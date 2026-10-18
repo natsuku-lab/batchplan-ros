@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The node and the browser demo, built and tested without MoveIt.
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: batchplan-ros
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: batchplan-ros
+      - uses: actions/checkout@v7
+        with:
+          repository: natsuku-lab/batchplan
+          path: batchplan
+          ssh-key: ${{ secrets.BATCHPLAN_DEPLOY_KEY }}
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.82.0
+          manifest-path: batchplan-ros/pixi.toml
+          cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: batchplan-ros/batchplan_ros
+      - run: pixi run build
+      - name: Lint
+        run: pixi run bash -c "cd batchplan_ros && cargo fmt --check && cargo clippy --all-targets -- -D warnings"
+      - run: pixi run test
+      - run: pixi run test-demo
+
+  # The MoveIt plugin, in its own pixi environment.
+  moveit:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: batchplan-ros
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: batchplan-ros
+      - uses: actions/checkout@v7
+        with:
+          repository: natsuku-lab/batchplan
+          path: batchplan
+          ssh-key: ${{ secrets.BATCHPLAN_DEPLOY_KEY }}
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.82.0
+          manifest-path: batchplan-ros/pixi.toml
+          environments: moveit
+          cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: batchplan-ros/batchplan_ros
+      - run: pixi run -e moveit test-moveit
