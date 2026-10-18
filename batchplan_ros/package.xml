@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>batchplan_ros</name>
+  <version>0.1.0</version>
+  <description>A ROS 2 planning node for batchplan: MoveIt planning requests in, timed trajectories out.</description>
+  <maintainer email="341164820+natsuku-lab@users.noreply.github.com">natsuku-lab</maintainer>
+  <license>MIT OR Apache-2.0</license>
+
+  <depend>moveit_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>shape_msgs</depend>
+
+  <export>
+    <build_type>ament_cargo</build_type>
+  </export>
+</package>

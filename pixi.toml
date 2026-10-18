@@ -1,0 +1,37 @@
+[workspace]
+name = "batchplan-ros"
+version = "0.1.0"
+description = "ROS 2 motion planning with batchplan: batched IK and planning on any GPU or plain CPU threads"
+channels = ["robostack-jazzy", "conda-forge"]
+platforms = ["linux-64", "linux-aarch64", { platform = "osx-arm64", macos = "14.0" }]
+
+[dependencies]
+ros-jazzy-ros-base = "*"
+ros-jazzy-rmw-cyclonedds-cpp = "*"
+ros-jazzy-moveit-msgs = "*"
+ros-jazzy-control-msgs = "*"
+rust = "1.99.*"
+compilers = "*"
+cmake = "*"
+pkg-config = "*"
+colcon-common-extensions = ">=0.3.0,<0.4"
+colcon-cargo = ">=0.2.0,<0.3"
+ros-jazzy-moveit-resources-panda-description = ">=3.1.0,<4"
+
+[pypi-dependencies]
+colcon-ros-cargo = ">=0.2.0,<0.3"
+
+[activation]
+scripts = ["scripts/activate.sh"]
+
+[activation.env]
+# Action round trips take 0.6 ms on Cyclone DDS against 11 ms on Fast DDS (research, Part 4).
+RMW_IMPLEMENTATION = "rmw_cyclonedds_cpp"
+
+[target.osx-arm64.activation.env]
+MACOSX_DEPLOYMENT_TARGET = "14.0"
+
+[tasks]
+cargo-ament-build = "cargo install --locked --quiet cargo-ament-build@0.1.11 --root .pixi/cargo"
+build = { cmd = "colcon build --symlink-install", depends-on = ["cargo-ament-build"] }
+test = { cmd = "cargo test --release --manifest-path batchplan_ros/Cargo.toml", depends-on = ["build"] }

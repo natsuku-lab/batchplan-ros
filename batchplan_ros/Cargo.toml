@@ -1,0 +1,34 @@
+[package]
+name = "batchplan_ros"
+version = "0.1.0"
+edition = "2024"
+description = "A ROS 2 planning node for batchplan: MoveIt planning requests in, timed trajectories out"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "batchplan_planner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+batchplan = { path = "../../batchplan" }
+futures = "0.3"
+rclrs = "0.8"
+ros-env = "0.3"
+roxmltree = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = "1.3"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[package.metadata.ros]
+install_to_share = ["launch"]
+
+# colcon builds the dev profile; planning needs optimized code either way.
+[profile.dev]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 3

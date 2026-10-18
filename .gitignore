@@ -1,0 +1,8 @@
+/build/
+/install/
+/log/
+/.pixi/
+target/
+__pycache__/
+*.pyc
+/.cargo/
