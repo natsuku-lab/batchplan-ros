@@ -1,0 +1,14 @@
+# A MoveIt planning pipeline that plans with batchplan. batchplan times its own trajectories, so no
+# time parameterization adapter follows; ValidateSolution checks the result as for any planner.
+planning_plugins:
+  - batchplan_moveit/BatchplanPlanner
+request_adapters:
+  - default_planning_request_adapters/ResolveConstraintFrames
+  - default_planning_request_adapters/ValidateWorkspaceBounds
+  - default_planning_request_adapters/CheckStartStateBounds
+  - default_planning_request_adapters/CheckStartStateCollision
+response_adapters:
+  - default_planning_response_adapters/ValidateSolution
+  - default_planning_response_adapters/DisplayMotionPath
+# The batchplan_planner action the plugin forwards to.
+action: /batchplan_planner/move_group

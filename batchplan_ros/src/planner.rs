@@ -80,8 +80,9 @@ pub struct Planner {
     meshes: MeshModel,
     tree: Tree,
     srdf: Srdf,
-    /// The root link and the frames fixed to it.
-    root: Vec<String>,
+    root: String,
+    /// SRDF virtual joints: name and parent frame.
+    virtual_joints: Vec<(String, String)>,
     hands: Vec<String>,
     grids: Grids,
     dt: f32,
@@ -124,8 +125,8 @@ impl Planner {
             DeviceKind::Gpu => Device::gpu(&robot)?,
         };
         let meshes = MeshModel::new(&robot)?;
-        let mut root = vec![tree.root().context("the URDF has no root link")?.to_string()];
-        root.extend(parsed.fixed_frames().iter().cloned());
+        let root = tree.root().context("the URDF has no root link")?.to_string();
+        let virtual_joints = parsed.virtual_joints().to_vec();
         Ok(Self {
             robot,
             device,
@@ -133,6 +134,7 @@ impl Planner {
             tree,
             srdf: parsed,
             root,
+            virtual_joints,
             hands,
             grids: Grids::new(SdfOptions::default()),
             dt: o.trajectory_dt,
@@ -176,9 +178,22 @@ impl Planner {
     ) -> Result<(RobotState, RobotTrajectory), Refusal> {
         let seconds = if request.allowed_planning_time > 0.0 { request.allowed_planning_time } else { DEFAULT_BUDGET };
         let budget = Duration::from_secs_f64(seconds);
+        let path = &request.path_constraints;
+        let constrained = !(path.joint_constraints.is_empty()
+            && path.position_constraints.is_empty()
+            && path.orientation_constraints.is_empty()
+            && path.visibility_constraints.is_empty()
+            && request.trajectory_constraints.constraints.is_empty());
+        if constrained {
+            return Err(Refusal::new(
+                Code::INVALID_GOAL_CONSTRAINTS,
+                "path and trajectory constraints are not supported",
+            ));
+        }
         let group = self.group(&request.group_name)?;
         let start = self.start(&request.start_state, scene, current)?;
-        let frames = Frames::new(&self.robot, &start, &self.root, scene);
+        let states = [&scene.robot_state, &request.start_state];
+        let frames = Frames::new(&self.robot, &start, &self.root, &self.virtual_joints, &states, scene);
 
         let attached: Vec<&AttachedCollisionObject> = scene
             .robot_state
@@ -331,7 +346,14 @@ impl Planner {
             .iter()
             .position(|h| *h == link)
             .ok_or_else(|| Refusal::new(Code::INVALID_LINK_NAME, format!("'{link}' is not an IK frame")))?;
-        let frames = Frames::new(&self.robot, &seed, &self.root, &PlanningScene::default());
+        let frames = Frames::new(
+            &self.robot,
+            &seed,
+            &self.root,
+            &self.virtual_joints,
+            &[&request.robot_state],
+            &PlanningScene::default(),
+        );
         let target =
             frames.pose_of(&request.pose_stamped.header.frame_id)?.mul_pose(scene::pose(&request.pose_stamped.pose));
         let worlds = self.device.upload(&[World::default()]).map_err(crash)?;

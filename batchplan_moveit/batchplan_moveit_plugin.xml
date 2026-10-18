@@ -1,0 +1,6 @@
+<library path="batchplan_moveit">
+  <class name="batchplan_moveit/BatchplanPlanner" type="batchplan_moveit::BatchplanPlannerManager"
+         base_class_type="planning_interface::PlannerManager">
+    <description>Plans with batchplan by forwarding each request, with its scene, to batchplan_planner.</description>
+  </class>
+</library>

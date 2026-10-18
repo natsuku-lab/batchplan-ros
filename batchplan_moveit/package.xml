@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>batchplan_moveit</name>
+  <version>0.1.0</version>
+  <description>A MoveIt planner plugin that plans with batchplan, by forwarding requests to batchplan_planner.</description>
+  <maintainer email="341164820+natsuku-lab@users.noreply.github.com">natsuku-lab</maintainer>
+  <license>MIT OR Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>moveit_core</depend>
+  <depend>moveit_msgs</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+
+  <exec_depend>batchplan_ros</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>moveit_configs_utils</exec_depend>
+  <exec_depend>moveit_resources_panda_moveit_config</exec_depend>
+  <exec_depend>moveit_ros_move_group</exec_depend>
+  <exec_depend>moveit_ros_visualization</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+    <moveit_core plugin="${prefix}/batchplan_moveit_plugin.xml"/>
+  </export>
+</package>

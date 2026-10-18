@@ -25,7 +25,30 @@ Then open http://localhost:8080: a simulated Panda on ros2_control mock hardware
 | 8 | 10 ms | 51 ms |
 | 64 | 28 ms | 554 ms |
 
-To plan for your own robot, run the node next to its `robot_state_publisher`:
+## With MoveIt (optional)
+
+```bash
+pixi run -e moveit demo-moveit
+```
+
+This is MoveIt's stock Panda demo, with a `batchplan` pipeline next to OMPL. In RViz's MotionPlanning panel, pick "batchplan" under Context → Planning Library, then Plan or Plan & Execute. The `batchplan_moveit` plugin forwards each request, with MoveIt's planning scene, to the planner node, waits within the request's planning time, and hands MoveIt a timed trajectory; MoveIt's own checks and controllers take it from there. Everything without MoveIt keeps working without it: the plugin is its own package and pixi environment.
+
+Through MoveIt's `/plan_kinematic_path`, 20 alternating identical requests per planner on an M4 Pro CPU (other apps running), medians:
+
+| Goal | Planner | Solved | Planning | Path | Motion |
+|---|---|---|---|---|---|
+| Round a wall | OMPL (RRTConnect) | 17/20 | 17.3 ms | 3.99 rad | 2.82 s |
+| Round a wall | batchplan | 20/20 | 4.4 ms | 2.70 rad | 2.28 s |
+| Free space | OMPL (RRTConnect) | 17/20 | 16.1 ms | 2.95 rad | 2.17 s |
+| Free space | batchplan | 20/20 | 4.9 ms | 1.88 rad | 2.52 s |
+
+batchplan keeps the configuration's jerk limits, which MoveIt's default time parameterization ignores, so its free-space motion is slower.
+
+To use it with your robot's MoveIt configuration, add `batchplan_planning.yaml` (from `batchplan_moveit/config`) to your config package's planning pipelines, and run `batchplan_planner` with the robot's SRDF and joint limits as `panda_moveit_demo.launch.py` does.
+
+## Your own robot
+
+To plan for your own robot without MoveIt, run the node next to its `robot_state_publisher`:
 
 ```bash
 pixi run ros2 launch batchplan_ros planner.launch.py robot_description_semantic:="$(cat my_robot.srdf)" \
@@ -36,4 +59,4 @@ In an existing ROS 2 Jazzy workspace, with `colcon-cargo`, `colcon-ros-cargo` an
 
 ## Status
 
-Early: Jazzy only. An optional MoveIt planner plugin is on the way.
+Early: Jazzy only, tested on macOS (Apple silicon).

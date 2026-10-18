@@ -33,12 +33,16 @@ fn share() -> PathBuf {
     PathBuf::from(prefix).join("share")
 }
 
-static PLANNER: LazyLock<Planner> = LazyLock::new(|| {
+fn panda(srdf: &str) -> Planner {
     let urdf = std::fs::read_to_string(share().join("moveit_resources_panda_description/urdf/panda.urdf")).unwrap();
     let cache_dir = Some(std::env::temp_dir().join("batchplan-ros-tests"));
     let options = PlannerOptions { package_dirs: vec![share()], cache_dir, ..Default::default() };
-    Planner::new(&urdf, Some(SRDF), &options).unwrap()
-});
+    Planner::new(&urdf, Some(srdf), &options).unwrap()
+}
+
+static PLANNER: LazyLock<Planner> = LazyLock::new(|| panda(SRDF));
+/// As MoveIt's Panda configuration has it: the root on a floating virtual joint from `world`.
+static FLOATING: LazyLock<Planner> = LazyLock::new(|| panda(&SRDF.replace(r#"type="fixed""#, r#"type="floating""#)));
 
 fn state(names: &[&str], positions: &[f64]) -> JointState {
     JointState {
@@ -371,6 +375,23 @@ fn frames_resolve_to_links_and_fixed_transforms() {
 }
 
 #[test]
+fn a_moving_base_places_the_planning_frame() {
+    let hand = FLOATING.robot().link_pose(&full(&READY), "panda_hand").unwrap().position;
+    let request = request("panda_arm", vec![joint_goal(&ARM, &[0.2, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])]);
+    // A box 1 m along x from the hand, given in the world frame.
+    let box_scene = scene(vec![cuboid("box", "world", [hand.x + 1.0, hand.y, hand.z].map(f64::from), [0.1; 3])]);
+    succeeded(&FLOATING.plan(&request, &box_scene, Some(&current(&READY))));
+    // With the robot standing 1 m along x in the world, the box is at its hand.
+    let mut moved = box_scene;
+    let mut base = geometry::Transform::default();
+    base.translation.x = 1.0;
+    moved.robot_state.multi_dof_joint_state.joint_names = vec!["virtual_joint".into()];
+    moved.robot_state.multi_dof_joint_state.transforms = vec![base];
+    let hit = FLOATING.plan(&request, &moved, Some(&current(&READY)));
+    assert_eq!(hit.error_code.val, Code::START_STATE_IN_COLLISION, "{}", hit.error_code.message);
+}
+
+#[test]
 fn attached_objects_move_with_their_link() {
     // A long bar held in the hand; a post beside the hand that the bare hand clears but the bar hits.
     let hand = PLANNER.robot().link_pose(&full(&READY), "panda_hand").unwrap();
@@ -420,6 +441,10 @@ fn refusals_carry_moveit_codes() {
     let mut moves_finger = goal.clone();
     moves_finger.joint_constraints.extend(joint_goal(&["panda_finger_joint1"], &[0.04]).joint_constraints);
     assert_eq!(code(&request("panda_arm", vec![moves_finger]), &READY), Code::INVALID_GOAL_CONSTRAINTS);
+
+    let mut constrained = request("panda_arm", vec![goal.clone()]);
+    constrained.path_constraints = joint_goal(&ARM, &READY);
+    assert_eq!(code(&constrained, &READY), Code::INVALID_GOAL_CONSTRAINTS);
 
     // Far out of reach.
     let away = Pose { position: Vec3::new(3.0, 0.0, 0.5), rotation: Quat::IDENTITY };

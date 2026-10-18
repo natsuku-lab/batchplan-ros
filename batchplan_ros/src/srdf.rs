@@ -54,8 +54,8 @@ pub struct Srdf {
     groups: BTreeMap<String, Group>,
     /// End effectors' parent links: the frames pose goals usually name.
     end_effector_links: Vec<String>,
-    /// Parent frames of fixed virtual joints, which coincide with the robot's root.
-    fixed_frames: Vec<String>,
+    /// Each virtual joint's name and parent frame, which its transform places the robot's root in.
+    virtual_joints: Vec<(String, String)>,
 }
 
 impl Srdf {
@@ -81,9 +81,7 @@ impl Srdf {
                     srdf.groups.insert(attr(n, "name")?, group);
                 }
                 "end_effector" => srdf.end_effector_links.push(attr(n, "parent_link")?),
-                "virtual_joint" if n.attribute("type") == Some("fixed") => {
-                    srdf.fixed_frames.push(attr(n, "parent_frame")?)
-                }
+                "virtual_joint" => srdf.virtual_joints.push((attr(n, "name")?, attr(n, "parent_frame")?)),
                 _ => {}
             }
         }
@@ -145,7 +143,7 @@ impl Srdf {
         tips
     }
 
-    pub fn fixed_frames(&self) -> &[String] {
-        &self.fixed_frames
+    pub fn virtual_joints(&self) -> &[(String, String)] {
+        &self.virtual_joints
     }
 }

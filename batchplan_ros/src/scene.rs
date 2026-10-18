@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use batchplan::glam::{Quat, Vec3};
 use batchplan::{AttachedObject, Obstacle, Pose, Robot, SdfGrid, SdfOptions, SphereOptions, World};
 use ros_env::geometry_msgs::msg as geometry;
-use ros_env::moveit_msgs::msg::{AttachedCollisionObject, CollisionObject, MoveItErrorCodes as Code, PlanningScene};
+use ros_env::moveit_msgs::msg::{
+    AttachedCollisionObject, CollisionObject, MoveItErrorCodes as Code, PlanningScene, RobotState,
+};
 use ros_env::shape_msgs::msg::{Mesh, SolidPrimitive};
 
 use crate::Refusal;
@@ -17,6 +19,11 @@ pub fn pose(p: &geometry::Pose) -> Pose {
         position: Vec3::new(p.position.x as f32, p.position.y as f32, p.position.z as f32),
         rotation: rotation(&p.orientation),
     }
+}
+
+fn transform(t: &geometry::Transform) -> Pose {
+    let v = &t.translation;
+    Pose { position: Vec3::new(v.x as f32, v.y as f32, v.z as f32), rotation: rotation(&t.rotation) }
 }
 
 pub fn rotation(o: &geometry::Quaternion) -> Quat {
@@ -29,35 +36,50 @@ pub fn rotation(o: &geometry::Quaternion) -> Quat {
 pub struct Frames<'a> {
     robot: &'a Robot,
     q: &'a [f32],
-    root: &'a [String],
-    fixed: HashMap<String, Pose>,
+    root: &'a str,
+    /// Frames that are not links: virtual joints' parent frames and the scene's fixed frames.
+    frames: HashMap<String, Pose>,
 }
 
 impl<'a> Frames<'a> {
-    /// `root` names the root link and the frames fixed to it (SRDF virtual joints); the scene's
-    /// fixed frame transforms place other frames relative to one of those.
-    pub fn new(robot: &'a Robot, q: &'a [f32], root: &'a [String], scene: &PlanningScene) -> Self {
-        let fixed = scene
-            .fixed_frame_transforms
-            .iter()
-            .filter(|t| root.contains(&t.header.frame_id))
-            .map(|t| {
-                let (v, r) = (&t.transform.translation, &t.transform.rotation);
-                let as_pose =
-                    geometry::Pose { position: geometry::Point { x: v.x, y: v.y, z: v.z }, orientation: r.clone() };
-                (t.child_frame_id.clone(), pose(&as_pose))
-            })
-            .collect();
-        Self { robot, q, root, fixed }
+    /// Each SRDF virtual joint's parent frame is placed by that joint's transform in the last of
+    /// `states` that gives one (MoveIt's planning frame for a robot on a moving base), and otherwise
+    /// coincides with the root link. The scene's fixed frame transforms place further frames
+    /// relative to the root or those frames.
+    pub fn new(
+        robot: &'a Robot,
+        q: &'a [f32],
+        root: &'a str,
+        virtual_joints: &[(String, String)],
+        states: &[&RobotState],
+        scene: &PlanningScene,
+    ) -> Self {
+        let mut frames = HashMap::new();
+        for (joint, parent) in virtual_joints {
+            let placed = states.iter().rev().find_map(|s| {
+                let m = &s.multi_dof_joint_state;
+                m.joint_names.iter().position(|n| n == joint).and_then(|i| m.transforms.get(i))
+            });
+            let root_in_parent = placed.map_or(Pose::IDENTITY, transform);
+            frames.insert(parent.clone(), root_in_parent.inverse());
+        }
+        for t in &scene.fixed_frame_transforms {
+            let parent =
+                if t.header.frame_id == root { Some(Pose::IDENTITY) } else { frames.get(&t.header.frame_id).copied() };
+            if let Some(parent) = parent {
+                frames.insert(t.child_frame_id.clone(), parent.mul_pose(transform(&t.transform)));
+            }
+        }
+        Self { robot, q, root, frames }
     }
 
     pub fn pose_of(&self, frame: &str) -> Result<Pose, Refusal> {
-        if frame.is_empty() || self.root.iter().any(|r| r == frame) {
+        if frame.is_empty() || frame == self.root {
             return Ok(Pose::IDENTITY);
         }
         self.robot
             .link_pose(self.q, frame)
-            .or_else(|| self.fixed.get(frame).copied())
+            .or_else(|| self.frames.get(frame).copied())
             .ok_or_else(|| Refusal::new(Code::FRAME_TRANSFORM_FAILURE, format!("unknown frame '{frame}'")))
     }
 }
