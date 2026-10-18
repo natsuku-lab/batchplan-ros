@@ -17,7 +17,7 @@ from moveit_msgs.srv import GetPositionIK
 from rclpy.action import ActionClient
 from sensor_msgs.msg import JointState
 
-from batchplan_viser.app import box_object, pose_goal, pose_msg
+from batchplan_viser.messages import box_object, pose_goal, pose_msg
 
 ARM = [f"panda_joint{i}" for i in range(1, 8)]
 

@@ -2,7 +2,9 @@
 
 Drag the gizmo to set the goal: IK runs as you drag, and the blue ghost shows where the arm would
 be. Add boxes and drag them around, then Plan to preview the motion in green, or Plan and execute to
-run it on the robot. Every request carries the boxes as its scene, so the planner keeps no state.
+run it on the robot. Best grasp sends one request with many approach poses around the can, which the
+planner plans in one batch, keeping the shortest path. Every request carries the boxes and the can as
+its scene, so the planner keeps no state.
 """
 
 import io
@@ -15,22 +17,23 @@ import rclpy
 import viser
 import yourdfpy
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import Pose
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import CollisionObject, Constraints, MoveItErrorCodes, OrientationConstraint, PositionConstraint
+from moveit_msgs.msg import MoveItErrorCodes
 from moveit_msgs.srv import GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
-from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import String
 from viser.extras import ViserUrdf
+
+from batchplan_viser.messages import box_object, cylinder_object, grasp_poses, pose_goal, pose_msg, seconds
 
 GHOST = (0.25, 0.55, 1.0, 0.45)
 PREVIEW = (0.3, 0.85, 0.4, 0.55)
 BOX_SIZE = (0.12, 0.12, 0.3)
+CAN_RADIUS, CAN_HEIGHT = 0.04, 0.2
 
 
 def resolve(fname: str) -> str:
@@ -43,39 +46,6 @@ def resolve(fname: str) -> str:
 
 def load_urdf(xml: str) -> yourdfpy.URDF:
     return yourdfpy.URDF.load(io.StringIO(xml), filename_handler=resolve)
-
-
-def pose_msg(position, wxyz) -> Pose:
-    pose = Pose()
-    pose.position.x, pose.position.y, pose.position.z = (float(v) for v in position)
-    w, x, y, z = (float(v) for v in wxyz)
-    pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = x, y, z, w
-    return pose
-
-
-def box_object(name: str, frame: str, position, wxyz, size) -> CollisionObject:
-    box = CollisionObject(id=name, operation=CollisionObject.ADD)
-    box.header.frame_id = frame
-    box.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[float(v) for v in size])]
-    box.primitive_poses = [pose_msg(position, wxyz)]
-    return box
-
-
-def pose_goal(link: str, frame: str, position, wxyz) -> Constraints:
-    position_constraint = PositionConstraint(link_name=link, weight=1.0)
-    position_constraint.header.frame_id = frame
-    position_constraint.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[1e-3])]
-    position_constraint.constraint_region.primitive_poses = [pose_msg(position, (1.0, 0.0, 0.0, 0.0))]
-    orientation = OrientationConstraint(link_name=link, weight=1.0)
-    orientation.header.frame_id = frame
-    orientation.orientation = pose_msg((0.0, 0.0, 0.0), wxyz).orientation
-    orientation.absolute_x_axis_tolerance = orientation.absolute_y_axis_tolerance = 1e-2
-    orientation.absolute_z_axis_tolerance = 1e-2
-    return Constraints(position_constraints=[position_constraint], orientation_constraints=[orientation])
-
-
-def seconds(duration) -> float:
-    return duration.sec + duration.nanosec * 1e-9
 
 
 class App(Node):
@@ -98,6 +68,8 @@ class App(Node):
         self.lock = threading.Lock()
         self.ik_busy = self.ik_again = False
         self.boxes = []
+        self.can = None
+        self.grasps = []
         self.playback = 0
 
     def on_description(self, msg: String):
@@ -144,6 +116,11 @@ class App(Node):
         with gui.add_folder("Scene"):
             gui.add_button("Add box", icon=viser.Icon.BOX).on_click(lambda _: self.add_box())
             gui.add_button("Remove boxes", icon=viser.Icon.TRASH).on_click(lambda _: self.remove_boxes())
+        with gui.add_folder("Best of N grasps"):
+            gui.add_markdown("One request with N approach poses around the can: IK for all of them, one batched plan, the shortest path wins.")
+            self.grasp_count = gui.add_slider("Grasps", min=1, max=64, step=1, initial_value=16)
+            gui.add_button("Best grasp", icon=viser.Icon.HAND_GRAB).on_click(lambda _: self.best_grasp(execute=False))
+            gui.add_button("Best grasp and execute", icon=viser.Icon.PLAYER_PLAY).on_click(lambda _: self.best_grasp(execute=True))
 
         self.solve_ik()
         while rclpy.ok():
@@ -196,30 +173,54 @@ class App(Node):
             control.remove()
         self.boxes = []
 
-    def plan(self, execute: bool):
+    def add_can(self):
+        control = self.server.scene.add_transform_controls("/can", scale=0.15, position=(0.45, 0.25, CAN_HEIGHT / 2), disable_rotations=True)
+        self.server.scene.add_cylinder("/can/shape", radius=CAN_RADIUS, height=CAN_HEIGHT, color=(200, 60, 60))
+        self.can = control
+
+    def best_grasp(self, execute: bool):
+        if self.can is None:
+            self.add_can()
+        poses = grasp_poses(self.can.position, CAN_RADIUS, int(self.grasp_count.value))
+        for frame in self.grasps:
+            frame.remove()
+        self.grasps = [
+            self.server.scene.add_frame(f"/grasps/{k}", axes_length=0.04, axes_radius=0.003, position=p, wxyz=q)
+            for k, (p, q) in enumerate(poses)
+        ]
+        goals = [pose_goal(self.tip, self.frame, p, q) for p, q in poses]
+        self.plan(execute, goals, f"Best of {len(goals)} grasps")
+
+    def objects(self):
+        objects = [box_object(n, self.frame, c.position, c.wxyz, BOX_SIZE) for n, c, _ in self.boxes]
+        if self.can is not None:
+            objects.append(cylinder_object("can", self.frame, self.can.position, CAN_RADIUS, CAN_HEIGHT))
+        return objects
+
+    def plan(self, execute: bool, goals=None, label: str = "Planned"):
         goal = MoveGroup.Goal()
         request = goal.request
         request.group_name = self.group
         request.allowed_planning_time = 2.0
         speed = float(self.speed.value)
         request.max_velocity_scaling_factor, request.max_acceleration_scaling_factor = speed, speed * speed
-        request.goal_constraints = [pose_goal(self.tip, self.frame, self.goal.position, self.goal.wxyz)]
+        request.goal_constraints = goals or [pose_goal(self.tip, self.frame, self.goal.position, self.goal.wxyz)]
         goal.planning_options.plan_only = not execute
         scene = goal.planning_options.planning_scene_diff
         scene.is_diff = True
-        scene.world.collision_objects = [box_object(n, self.frame, c.position, c.wxyz, BOX_SIZE) for n, c, _ in self.boxes]
+        scene.world.collision_objects = self.objects()
         self.status.content = "Planning..."
         sent = self.planning.send_goal_async(goal)
-        sent.add_done_callback(lambda f: self.on_accepted(f, execute))
+        sent.add_done_callback(lambda f: self.on_accepted(f, execute, label))
 
-    def on_accepted(self, future, execute: bool):
+    def on_accepted(self, future, execute: bool, label: str):
         handle = future.result()
         if not handle.accepted:
             self.status.content = "The planner refused the request."
             return
-        handle.get_result_async().add_done_callback(lambda f: self.on_result(f.result().result, execute))
+        handle.get_result_async().add_done_callback(lambda f: self.on_result(f.result().result, execute, label))
 
-    def on_result(self, result, execute: bool):
+    def on_result(self, result, execute: bool, label: str):
         if result.error_code.val != MoveItErrorCodes.SUCCESS:
             self.status.content = f"**Failed** ({result.error_code.val}): {result.error_code.message}"
             return
@@ -227,7 +228,7 @@ class App(Node):
         points = trajectory.points
         motion = seconds(points[-1].time_from_start)
         self.status.content = (
-            f"Planned in **{result.planning_time * 1e3:.1f} ms**, {len(points)} waypoints, {motion:.2f} s of motion"
+            f"{label} in **{result.planning_time * 1e3:.1f} ms**, {len(points)} waypoints, {motion:.2f} s of motion"
             + (", executed." if execute else ".")
         )
         waypoints = [{**self.joints, **dict(zip(trajectory.joint_names, p.positions))} for p in points]

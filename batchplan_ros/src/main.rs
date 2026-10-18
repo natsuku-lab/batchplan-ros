@@ -115,11 +115,13 @@ fn main() -> Result<()> {
     let controller = controller.transpose()?;
 
     let _move_group = {
-        let (planner, current) = (Arc::clone(&planner), current.clone());
+        let (planner, current, server) = (Arc::clone(&planner), current.clone(), node.clone());
         node.create_action_server::<MoveGroup, _>("~/move_group", move |goal: RequestedGoal<MoveGroup>| {
-            let (planner, current, controller) = (planner.get().cloned(), current(), controller.clone());
+            let (planner, current, controller, node) =
+                (planner.get().cloned(), current(), controller.clone(), server.clone());
             async move {
                 let request = Arc::clone(goal.goal());
+                let id = goal.goal_id().to_string();
                 let goal = goal.accept().execute();
                 let Some(planner) = planner else {
                     let error_code = error(MoveItErrorCodes::FAILURE, "the robot description has not arrived yet");
@@ -153,11 +155,18 @@ fn main() -> Result<()> {
                         Err(message) => result.error_code = error(MoveItErrorCodes::CONTROL_FAILED, &message),
                     }
                 }
-                if result.error_code.val == MoveItErrorCodes::SUCCESS {
-                    goal.succeeded_with(result)
-                } else {
-                    goal.aborted_with(result)
-                }
+                let succeeded = result.error_code.val == MoveItErrorCodes::SUCCESS;
+                let what = if request.planning_options.plan_only { "plan" } else { "plan and execute" };
+                log_info!(
+                    node.logger(),
+                    "goal {}: {} goal(s) for '{}', {what}: {} ({:.1} ms planning)",
+                    &id[..8],
+                    request.request.goal_constraints.len(),
+                    request.request.group_name,
+                    if succeeded { "done" } else { &result.error_code.message },
+                    result.planning_time * 1e3
+                );
+                if succeeded { goal.succeeded_with(result) } else { goal.aborted_with(result) }
             }
         })?
     };

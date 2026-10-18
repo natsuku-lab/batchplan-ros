@@ -17,6 +17,14 @@ pixi run demo                                    # Linux or macOS (Apple silicon
 
 Then open http://localhost:8080: a simulated Panda on ros2_control mock hardware. Drag the gizmo to set a goal (IK runs as you drag), add boxes, and plan or plan and execute. No MoveIt and no GPU are needed; `pixi run demo device:=gpu` plans on the GPU.
 
+**Best of N grasps.** "Best grasp" sends one request with N approach poses around a can as its goal constraints. The node solves IK for all of them and plans to every solution in one batched call, keeping the shortest path. `ros2 run batchplan_examples best_grasp.py` times that against one request per grasp, next to a running demo. On an M4 Pro CPU (medians of 5, other apps running):
+
+| Grasps | One request | One request per grasp |
+|---|---|---|
+| 1 | 15 ms | 15 ms |
+| 8 | 10 ms | 51 ms |
+| 64 | 28 ms | 554 ms |
+
 To plan for your own robot, run the node next to its `robot_state_publisher`:
 
 ```bash
@@ -28,4 +36,4 @@ In an existing ROS 2 Jazzy workspace, with `colcon-cargo`, `colcon-ros-cargo` an
 
 ## Status
 
-Early: Jazzy only. A batch demo and an optional MoveIt planner plugin are on the way.
+Early: Jazzy only. An optional MoveIt planner plugin is on the way.
