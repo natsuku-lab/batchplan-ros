@@ -38,6 +38,9 @@ def ros():
     node.create_subscription(JointState, "/joint_states", lambda m: joints.update(zip(m.name, m.position)), 10)
     planning = node.create_client(GetMotionPlan, "/plan_kinematic_path")
     assert planning.wait_for_service(timeout_sec=90.0), "move_group did not start"
+    # The planner offers its action once it has loaded the robot.
+    planner = ActionClient(node, MoveGroup, "/batchplan_planner/move_group")
+    assert planner.wait_for_server(timeout_sec=90.0), "batchplan_planner did not get ready"
     # Discovery finishes after the service first shows up; a request sent at once can lose its answer.
     settled = time.time() + 1.0
     while time.time() < settled:

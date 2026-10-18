@@ -9,6 +9,8 @@ ROS 2 motion planning with [batchplan](https://github.com/natsuku-lab/batchplan)
 
 Several goal constraints in one request are planned in one batched call, and the shortest valid path wins.
 
+<img src="docs/best_grasp.gif" alt="A simulated Panda in the browser: 24 approach poses around a can, planned in one request; the arm's preview moves to the nearest one past a box." width="600">
+
 ## Quick start
 
 ```bash

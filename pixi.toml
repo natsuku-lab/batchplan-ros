@@ -45,8 +45,8 @@ MACOSX_DEPLOYMENT_TARGET = "14.0"
 cargo-ament-build = "cargo install --locked --quiet cargo-ament-build@0.1.11 --root .pixi/cargo"
 build = { cmd = "colcon build --symlink-install --packages-ignore batchplan_moveit", depends-on = ["cargo-ament-build"] }
 test = { cmd = "cargo test --manifest-path batchplan_ros/Cargo.toml", depends-on = ["build"] }
-test-demo = { cmd = "pytest -q batchplan_examples/test", depends-on = ["build"] }
-demo = { cmd = "ros2 launch batchplan_examples panda_demo.launch.py", depends-on = ["build"] }
+test-demo = { cmd = "scripts/run.sh pytest -q batchplan_examples/test", depends-on = ["build"] }
+demo = { cmd = "scripts/run.sh ros2 launch batchplan_examples panda_demo.launch.py", depends-on = ["build"] }
 
 [feature.moveit.dependencies]
 ros-jazzy-moveit = "*"
@@ -54,8 +54,8 @@ ros-jazzy-moveit-resources-panda-moveit-config = "*"
 
 [feature.moveit.tasks]
 build-moveit = { cmd = "colcon build --symlink-install", depends-on = ["cargo-ament-build"] }
-demo-moveit = { cmd = "ros2 launch batchplan_moveit panda_moveit_demo.launch.py", depends-on = ["build-moveit"] }
-test-moveit = { cmd = "pytest -q batchplan_moveit/test", depends-on = ["build-moveit"] }
+demo-moveit = { cmd = "scripts/run.sh ros2 launch batchplan_moveit panda_moveit_demo.launch.py", depends-on = ["build-moveit"] }
+test-moveit = { cmd = "scripts/run.sh pytest -q batchplan_moveit/test", depends-on = ["build-moveit"] }
 
 [environments]
 moveit = { features = ["moveit"], solve-group = "default" }

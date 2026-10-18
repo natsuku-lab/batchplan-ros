@@ -55,29 +55,46 @@ fn main() -> Result<()> {
         trajectory_dt: dt as f32,
     };
 
+    let latest: Arc<Mutex<Option<JointState>>> = Arc::new(Mutex::new(None));
+    let _states = {
+        let latest = Arc::clone(&latest);
+        node.create_subscription("/joint_states", move |msg: JointState| {
+            *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+        })?
+    };
+    let controller = (!controller_action.is_empty())
+        .then(|| node.create_action_client::<FollowJointTrajectory>(controller_action.as_str()))
+        .transpose()?;
+
     // The planner is built once, from the parameter or the first description published, on a
-    // thread of its own: fitting spheres to a new robot takes seconds.
-    let planner: Arc<OnceLock<Arc<Planner>>> = Arc::new(OnceLock::new());
+    // thread of its own, since fitting spheres to a new robot takes seconds. Its action and service
+    // appear only once it is ready, so a client waiting for them waits for the robot too.
+    let serving: Arc<OnceLock<Serving>> = Arc::new(OnceLock::new());
     let pending = Arc::new(Mutex::new(Some((srdf, options))));
     let build = {
-        let (planner, node) = (Arc::clone(&planner), node.clone());
+        let (serving, node) = (Arc::clone(&serving), node.clone());
         move |urdf: String| {
             let Some((srdf, options)) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
-            let (planner, node) = (Arc::clone(&planner), node.clone());
+            let (serving, node, latest, controller) =
+                (Arc::clone(&serving), node.clone(), Arc::clone(&latest), controller.clone());
             std::thread::spawn(move || {
                 let begun = Instant::now();
-                match Planner::new(&urdf, srdf.as_deref(), &options) {
-                    Ok(p) => {
+                let planner = match Planner::new(&urdf, srdf.as_deref(), &options) {
+                    Ok(p) => Arc::new(p),
+                    Err(e) => return log_error!(node.logger(), "cannot plan for this robot: {e:#}"),
+                };
+                match serve(&node, Arc::clone(&planner), controller, latest) {
+                    Ok(served) => {
+                        let _ = serving.set(served);
                         log_info!(
                             node.logger(),
                             "planning {} joints on {}, ready in {:.1} s",
-                            p.robot().dof(),
-                            p.device_name(),
+                            planner.robot().dof(),
+                            planner.device_name(),
                             begun.elapsed().as_secs_f64()
                         );
-                        let _ = planner.set(Arc::new(p));
                     }
-                    Err(e) => log_error!(node.logger(), "cannot plan for this robot: {e:#}"),
+                    Err(e) => log_error!(node.logger(), "cannot serve requests: {e}"),
                 }
             });
         }
@@ -98,35 +115,32 @@ fn main() -> Result<()> {
         None
     };
 
-    let latest: Arc<Mutex<Option<JointState>>> = Arc::new(Mutex::new(None));
-    let _states = {
-        let latest = Arc::clone(&latest);
-        node.create_subscription("/joint_states", move |msg: JointState| {
-            *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
-        })?
-    };
-    let current = {
-        let latest = Arc::clone(&latest);
-        move || latest.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    };
+    executor.spin(SpinOptions::default()).first_error()?;
+    Ok(())
+}
 
-    let controller = (!controller_action.is_empty())
-        .then(|| node.create_action_client::<FollowJointTrajectory>(controller_action.as_str()));
-    let controller = controller.transpose()?;
+/// The node's interfaces, kept alive while it runs.
+struct Serving {
+    _move_group: ActionServer<MoveGroup>,
+    _compute_ik: Service<GetPositionIK>,
+}
 
-    let _move_group = {
-        let (planner, current, server) = (Arc::clone(&planner), current.clone(), node.clone());
-        node.create_action_server::<MoveGroup, _>("~/move_group", move |goal: RequestedGoal<MoveGroup>| {
+fn serve(
+    node: &Node,
+    planner: Arc<Planner>,
+    controller: Option<ActionClient<FollowJointTrajectory>>,
+    latest: Arc<Mutex<Option<JointState>>>,
+) -> Result<Serving, RclrsError> {
+    let current = move || latest.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let move_group = {
+        let (planner, current, node) = (Arc::clone(&planner), current.clone(), node.clone());
+        node.clone().create_action_server::<MoveGroup, _>("~/move_group", move |goal: RequestedGoal<MoveGroup>| {
             let (planner, current, controller, node) =
-                (planner.get().cloned(), current(), controller.clone(), server.clone());
+                (Arc::clone(&planner), current(), controller.clone(), node.clone());
             async move {
                 let request = Arc::clone(goal.goal());
                 let id = goal.goal_id().to_string();
                 let goal = goal.accept().execute();
-                let Some(planner) = planner else {
-                    let error_code = error(MoveItErrorCodes::FAILURE, "the robot description has not arrived yet");
-                    return goal.aborted_with(MoveGroup_Result { error_code, ..Default::default() });
-                };
                 goal.publish_feedback(MoveGroup_Feedback { state: "PLANNING".into() });
                 let (tx, rx) = futures::channel::oneshot::channel();
                 let asked = Arc::clone(&request);
@@ -170,19 +184,12 @@ fn main() -> Result<()> {
             }
         })?
     };
-
-    let _compute_ik =
+    let compute_ik =
         node.create_service::<GetPositionIK, _>("~/compute_ik", move |request: GetPositionIK_Request| {
-            let Some(planner) = planner.get() else {
-                let error_code = error(MoveItErrorCodes::FAILURE, "the robot description has not arrived yet");
-                return GetPositionIK_Response { error_code, ..Default::default() };
-            };
             let (solution, error_code) = planner.ik(&request.ik_request, current().as_ref());
             GetPositionIK_Response { solution, error_code }
         })?;
-
-    executor.spin(SpinOptions::default()).first_error()?;
-    Ok(())
+    Ok(Serving { _move_group: move_group, _compute_ik: compute_ik })
 }
 
 async fn execute(
