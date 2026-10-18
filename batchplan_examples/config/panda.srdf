@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!-- The planning groups of MoveIt's Panda configuration (moveit_resources_panda_moveit_config). -->
+<robot name="panda">
+  <group name="panda_arm">
+    <chain base_link="panda_link0" tip_link="panda_link8"/>
+  </group>
+  <group name="hand">
+    <link name="panda_hand"/>
+    <link name="panda_leftfinger"/>
+    <link name="panda_rightfinger"/>
+  </group>
+  <group name="panda_arm_hand">
+    <group name="panda_arm"/>
+    <group name="hand"/>
+  </group>
+  <end_effector name="hand" parent_link="panda_link8" group="hand" parent_group="panda_arm"/>
+  <virtual_joint name="virtual_joint" type="fixed" parent_frame="world" child_link="panda_link0"/>
+</robot>

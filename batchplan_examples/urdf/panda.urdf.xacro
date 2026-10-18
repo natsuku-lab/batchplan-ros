@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<!-- MoveIt's Panda on ros2_control mock hardware, starting at its ready pose. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="panda">
+  <xacro:include filename="$(find moveit_resources_panda_description)/urdf/panda.urdf.xacro"/>
+
+  <xacro:macro name="joint_interfaces" params="name initial">
+    <joint name="${name}">
+      <command_interface name="position"/>
+      <state_interface name="position"><param name="initial_value">${initial}</param></state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+  </xacro:macro>
+
+  <ros2_control name="PandaMock" type="system">
+    <hardware><plugin>mock_components/GenericSystem</plugin></hardware>
+    <xacro:joint_interfaces name="panda_joint1" initial="0.0"/>
+    <xacro:joint_interfaces name="panda_joint2" initial="-0.785"/>
+    <xacro:joint_interfaces name="panda_joint3" initial="0.0"/>
+    <xacro:joint_interfaces name="panda_joint4" initial="-2.356"/>
+    <xacro:joint_interfaces name="panda_joint5" initial="0.0"/>
+    <xacro:joint_interfaces name="panda_joint6" initial="1.571"/>
+    <xacro:joint_interfaces name="panda_joint7" initial="0.785"/>
+    <xacro:joint_interfaces name="panda_finger_joint1" initial="0.035"/>
+  </ros2_control>
+</robot>

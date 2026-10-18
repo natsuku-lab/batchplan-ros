@@ -17,6 +17,16 @@ pkg-config = "*"
 colcon-common-extensions = ">=0.3.0,<0.4"
 colcon-cargo = ">=0.2.0,<0.3"
 ros-jazzy-moveit-resources-panda-description = ">=3.1.0,<4"
+ros-jazzy-robot-state-publisher = ">=3.3.4,<4"
+ros-jazzy-controller-manager = ">=4.49.0,<5"
+ros-jazzy-joint-trajectory-controller = ">=4.43.0,<5"
+ros-jazzy-joint-state-broadcaster = ">=4.43.0,<5"
+ros-jazzy-ros2-control = ">=4.49.0,<5"
+ros-jazzy-xacro = ">=2.1.1,<3"
+viser = ">=1.1,<2"
+yourdfpy = ">=0.0.60,<0.0.61"
+pycollada = ">=0.9,<0.10"
+pytest = ">=9.1.1,<10"
 
 [pypi-dependencies]
 colcon-ros-cargo = ">=0.2.0,<0.3"
@@ -34,4 +44,6 @@ MACOSX_DEPLOYMENT_TARGET = "14.0"
 [tasks]
 cargo-ament-build = "cargo install --locked --quiet cargo-ament-build@0.1.11 --root .pixi/cargo"
 build = { cmd = "colcon build --symlink-install", depends-on = ["cargo-ament-build"] }
-test = { cmd = "cargo test --release --manifest-path batchplan_ros/Cargo.toml", depends-on = ["build"] }
+test = { cmd = "cargo test --manifest-path batchplan_ros/Cargo.toml", depends-on = ["build"] }
+test-demo = { cmd = "pytest -q batchplan_examples/test", depends-on = ["build"] }
+demo = { cmd = "ros2 launch batchplan_examples panda_demo.launch.py", depends-on = ["build"] }

@@ -12,12 +12,20 @@ Several goal constraints in one request are planned in one batched call, and the
 ## Quick start
 
 ```bash
-pixi run build                                   # Linux or macOS (Apple silicon); ROS 2 Jazzy from RoboStack
-pixi run ros2 launch batchplan_ros planner.launch.py
+pixi run demo                                    # Linux or macOS (Apple silicon); ROS 2 Jazzy from RoboStack
+```
+
+Then open http://localhost:8080: a simulated Panda on ros2_control mock hardware. Drag the gizmo to set a goal (IK runs as you drag), add boxes, and plan or plan and execute. No MoveIt and no GPU are needed; `pixi run demo device:=gpu` plans on the GPU.
+
+To plan for your own robot, run the node next to its `robot_state_publisher`:
+
+```bash
+pixi run ros2 launch batchplan_ros planner.launch.py robot_description_semantic:="$(cat my_robot.srdf)" \
+    controller_action:=/arm_controller/follow_joint_trajectory
 ```
 
 In an existing ROS 2 Jazzy workspace, with `colcon-cargo`, `colcon-ros-cargo` and `cargo-ament-build` installed: `colcon build --packages-select batchplan_ros`.
 
 ## Status
 
-Early: Jazzy only. A browser demo, a batch demo and an optional MoveIt planner plugin are on the way.
+Early: Jazzy only. A batch demo and an optional MoveIt planner plugin are on the way.

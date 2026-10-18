@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>batchplan_viser</name>
+  <version>0.1.0</version>
+  <description>Plan with batchplan_ros from a browser (viser): drag the goal, add boxes, plan and execute.</description>
+  <maintainer email="341164820+natsuku-lab@users.noreply.github.com">natsuku-lab</maintainer>
+  <license>MIT OR Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>shape_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
