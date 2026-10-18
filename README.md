@@ -13,7 +13,12 @@ Several goal constraints in one request are planned in one batched call, and the
 
 ## Quick start
 
+The node builds [batchplan](https://github.com/natsuku-lab/batchplan) from source, from a checkout beside this one:
+
 ```bash
+git clone https://github.com/natsuku-lab/batchplan
+git clone https://github.com/natsuku-lab/batchplan-ros
+cd batchplan-ros
 pixi run demo                                    # Linux or macOS (Apple silicon); ROS 2 Jazzy from RoboStack
 ```
 
@@ -61,4 +66,4 @@ In an existing ROS 2 Jazzy workspace, with `colcon-cargo`, `colcon-ros-cargo` an
 
 ## Status
 
-Early: Jazzy only, tested on macOS (Apple silicon).
+Early: ROS 2 Jazzy only. CI builds and tests the node and the browser demo on Linux (x86-64) and macOS (Apple silicon), and the MoveIt plugin on Linux.
