@@ -24,13 +24,13 @@ pixi run demo                                    # Linux or macOS (Apple silicon
 
 Then open http://localhost:8080: a simulated Panda on ros2_control mock hardware. Drag the gizmo to set a goal (IK runs as you drag), add boxes, and plan or plan and execute. No MoveIt and no GPU are needed; `pixi run demo device:=gpu` plans on the GPU.
 
-**Best of N grasps.** "Best grasp" sends one request with N approach poses around a can as its goal constraints. The node solves IK for all of them and plans to every solution in one batched call, keeping the shortest path. `ros2 run batchplan_examples best_grasp.py` times that against one request per grasp, next to a running demo. On an M4 Pro CPU (medians of 5, other apps running):
+**Best of N grasps.** "Best grasp" sends one request with N approach poses around a can as its goal constraints. The node solves IK for all of them and plans to every solution in one batched call, keeping the shortest path. `ros2 run batchplan_examples best_grasp.py` times that against one request per grasp, next to a running demo. Wall-clock times on an M4 Pro CPU (the middle of three runs, each the median of 5 requests; other apps running):
 
 | Grasps | One request | One request per grasp |
 |---|---|---|
-| 1 | 15 ms | 15 ms |
-| 8 | 10 ms | 51 ms |
-| 64 | 28 ms | 554 ms |
+| 1 | 11 ms | 10 ms |
+| 8 | 8 ms | 51 ms |
+| 64 | 19 ms | 586 ms |
 
 ## With MoveIt (optional)
 
@@ -44,10 +44,10 @@ Through MoveIt's `/plan_kinematic_path`, 20 alternating identical requests per p
 
 | Goal | Planner | Solved | Planning | Path | Motion |
 |---|---|---|---|---|---|
-| Round a wall | OMPL (RRTConnect) | 17/20 | 17.3 ms | 3.99 rad | 2.82 s |
-| Round a wall | batchplan | 20/20 | 4.4 ms | 2.70 rad | 2.28 s |
-| Free space | OMPL (RRTConnect) | 17/20 | 16.1 ms | 2.95 rad | 2.17 s |
-| Free space | batchplan | 20/20 | 4.9 ms | 1.88 rad | 2.52 s |
+| Round a wall | OMPL (RRTConnect) | 16/20 | 15.3 ms | 3.84 rad | 2.59 s |
+| Round a wall | batchplan | 20/20 | 4.0 ms | 2.69 rad | 2.23 s |
+| Free space | OMPL (RRTConnect) | 16/20 | 14.2 ms | 3.13 rad | 2.43 s |
+| Free space | batchplan | 20/20 | 4.6 ms | 1.88 rad | 2.52 s |
 
 batchplan keeps the configuration's jerk limits, which MoveIt's default time parameterization ignores, so its free-space motion is slower.
 
