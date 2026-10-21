@@ -13,10 +13,7 @@ Several goal constraints in one request are planned in one batched call, and the
 
 ## Quick start
 
-The node builds [batchplan](https://github.com/natsuku-lab/batchplan) from source, from a checkout beside this one:
-
 ```bash
-git clone https://github.com/natsuku-lab/batchplan
 git clone https://github.com/natsuku-lab/batchplan-ros
 cd batchplan-ros
 pixi run demo                                    # Linux or macOS (Apple silicon); ROS 2 Jazzy from RoboStack
