@@ -2,9 +2,10 @@
 
 Drag the gizmo to set the goal: IK runs as you drag, and the blue ghost shows where the arm would
 be. Add boxes and drag them around, then Plan to preview the motion in green, or Plan and execute to
-run it on the robot. Best grasp sends one request with many approach poses around the can, which the
-planner plans in one batch, keeping the shortest path. Every request carries the boxes and the can as
-its scene, so the planner keeps no state.
+run it on the robot. Best grasp sends one request with the poses before many grasps of the can, which
+the planner plans in one batch, keeping the shortest path; then the arm moves in to that grasp and the
+fingers close on the can. Every request carries the boxes and the can as its scene, so the planner
+keeps no state.
 """
 
 import io
@@ -17,6 +18,8 @@ import rclpy
 import viser
 import yourdfpy
 from ament_index_python.packages import get_package_share_directory
+from builtin_interfaces.msg import Duration
+from control_msgs.action import FollowJointTrajectory
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import MoveItErrorCodes
 from moveit_msgs.srv import GetPositionIK
@@ -26,14 +29,25 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
+from trajectory_msgs.msg import JointTrajectoryPoint
 from viser.extras import ViserUrdf
 
-from batchplan_viser.messages import box_object, cylinder_object, grasp_poses, pose_goal, pose_msg, seconds
+from batchplan_viser.messages import (
+    APPROACH,
+    FINGER,
+    FINGERS_OPEN,
+    box_object,
+    cylinder_object,
+    grasp_poses,
+    pose_goal,
+    pose_msg,
+    seconds,
+)
 
 GHOST = (0.25, 0.55, 1.0, 0.45)
 PREVIEW = (0.3, 0.85, 0.4, 0.55)
 BOX_SIZE = (0.12, 0.12, 0.3)
-CAN_RADIUS, CAN_HEIGHT = 0.04, 0.2
+CAN_RADIUS, CAN_HEIGHT = 0.03, 0.2
 
 
 def resolve(fname: str) -> str:
@@ -54,6 +68,7 @@ class App(Node):
         self.group = self.declare_parameter("group", "").value
         self.tip = self.declare_parameter("tip_link", "").value
         planner = self.declare_parameter("planner", "/batchplan_planner").value
+        gripper = self.declare_parameter("gripper", "/panda_hand_controller").value
         self.port = self.declare_parameter("port", 8080).value
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
@@ -64,6 +79,7 @@ class App(Node):
         self.create_subscription(JointState, "/joint_states", self.on_state, 10)
         self.planning = ActionClient(self, MoveGroup, f"{planner}/move_group")
         self.ik = self.create_client(GetPositionIK, f"{planner}/compute_ik")
+        self.hand = ActionClient(self, FollowJointTrajectory, f"{gripper}/follow_joint_trajectory")
 
         self.lock = threading.Lock()
         self.ik_busy = self.ik_again = False
@@ -117,7 +133,10 @@ class App(Node):
             gui.add_button("Add box", icon=viser.Icon.BOX).on_click(lambda _: self.add_box())
             gui.add_button("Remove boxes", icon=viser.Icon.TRASH).on_click(lambda _: self.remove_boxes())
         with gui.add_folder("Best of N grasps"):
-            gui.add_markdown("One request with N approach poses around the can: IK for all of them, one batched plan, the shortest path wins.")
+            gui.add_markdown(
+                "One request with the poses before N grasps of the can: IK for all of them, one batched plan, the shortest "
+                "path wins. Then in to the grasp, and the fingers close."
+            )
             self.grasp_count = gui.add_slider("Grasps", min=1, max=64, step=1, initial_value=16)
             gui.add_button("Best grasp", icon=viser.Icon.HAND_GRAB).on_click(lambda _: self.best_grasp(execute=False))
             gui.add_button("Best grasp and execute", icon=viser.Icon.PLAYER_PLAY).on_click(lambda _: self.best_grasp(execute=True))
@@ -181,63 +200,132 @@ class App(Node):
     def best_grasp(self, execute: bool):
         if self.can is None:
             self.add_can()
-        poses = grasp_poses(self.can.position, CAN_RADIUS, int(self.grasp_count.value))
+        threading.Thread(target=self.grasp, args=(execute,), daemon=True).start()
+
+    def grasp(self, execute: bool):
+        """Plans to the best of N poses before a grasp of the can in one request, then in to that
+        grasp, and closes the fingers on the can. On the robot, it then lets go and backs out."""
+        count = int(self.grasp_count.value)
+        grasps = grasp_poses(self.can.position, count)
+        approaches = grasp_poses(self.can.position, count, back=APPROACH)
         for frame in self.grasps:
             frame.remove()
         self.grasps = [
             self.server.scene.add_frame(f"/grasps/{k}", axes_length=0.04, axes_radius=0.003, position=p, wxyz=q)
-            for k, (p, q) in enumerate(poses)
+            for k, (p, q) in enumerate(approaches)
         ]
-        goals = [pose_goal(self.tip, self.frame, p, q) for p, q in poses]
-        self.plan(execute, goals, f"Best of {len(goals)} grasps")
+        opened = {FINGER: FINGERS_OPEN}
+        if execute and not self.grip(FINGERS_OPEN):
+            return
+        approach = self.move([pose_goal(self.tip, self.frame, p, q) for p, q in approaches], execute, self.objects(), opened)
+        if approach is None:
+            return
+        waypoints, times = self.waypoints(approach, opened)
+        reached = self.tip_pose(waypoints[-1])[0]
+        k = min(range(count), key=lambda i: np.linalg.norm(approaches[i][0] - reached))
+        # The fingers may touch what they grasp, so the move in plans without the can.
+        start = opened if execute else waypoints[-1]
+        inward = self.move([pose_goal(self.tip, self.frame, *grasps[k])], execute, self.objects(can=False), start)
+        if inward is None:
+            return
+        if execute:
+            # Close on the can, then let go and back out, so the next request does not start around it.
+            if not self.grip(CAN_RADIUS):
+                return
+            time.sleep(1.0)
+            if not self.grip(FINGERS_OPEN):
+                return
+            if self.move([pose_goal(self.tip, self.frame, *approaches[k])], True, self.objects(can=False), opened) is None:
+                return
+        more, later = self.waypoints(inward, opened)
+        waypoints += more
+        times += [times[-1] + t for t in later]
+        # The fingers close on the can in half a second.
+        for step in range(1, 11):
+            waypoints.append({**waypoints[-1], FINGER: FINGERS_OPEN + (CAN_RADIUS - FINGERS_OPEN) * step / 10})
+            times.append(times[-1] + 0.05)
+        self.status.content = (
+            f"Best of {count} grasps in **{approach.planning_time * 1e3:.1f} ms**, in to the can in "
+            f"**{inward.planning_time * 1e3:.1f} ms**, {times[-1]:.2f} s of motion with the fingers closing"
+            + (", executed, then let go and backed out." if execute else ".")
+        )
+        self.show(waypoints, times, execute)
 
-    def objects(self):
+    def grip(self, opening: float) -> bool:
+        """Moves the fingers to `opening` (each finger's distance from the middle) in half a second."""
+        if not self.hand.wait_for_server(timeout_sec=2.0):
+            self.status.content = "No gripper controller to close the fingers."
+            return False
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = [FINGER]
+        goal.trajectory.points = [JointTrajectoryPoint(positions=[opening], time_from_start=Duration(nanosec=500_000_000))]
+        handle = wait(self.hand.send_goal_async(goal))
+        return handle.accepted and wait(handle.get_result_async()).result.error_code == FollowJointTrajectory.Result.SUCCESSFUL
+
+    def objects(self, can: bool = True):
         objects = [box_object(n, self.frame, c.position, c.wxyz, BOX_SIZE) for n, c, _ in self.boxes]
-        if self.can is not None:
+        if can and self.can is not None:
             objects.append(cylinder_object("can", self.frame, self.can.position, CAN_RADIUS, CAN_HEIGHT))
         return objects
 
-    def plan(self, execute: bool, goals=None, label: str = "Planned"):
+    def plan(self, execute: bool):
+        goals = [pose_goal(self.tip, self.frame, self.goal.position, self.goal.wxyz)]
+        threading.Thread(target=self.plan_to, args=(goals, execute), daemon=True).start()
+
+    def plan_to(self, goals, execute: bool):
+        result = self.move(goals, execute, self.objects())
+        if result is None:
+            return
+        waypoints, times = self.waypoints(result)
+        self.status.content = (
+            f"Planned in **{result.planning_time * 1e3:.1f} ms**, {len(waypoints)} waypoints, {times[-1]:.2f} s of motion"
+            + (", executed." if execute else ".")
+        )
+        self.show(waypoints, times, execute)
+
+    def move(self, goals, execute: bool, objects, start=None):
+        """Sends one MoveGroup request, from `start` (joint positions over the current ones), and waits
+        for it; None, with the reason shown, if it fails."""
         goal = MoveGroup.Goal()
         request = goal.request
         request.group_name = self.group
         request.allowed_planning_time = 2.0
         speed = float(self.speed.value)
         request.max_velocity_scaling_factor, request.max_acceleration_scaling_factor = speed, speed * speed
-        request.goal_constraints = goals or [pose_goal(self.tip, self.frame, self.goal.position, self.goal.wxyz)]
+        request.goal_constraints = goals
+        if start:
+            request.start_state.joint_state = JointState(name=list(start), position=[float(v) for v in start.values()])
         goal.planning_options.plan_only = not execute
         scene = goal.planning_options.planning_scene_diff
         scene.is_diff = True
-        scene.world.collision_objects = self.objects()
+        scene.world.collision_objects = objects
         self.status.content = "Planning..."
-        sent = self.planning.send_goal_async(goal)
-        sent.add_done_callback(lambda f: self.on_accepted(f, execute, label))
-
-    def on_accepted(self, future, execute: bool, label: str):
-        handle = future.result()
+        handle = wait(self.planning.send_goal_async(goal))
         if not handle.accepted:
             self.status.content = "The planner refused the request."
-            return
-        handle.get_result_async().add_done_callback(lambda f: self.on_result(f.result().result, execute, label))
-
-    def on_result(self, result, execute: bool, label: str):
+            return None
+        result = wait(handle.get_result_async()).result
         if result.error_code.val != MoveItErrorCodes.SUCCESS:
             self.status.content = f"**Failed** ({result.error_code.val}): {result.error_code.message}"
-            return
+            return None
+        return result
+
+    def waypoints(self, result, joints=None):
+        """The planned trajectory's waypoints, with every joint (the current ones, then `joints`), and
+        their times."""
         trajectory = result.planned_trajectory.joint_trajectory
-        points = trajectory.points
-        motion = seconds(points[-1].time_from_start)
-        self.status.content = (
-            f"{label} in **{result.planning_time * 1e3:.1f} ms**, {len(points)} waypoints, {motion:.2f} s of motion"
-            + (", executed." if execute else ".")
-        )
-        waypoints = [{**self.joints, **dict(zip(trajectory.joint_names, p.positions))} for p in points]
+        current = {**self.joints, **(joints or {})}
+        waypoints = [{**current, **dict(zip(trajectory.joint_names, p.positions))} for p in trajectory.points]
+        return waypoints, [seconds(p.time_from_start) for p in trajectory.points]
+
+    def show(self, waypoints, times, execute: bool):
+        """Draws the hand's path, and plays the motion on the preview unless the robot ran it."""
         path = np.array([self.tip_pose(w)[0] for w in waypoints])
         self.server.scene.add_line_segments(
             "/path", points=np.stack([path[:-1], path[1:]], axis=1), colors=(60, 200, 90), thickness=0.004
         )
         if not execute:
-            threading.Thread(target=self.play, args=(waypoints, [seconds(p.time_from_start) for p in points]), daemon=True).start()
+            self.play(waypoints, times)
 
     def play(self, waypoints, times):
         with self.lock:
@@ -250,6 +338,13 @@ class App(Node):
                 return
             time.sleep(max(0.0, at - (time.perf_counter() - begun)))
             self.preview.update_cfg(self.configuration(self.preview, waypoint))
+
+
+def wait(future):
+    """A future's result, waited for on a thread the executor does not run."""
+    while not future.done():
+        time.sleep(0.005)
+    return future.result()
 
 
 def main():

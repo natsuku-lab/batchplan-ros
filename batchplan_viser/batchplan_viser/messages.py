@@ -8,6 +8,14 @@ from shape_msgs.msg import SolidPrimitive
 
 # panda_hand is panda_link8 turned -45° about z.
 HAND_IN_LINK8 = -np.pi / 4
+# How far along panda_link8's z axis a grasp puts an object's axis: between the finger pads, which
+# reach from 5.84 to 11.2 cm out, and past the palm, which ends at 6.6 cm.
+GRASP_DEPTH = 0.105
+# The Panda's finger joint, each finger's distance from the middle, and how far it opens.
+FINGER = "panda_finger_joint1"
+FINGERS_OPEN = 0.04
+# How far before a grasp the arm stops, along the hand's approach, to move in from there.
+APPROACH = 0.08
 
 
 def pose_msg(position, wxyz) -> Pose:
@@ -47,11 +55,12 @@ def pose_goal(link: str, frame: str, position, wxyz) -> Constraints:
     return Constraints(position_constraints=[position_constraint], orientation_constraints=[orientation])
 
 
-def grasp_poses(center, radius: float, count: int, facing=(0.0, 0.0), standoff: float = 0.15):
-    """`count` approach poses of the Panda's panda_link8 around a vertical cylinder at `center`: the
-    hand points at the cylinder's axis from `standoff` beyond its surface, its fingers closing
-    horizontally, the first approaching from the side facing the point `facing` (x, y), such as the
-    robot's base. Returns (position, wxyz) pairs."""
+def grasp_poses(center, count: int, facing=(0.0, 0.0), back: float = 0.0):
+    """`count` grasps of a vertical cylinder at `center` by the Panda's hand, as poses of
+    panda_link8: the hand points at the cylinder's axis, which lies between the finger pads
+    (`GRASP_DEPTH`), its fingers closing horizontally, the first from the side facing the point
+    `facing` (x, y), such as the robot's base. Each pose is moved `back` along the hand's approach,
+    for the poses before the grasps. Returns (position, wxyz) pairs."""
     first = np.arctan2(facing[1] - center[1], facing[0] - center[0])
     turn = SO3.from_z_radians(HAND_IN_LINK8).as_matrix()
     poses = []
@@ -62,7 +71,7 @@ def grasp_poses(center, radius: float, count: int, facing=(0.0, 0.0), standoff: 
         y = np.cross(z, [0.0, 0.0, 1.0])
         hand = np.column_stack([np.cross(y, z), y, z])
         link8 = hand @ turn.T
-        poses.append((np.asarray(center, dtype=float) + out * (radius + standoff), SO3.from_matrix(link8).wxyz))
+        poses.append((np.asarray(center, dtype=float) + out * (GRASP_DEPTH + back), SO3.from_matrix(link8).wxyz))
     return poses
 
 

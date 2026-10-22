@@ -27,6 +27,7 @@ viser = ">=1.1,<2"
 yourdfpy = ">=0.0.60,<0.0.61"
 pycollada = ">=0.9,<0.10"
 pytest = ">=9.1.1,<10"
+trimesh = ">=4.12.2,<5"
 
 [pypi-dependencies]
 colcon-ros-cargo = ">=0.2.0,<0.3"

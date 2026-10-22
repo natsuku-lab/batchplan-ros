@@ -1,7 +1,8 @@
 """A simulated Panda planned with batchplan from a browser, without MoveIt.
 
-ros2_control mock hardware runs the arm; batchplan_planner plans and executes through the arm's
-trajectory controller; batchplan_viser serves the scene at http://localhost:8080.
+ros2_control mock hardware runs the arm and its fingers; batchplan_planner plans and executes through
+the arm's trajectory controller; batchplan_viser serves the scene at http://localhost:8080 and moves
+the fingers through theirs.
 """
 
 from pathlib import Path
@@ -37,6 +38,7 @@ def generate_launch_description():
             ),
             spawn("joint_state_broadcaster"),
             spawn("panda_arm_controller"),
+            spawn("panda_hand_controller"),
             Node(
                 package="batchplan_ros",
                 executable="batchplan_planner",

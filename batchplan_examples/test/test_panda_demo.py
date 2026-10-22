@@ -3,21 +3,31 @@
 Run with `pixi run test-demo`; it launches the demo without the browser scene on a domain of its own.
 """
 
+import io
 import os
 import random
 import signal
 import subprocess
 import time
 
+import numpy as np
 import pytest
 import rclpy
+import trimesh
+import yourdfpy
+from builtin_interfaces.msg import Duration
+from control_msgs.action import FollowJointTrajectory
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
 from moveit_msgs.srv import GetPositionIK
 from rclpy.action import ActionClient
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
+from std_msgs.msg import String
+from trajectory_msgs.msg import JointTrajectoryPoint
 
-from batchplan_viser.messages import box_object, pose_goal, pose_msg
+from batchplan_viser.app import resolve
+from batchplan_viser.messages import APPROACH, FINGER, box_object, cylinder_object, grasp_poses, pose_goal, pose_msg
 
 ARM = [f"panda_joint{i}" for i in range(1, 8)]
 
@@ -122,3 +132,68 @@ def test_ik_solves_for_the_link(ros):
     rclpy.spin_until_future_complete(node, answer, timeout_sec=10)
     assert answer.result().error_code.val == MoveItErrorCodes.SUCCESS, answer.result().error_code.message
     assert "panda_joint1" in answer.result().solution.joint_state.name
+
+
+def clearance_to_cylinder(ros, trajectory, center, radius: float, height: float) -> float:
+    """The least distance from the robot's collision meshes to a vertical cylinder along a
+    trajectory, measured at points sampled on the meshes."""
+    node, _, joints = ros
+    description = []
+    latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+    node.create_subscription(String, "/robot_description", lambda m: description.append(m.data), latched)
+    while not description:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    robot = yourdfpy.URDF.load(
+        io.StringIO(description[0]),
+        filename_handler=resolve,
+        load_meshes=False,
+        build_collision_scene_graph=True,
+        load_collision_meshes=True,
+        force_collision_mesh=False,
+    )
+    scene = robot.collision_scene
+    samples = []
+    for name in scene.graph.nodes_geometry:
+        mesh = scene.geometry[scene.graph[name][1]]
+        points, _ = trimesh.sample.sample_surface(mesh, 4000, seed=1)
+        samples.append((name, np.vstack([points, mesh.vertices])))
+    least = np.inf
+    for point in trajectory.points:
+        robot.update_cfg({**joints, **dict(zip(trajectory.joint_names, point.positions))})
+        for name, local in samples:
+            transform = scene.graph.get(name)[0]
+            world = local @ transform[:3, :3].T + transform[:3, 3]
+            beside = np.abs(world[:, 2] - center[2]) < height / 2
+            if beside.any():
+                least = min(least, np.min(np.hypot(*(world[beside, :2] - center[:2]).T) - radius))
+    return least
+
+
+def test_the_hand_moves_in_around_the_can_and_the_fingers_close_on_it(ros):
+    """The browser demo's best grasp, for one grasp: to the pose before it with the can in the scene,
+    then in to the grasp without the can, as the fingers may touch what they grasp. The robot's
+    meshes keep clear of the can and end close around it, and the fingers close on it."""
+    center, radius, height = np.array([0.45, 0.25, 0.1]), 0.03, 0.2
+    (grasp,), (approach,) = grasp_poses(center, 1), grasp_poses(center, 1, back=APPROACH)
+    can = cylinder_object("can", "world", center, radius, height)
+    before = run(ros, request([pose_goal("panda_link8", "world", *approach)], plan_only=False, objects=[can]))
+    assert before.error_code.val == MoveItErrorCodes.SUCCESS, before.error_code.message
+    settle(ros)
+    inward = run(ros, request([pose_goal("panda_link8", "world", *grasp)], plan_only=False))
+    assert inward.error_code.val == MoveItErrorCodes.SUCCESS, inward.error_code.message
+    clearance = clearance_to_cylinder(ros, inward.planned_trajectory.joint_trajectory, center, radius, height)
+    assert 0.0 < clearance < 0.015, f"the robot's meshes come within {clearance * 1e3:.1f} mm of the can"
+
+    node, _, joints = ros
+    hand = ActionClient(node, FollowJointTrajectory, "/panda_hand_controller/follow_joint_trajectory")
+    assert hand.wait_for_server(timeout_sec=10.0), "no gripper controller"
+    goal = FollowJointTrajectory.Goal()
+    goal.trajectory.joint_names = [FINGER]
+    goal.trajectory.points = [JointTrajectoryPoint(positions=[radius], time_from_start=Duration(nanosec=500_000_000))]
+    sent = hand.send_goal_async(goal)
+    rclpy.spin_until_future_complete(node, sent, timeout_sec=10)
+    done = sent.result().get_result_async()
+    rclpy.spin_until_future_complete(node, done, timeout_sec=10)
+    assert done.result().result.error_code == FollowJointTrajectory.Result.SUCCESSFUL
+    settle(ros)
+    assert abs(joints[FINGER] - radius) < 1e-3, f"the fingers stopped at {joints[FINGER]:.4f} m"

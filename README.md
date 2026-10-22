@@ -10,7 +10,7 @@ ROS 2 motion planning with [batchplan](https://github.com/natsuku-lab/batchplan)
 Several goal constraints in one request are planned in one batched call, and the shortest valid path wins.
 
 <p align="center">
-  <img src="docs/best_grasp.gif" alt="A simulated Panda in the browser: 24 approach poses around a can, planned in one request; the arm's preview moves to the nearest one past a box." width="600">
+  <img src="docs/best_grasp.gif" alt="A simulated Panda in the browser: the poses before 24 grasps of a can, planned in one request; the arm's preview moves to the nearest one past a box, in to the grasp, and closes its fingers on the can." width="600">
 </p>
 
 ## Quick start
@@ -21,15 +21,15 @@ cd batchplan-ros
 pixi run demo                                    # Linux or macOS (Apple silicon); ROS 2 Jazzy from RoboStack
 ```
 
-Then open http://localhost:8080: a simulated Panda on ros2_control mock hardware. Drag the gizmo to set a goal (IK runs as you drag), add boxes, and plan or plan and execute. No MoveIt and no GPU are needed; `pixi run demo device:=gpu` plans on the GPU.
+Then open http://localhost:8080: a simulated Panda and its gripper on ros2_control mock hardware. Drag the gizmo to set a goal (IK runs as you drag), add boxes, and plan or plan and execute. No MoveIt and no GPU are needed; `pixi run demo device:=gpu` plans on the GPU.
 
-**Best of N grasps.** "Best grasp" sends one request with N approach poses around a can as its goal constraints. The node solves IK for all of them and plans to every solution in one batched call, keeping the shortest path. `ros2 run batchplan_examples best_grasp.py` times that against one request per grasp, next to a running demo. Wall-clock times on an M4 Pro CPU (the middle of three runs, each the median of 5 requests; other apps running):
+**Best of N grasps.** "Best grasp" sends one request whose goal constraints are the poses 8 cm before N grasps of a can, each around a different side. The node solves IK for all of them and plans to every solution in one batched call, keeping the shortest path. A second request then plans in to that grasp without the can in its scene, since the fingers may touch what they grasp, and the fingers close on the can through their own trajectory controller; on the robot, the hand then lets go and backs out. `ros2 run batchplan_examples best_grasp.py` times the first request against one request per grasp, next to a running demo. Wall-clock times on an M4 Pro CPU (the middle of three runs, each the median of 5 requests; other apps running):
 
 | Grasps | One request | One request per grasp |
 |---|---|---|
 | 1 | 11 ms | 10 ms |
-| 8 | 8 ms | 51 ms |
-| 64 | 19 ms | 586 ms |
+| 8 | 7 ms | 61 ms |
+| 64 | 19 ms | 565 ms |
 
 ## With MoveIt (optional)
 
@@ -43,9 +43,9 @@ Through MoveIt's `/plan_kinematic_path`, 20 alternating identical requests per p
 
 | Goal | Planner | Solved | Planning | Path | Motion |
 |---|---|---|---|---|---|
-| Round a wall | OMPL (RRTConnect) | 16/20 | 15.3 ms | 3.84 rad | 2.59 s |
-| Round a wall | batchplan | 20/20 | 4.0 ms | 2.69 rad | 2.23 s |
-| Free space | OMPL (RRTConnect) | 16/20 | 14.2 ms | 3.13 rad | 2.43 s |
+| Round a wall | OMPL (RRTConnect) | 17/20 | 16.5 ms | 4.03 rad | 2.58 s |
+| Round a wall | batchplan | 20/20 | 4.2 ms | 2.69 rad | 2.23 s |
+| Free space | OMPL (RRTConnect) | 18/20 | 15.2 ms | 3.26 rad | 2.48 s |
 | Free space | batchplan | 20/20 | 4.6 ms | 1.88 rad | 2.52 s |
 
 batchplan keeps the configuration's jerk limits, which MoveIt's default time parameterization ignores, so its free-space motion is slower.
