@@ -29,7 +29,8 @@ struct Entry {
 /// Each joint's limits that the file enables (`has_*_limits: true`).
 pub fn parse(text: &str) -> Result<HashMap<String, JointLimits>> {
     let file: File = serde_saphyr::from_str(text).context("parsing joint_limits.yaml")?;
-    let given = |enabled: bool, value: Option<f64>| value.filter(|&v| enabled && v > 0.0).map(|v| v as f32);
+    let given =
+        |enabled: bool, value: Option<f64>| value.filter(|&v| enabled && v > 0.0).map(|v| v as f32);
     Ok(file
         .joint_limits
         .into_iter()

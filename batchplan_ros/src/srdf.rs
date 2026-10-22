@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result, bail};
+use roxmltree::{Document, Node};
 
 /// A URDF's joints by the links they connect: all MoveIt needs to resolve groups.
 pub struct Tree {
@@ -12,18 +13,26 @@ pub struct Tree {
 
 impl Tree {
     pub fn parse(urdf: &str) -> Result<Self> {
-        let doc = roxmltree::Document::parse(urdf).context("parsing the URDF")?;
-        let child = |n: roxmltree::Node, tag: &str| {
-            n.children().find(|c| c.has_tag_name(tag)).and_then(|c| c.attribute("link")).map(str::to_string)
+        let doc = Document::parse(urdf).context("parsing the URDF")?;
+        let child = |n: Node, tag: &str| {
+            n.children()
+                .find(|c| c.has_tag_name(tag))
+                .and_then(|c| c.attribute("link"))
+                .map(str::to_string)
         };
         let joints = doc
             .root_element()
             .children()
             .filter(|n| n.has_tag_name("joint"))
             .map(|n| {
-                let name = n.attribute("name").context("a URDF joint without a name")?.to_string();
-                let parent = child(n, "parent").with_context(|| format!("joint '{name}' has no parent"))?;
-                let link = child(n, "child").with_context(|| format!("joint '{name}' has no child"))?;
+                let name = n
+                    .attribute("name")
+                    .context("a URDF joint without a name")?
+                    .to_string();
+                let parent =
+                    child(n, "parent").with_context(|| format!("joint '{name}' has no parent"))?;
+                let link =
+                    child(n, "child").with_context(|| format!("joint '{name}' has no child"))?;
                 Ok((name, parent, link))
             })
             .collect::<Result<_>>()?;
@@ -33,7 +42,10 @@ impl Tree {
     /// The link no joint has as its child.
     pub fn root(&self) -> Option<&str> {
         let children: HashSet<&str> = self.joints.iter().map(|(_, _, c)| c.as_str()).collect();
-        self.joints.iter().map(|(_, p, _)| p.as_str()).find(|p| !children.contains(p))
+        self.joints
+            .iter()
+            .map(|(_, p, _)| p.as_str())
+            .find(|p| !children.contains(p))
     }
 
     fn parent_joint(&self, link: &str) -> Option<&(String, String, String)> {
@@ -60,18 +72,22 @@ pub struct Srdf {
 
 impl Srdf {
     pub fn parse(text: &str) -> Result<Self> {
-        let doc = roxmltree::Document::parse(text).context("parsing the SRDF")?;
-        let attr = |n: roxmltree::Node, a: &str| {
-            n.attribute(a).map(str::to_string).with_context(|| format!("SRDF <{}> without {a}", n.tag_name().name()))
+        let doc = Document::parse(text).context("parsing the SRDF")?;
+        let attr = |n: Node, a: &str| {
+            n.attribute(a)
+                .map(str::to_string)
+                .with_context(|| format!("SRDF <{}> without {a}", n.tag_name().name()))
         };
         let mut srdf = Srdf::default();
-        for n in doc.root_element().children().filter(roxmltree::Node::is_element) {
+        for n in doc.root_element().children().filter(Node::is_element) {
             match n.tag_name().name() {
                 "group" => {
                     let mut group = Group::default();
-                    for c in n.children().filter(roxmltree::Node::is_element) {
+                    for c in n.children().filter(Node::is_element) {
                         match c.tag_name().name() {
-                            "chain" => group.chains.push((attr(c, "base_link")?, attr(c, "tip_link")?)),
+                            "chain" => group
+                                .chains
+                                .push((attr(c, "base_link")?, attr(c, "tip_link")?)),
                             "joint" => group.joints.push(attr(c, "name")?),
                             "link" => group.links.push(attr(c, "name")?),
                             "group" => group.subgroups.push(attr(c, "name")?),
@@ -81,7 +97,9 @@ impl Srdf {
                     srdf.groups.insert(attr(n, "name")?, group);
                 }
                 "end_effector" => srdf.end_effector_links.push(attr(n, "parent_link")?),
-                "virtual_joint" => srdf.virtual_joints.push((attr(n, "name")?, attr(n, "parent_frame")?)),
+                "virtual_joint" => srdf
+                    .virtual_joints
+                    .push((attr(n, "name")?, attr(n, "parent_frame")?)),
                 _ => {}
             }
         }
@@ -100,11 +118,20 @@ impl Srdf {
         Ok(joints)
     }
 
-    fn collect(&self, name: &str, tree: &Tree, out: &mut Vec<String>, seen: &mut HashSet<String>) -> Result<()> {
+    fn collect(
+        &self,
+        name: &str,
+        tree: &Tree,
+        out: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
         if !seen.insert(name.to_string()) {
             bail!("group '{name}' contains itself");
         }
-        let group = self.groups.get(name).with_context(|| format!("unknown group '{name}'"))?;
+        let group = self
+            .groups
+            .get(name)
+            .with_context(|| format!("unknown group '{name}'"))?;
         let mut push = |joint: &str| {
             if !out.iter().any(|j| j == joint) {
                 out.push(joint.to_string());
@@ -135,7 +162,8 @@ impl Srdf {
     /// Frames pose goals may name: end effectors' parent links and chain tips.
     pub fn tips(&self) -> Vec<String> {
         let mut tips = self.end_effector_links.clone();
-        for (_, tip) in self.groups.values().flat_map(|g| &g.chains) {
+        let chains = self.groups.values().flat_map(|g| &g.chains);
+        for (_, tip) in chains {
             if !tips.contains(tip) {
                 tips.push(tip.clone());
             }

@@ -1,42 +1,52 @@
 //! MoveIt planning requests, each against the scene it carries.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::Hasher;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use batchplan::{
-    CollisionModel, CollisionWeights, Device, IkOptions, IkProblem, JointLimits, JointTrajectory, MeshModel,
-    PlanOptions, PlanProblem, PlanResult, Robot, RobotOptions, SdfOptions, Trajectory, World, Worlds, solve_ik,
+    CollisionModel, CollisionWeights, Device, IkOptions, IkProblem, JointLimits, JointTrajectory,
+    MeshModel, PlanOptions, PlanProblem, PlanResult, Robot, RobotOptions, SdfOptions, Trajectory,
+    World, Worlds, solve_ik,
 };
 use ros_env::moveit_msgs::msg::{
-    AttachedCollisionObject, MotionPlanRequest, MoveItErrorCodes, PlanningScene, PositionIKRequest, RobotState,
-    RobotTrajectory,
+    AttachedCollisionObject, MotionPlanRequest, MoveItErrorCodes, PlanningScene, PositionIKRequest,
+    RobotState, RobotTrajectory,
 };
 use ros_env::sensor_msgs::msg::JointState;
 
-use crate::goals::{Goal, goals};
+use crate::goals::{self, Goal};
 use crate::scene::{self, Fnv, Frames, Grids};
 use crate::srdf::{Srdf, Tree};
 use crate::{Refusal, state, trajectory};
 
 type Code = MoveItErrorCodes;
 
+/// Where batches run.
+#[derive(Clone, Copy, Debug)]
 pub enum DeviceKind {
-    /// CPU threads; `0` uses every core.
+    /// CPU threads.
     Cpu {
+        /// How many; `0` uses every core.
         threads: usize,
     },
+    /// The first GPU wgpu finds; searches still run on CPU threads.
     Gpu,
 }
 
+/// How a [`Planner`] loads its robot and answers requests.
+#[derive(Debug)]
 pub struct PlannerOptions {
     /// Directories holding the packages `package://` paths name (each prefix's `share/`).
     pub package_dirs: Vec<PathBuf>,
+    /// Limits replacing the URDF's, by joint name, as in MoveIt's `joint_limits.yaml`.
     pub joint_limits: HashMap<String, JointLimits>,
     /// IK frames; the SRDF's end effectors and chain tips when empty.
     pub ee_links: Vec<String>,
+    /// Where batches run.
     pub device: DeviceKind,
     /// Where fitted collision spheres are kept between runs.
     pub cache_dir: Option<PathBuf>,
@@ -58,10 +68,15 @@ impl Default for PlannerOptions {
 }
 
 /// What a request comes to: an error code, and on success the start and the trajectory.
+#[derive(Debug)]
 pub struct Answer {
+    /// `SUCCESS`, or why the request failed.
     pub error_code: MoveItErrorCodes,
+    /// The state the trajectory starts from.
     pub trajectory_start: RobotState,
+    /// The timed trajectory; empty unless the request succeeded.
     pub trajectory: RobotTrajectory,
+    /// Seconds spent answering.
     pub planning_time: f64,
 }
 
@@ -74,6 +89,7 @@ const DEFAULT_BUDGET: f64 = 5.0;
 /// Positions this close outside a limit are moved onto it.
 const LIMIT_TOLERANCE: f32 = 1e-3;
 
+/// Answers MoveIt planning and IK requests for one robot with batchplan.
 pub struct Planner {
     robot: Robot,
     device: Device,
@@ -88,11 +104,26 @@ pub struct Planner {
     dt: f32,
 }
 
+impl fmt::Debug for Planner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Planner")
+            .field("robot", &self.robot.name())
+            .field("device", &self.device.name())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Planner {
-    pub fn new(urdf: &str, srdf: Option<&str>, o: &PlannerOptions) -> Result<Self> {
+    /// Loads the robot from its URDF and SRDF text: the SRDF's disabled collision pairs and end
+    /// effectors, collision spheres fitted once and kept in `o.cache_dir`, and the limits given.
+    pub fn try_new(urdf: &str, srdf: Option<&str>, o: &PlannerOptions) -> Result<Self> {
         let tree = Tree::parse(urdf)?;
         let parsed = srdf.map(Srdf::parse).transpose()?.unwrap_or_default();
-        let hands = if o.ee_links.is_empty() { parsed.tips() } else { o.ee_links.clone() };
+        let hands = if o.ee_links.is_empty() {
+            parsed.tips()
+        } else {
+            o.ee_links.clone()
+        };
         let mut options = RobotOptions {
             ee_links: hands.clone(),
             package_dirs: o.package_dirs.clone(),
@@ -115,7 +146,8 @@ impl Planner {
         let robot = Robot::from_urdf(urdf, &options)?;
         if let Some(path) = cached.filter(|_| options.collision_model.is_none()) {
             if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
             }
             robot.collision_model().save(&path)?;
         }
@@ -124,8 +156,11 @@ impl Planner {
             DeviceKind::Cpu { threads } => Device::cpu_threads(&robot, threads)?,
             DeviceKind::Gpu => Device::gpu(&robot)?,
         };
-        let meshes = MeshModel::new(&robot)?;
-        let root = tree.root().context("the URDF has no root link")?.to_string();
+        let meshes = MeshModel::try_new(&robot)?;
+        let root = tree
+            .root()
+            .context("the URDF has no root link")?
+            .to_string();
         let virtual_joints = parsed.virtual_joints().to_vec();
         Ok(Self {
             robot,
@@ -141,10 +176,14 @@ impl Planner {
         })
     }
 
+    /// The robot it plans for.
+    #[must_use]
     pub fn robot(&self) -> &Robot {
         &self.robot
     }
 
+    /// What runs the batches: the GPU adapter, or the CPU's thread count.
+    #[must_use]
     pub fn device_name(&self) -> String {
         self.device.name()
     }
@@ -152,14 +191,22 @@ impl Planner {
     /// Plans `request` in `scene`, whose collision objects are the whole world. The start is
     /// `current` (the latest joint states), overridden by the scene's robot state and then the
     /// request's start state.
-    pub fn plan(&self, request: &MotionPlanRequest, scene: &PlanningScene, current: Option<&JointState>) -> Answer {
+    pub fn plan(
+        &self,
+        request: &MotionPlanRequest,
+        scene: &PlanningScene,
+        current: Option<&JointState>,
+    ) -> Answer {
         let begun = Instant::now();
         let outcome = self.try_plan(request, scene, current, begun);
         let planning_time = begun.elapsed().as_secs_f64();
         match outcome {
-            Ok((trajectory_start, trajectory)) => {
-                Answer { error_code: code(Code::SUCCESS, ""), trajectory_start, trajectory, planning_time }
-            }
+            Ok((trajectory_start, trajectory)) => Answer {
+                error_code: code(Code::SUCCESS, ""),
+                trajectory_start,
+                trajectory,
+                planning_time,
+            },
             Err(r) => Answer {
                 error_code: code(r.code, &r.message),
                 trajectory_start: RobotState::default(),
@@ -176,7 +223,11 @@ impl Planner {
         current: Option<&JointState>,
         begun: Instant,
     ) -> Result<(RobotState, RobotTrajectory), Refusal> {
-        let seconds = if request.allowed_planning_time > 0.0 { request.allowed_planning_time } else { DEFAULT_BUDGET };
+        let seconds = if request.allowed_planning_time > 0.0 {
+            request.allowed_planning_time
+        } else {
+            DEFAULT_BUDGET
+        };
         let budget = Duration::from_secs_f64(seconds);
         let path = &request.path_constraints;
         let constrained = !(path.joint_constraints.is_empty()
@@ -193,7 +244,14 @@ impl Planner {
         let group = self.group(&request.group_name)?;
         let start = self.start(&request.start_state, scene, current)?;
         let states = [&scene.robot_state, &request.start_state];
-        let frames = Frames::new(&self.robot, &start, &self.root, &self.virtual_joints, &states, scene);
+        let frames = Frames::new(
+            &self.robot,
+            &start,
+            &self.root,
+            &self.virtual_joints,
+            &states,
+            scene,
+        );
 
         let attached: Vec<&AttachedCollisionObject> = scene
             .robot_state
@@ -202,8 +260,11 @@ impl Planner {
             .chain(&request.start_state.attached_collision_objects)
             .collect();
         let holding = self.holding(&attached, &frames)?;
-        let (robot, device, meshes) =
-            holding.as_ref().map_or((&self.robot, &self.device, &self.meshes), |h| (&h.0, &h.1, &h.2));
+        let (robot, device, meshes) = holding
+            .as_ref()
+            .map_or((&self.robot, &self.device, &self.meshes), |h| {
+                (&h.0, &h.1, &h.2)
+            });
         let world = scene::world(scene, &frames, &self.grids)?;
         let worlds = device.upload(std::slice::from_ref(&world)).map_err(crash)?;
 
@@ -216,10 +277,17 @@ impl Planner {
             ));
         }
 
-        let goals = goals(&request.goal_constraints, robot, &group, &start, &self.hands, &frames)?;
+        let goals = goals::goals(
+            &request.goal_constraints,
+            robot,
+            &group,
+            &start,
+            &self.hands,
+            &frames,
+        )?;
         let candidates = candidates(&goals, robot, device, &worlds, &start, &group)?;
-        let speed =
-            factor(request.max_velocity_scaling_factor).min(factor(request.max_acceleration_scaling_factor).sqrt());
+        let speed = factor(request.max_velocity_scaling_factor)
+            .min(factor(request.max_acceleration_scaling_factor).sqrt());
         let hold: Vec<usize> = (0..robot.dof()).filter(|j| !group.contains(j)).collect();
         let problems: Vec<PlanProblem> = candidates
             .iter()
@@ -239,23 +307,31 @@ impl Planner {
             if remaining.is_zero() {
                 break;
             }
-            let mut options = PlanOptions { time_budget: Some(remaining), ..Default::default() };
+            let mut options = PlanOptions {
+                time_budget: Some(remaining),
+                ..Default::default()
+            };
             options.rrt.clearance *= widen;
             options.shortcut.clearance *= widen;
             let result = batchplan::plan(device, &worlds, &problems, &options).map_err(crash)?;
-            let mut solved: Vec<(f32, &[f32])> =
-                result.solved().map(|s| (best_length(&result, s.index), s.solution)).collect();
+            let mut solved: Vec<(f32, &[f32])> = result
+                .solved()
+                .map(|s| (best_length(&result, s.index), s.solution))
+                .collect();
             if solved.is_empty() {
                 break;
             }
             solved.sort_by(|a, b| a.0.total_cmp(&b.0));
             for (_, path) in solved {
-                let sampled =
-                    Trajectory::new(robot, path, speed).and_then(|t| t.sample(1.0 / self.dt)).map_err(crash)?;
+                let sampled = Trajectory::try_new(robot, path, speed)
+                    .and_then(|t| t.sample(1.0 / self.dt))
+                    .map_err(crash)?;
                 if clear_on_meshes(meshes, &world, &sampled)? {
                     let trajectory = trajectory::robot_trajectory(&sampled, robot, &group);
-                    let start_state =
-                        RobotState { joint_state: state::joint_state(robot, &start), ..Default::default() };
+                    let start_state = RobotState {
+                        joint_state: state::joint_state(robot, &start),
+                        ..Default::default()
+                    };
                     return Ok((start_state, trajectory));
                 }
                 touched = true;
@@ -264,7 +340,10 @@ impl Planner {
         Err(if begun.elapsed() >= budget {
             Refusal::new(Code::TIMED_OUT, format!("no path within {seconds} s"))
         } else if touched {
-            Refusal::new(Code::PLANNING_FAILED, "every path found touches the robot's or the scene's meshes")
+            Refusal::new(
+                Code::PLANNING_FAILED,
+                "every path found touches the robot's or the scene's meshes",
+            )
         } else {
             Refusal::new(Code::PLANNING_FAILED, "no collision-free path found")
         })
@@ -283,10 +362,12 @@ impl Planner {
         let objects = scene::attached(attached, frames)?;
         let mut robot = self.robot.clone();
         for object in &objects {
-            robot = robot.attach(object).map_err(|e| Refusal::new(Code::INVALID_OBJECT_NAME, e.to_string()))?;
+            robot = robot
+                .attach(object)
+                .map_err(|e| Refusal::new(Code::INVALID_OBJECT_NAME, e.to_string()))?;
         }
         let device = self.device.with_robot(&robot).map_err(crash)?;
-        let meshes = MeshModel::new(&robot).map_err(crash)?;
+        let meshes = MeshModel::try_new(&robot).map_err(crash)?;
         Ok(Some((robot, device, meshes)))
     }
 
@@ -299,11 +380,17 @@ impl Planner {
         if !self.srdf.has_group(name) {
             return Err(invalid(format!("unknown group '{name}'")));
         }
-        let joints = self.srdf.group_joints(name, &self.tree).map_err(|e| invalid(format!("{e:#}")))?;
-        let dofs: Vec<usize> =
-            (0..self.robot.dof()).filter(|&j| joints.contains(&self.robot.joint_names()[j])).collect();
+        let joints = self
+            .srdf
+            .group_joints(name, &self.tree)
+            .map_err(|e| invalid(format!("{e:#}")))?;
+        let dofs: Vec<usize> = (0..self.robot.dof())
+            .filter(|&j| joints.contains(&self.robot.joint_names()[j]))
+            .collect();
         if dofs.is_empty() {
-            return Err(invalid(format!("group '{name}' moves none of the planned joints")));
+            return Err(invalid(format!(
+                "group '{name}' moves none of the planned joints"
+            )));
         }
         Ok(dofs)
     }
@@ -324,28 +411,45 @@ impl Planner {
 
     /// The configuration nearest `request`'s seed that puts its link at its pose, checked against
     /// the robot itself (the service carries no scene).
-    pub fn ik(&self, request: &PositionIKRequest, current: Option<&JointState>) -> (RobotState, MoveItErrorCodes) {
+    pub fn ik(
+        &self,
+        request: &PositionIKRequest,
+        current: Option<&JointState>,
+    ) -> (RobotState, MoveItErrorCodes) {
         match self.try_ik(request, current) {
             Ok(q) => (
-                RobotState { joint_state: state::joint_state(&self.robot, &q), ..Default::default() },
+                RobotState {
+                    joint_state: state::joint_state(&self.robot, &q),
+                    ..Default::default()
+                },
                 code(Code::SUCCESS, ""),
             ),
             Err(r) => (RobotState::default(), code(r.code, &r.message)),
         }
     }
 
-    fn try_ik(&self, request: &PositionIKRequest, current: Option<&JointState>) -> Result<Vec<f32>, Refusal> {
+    fn try_ik(
+        &self,
+        request: &PositionIKRequest,
+        current: Option<&JointState>,
+    ) -> Result<Vec<f32>, Refusal> {
         let seed = self.start(&request.robot_state, &PlanningScene::default(), current)?;
         let link = match (request.ik_link_name.as_str(), self.hands.as_slice()) {
             ("", [only]) => only.clone(),
-            ("", _) => return Err(Refusal::new(Code::INVALID_LINK_NAME, "name the IK link: the robot has several")),
+            ("", _) => {
+                return Err(Refusal::new(
+                    Code::INVALID_LINK_NAME,
+                    "name the IK link: the robot has several",
+                ));
+            }
             (name, _) => name.to_string(),
         };
-        let hand = self
-            .hands
-            .iter()
-            .position(|h| *h == link)
-            .ok_or_else(|| Refusal::new(Code::INVALID_LINK_NAME, format!("'{link}' is not an IK frame")))?;
+        let hand = self.hands.iter().position(|h| *h == link).ok_or_else(|| {
+            Refusal::new(
+                Code::INVALID_LINK_NAME,
+                format!("'{link}' is not an IK frame"),
+            )
+        })?;
         let frames = Frames::new(
             &self.robot,
             &seed,
@@ -354,12 +458,20 @@ impl Planner {
             &[&request.robot_state],
             &PlanningScene::default(),
         );
-        let target =
-            frames.pose_of(&request.pose_stamped.header.frame_id)?.mul_pose(scene::pose(&request.pose_stamped.pose));
+        let target = frames
+            .pose_of(&request.pose_stamped.header.frame_id)?
+            .mul_pose(scene::pose(&request.pose_stamped.pose));
         let worlds = self.device.upload(&[World::default()]).map_err(crash)?;
-        let targets = (0..self.robot.hands()).map(|h| (h == hand).then_some(target)).collect();
-        let problem = IkProblem { world: 0, targets, seed: Some(seed.clone()) };
-        let result = solve_ik(&self.device, &worlds, &[problem], &IkOptions::default()).map_err(crash)?;
+        let targets = (0..self.robot.hands())
+            .map(|h| (h == hand).then_some(target))
+            .collect();
+        let problem = IkProblem {
+            world: 0,
+            targets,
+            seed: Some(seed.clone()),
+        };
+        let result =
+            solve_ik(&self.device, &worlds, &[problem], &IkOptions::default()).map_err(crash)?;
         result
             .nearest(0, &seed)
             .map(<[f32]>::to_vec)
@@ -389,14 +501,23 @@ fn candidates(
     }
     if !joint_goals.is_empty() {
         let clear = clearances(device, worlds, &joint_goals.concat())?;
-        out.extend(joint_goals.into_iter().zip(clear).filter(|(_, [w, s])| *w >= 0.0 && *s >= 0.0).map(|(q, _)| q));
+        out.extend(
+            joint_goals
+                .into_iter()
+                .zip(clear)
+                .filter(|(_, [w, s])| *w >= 0.0 && *s >= 0.0)
+                .map(|(q, _)| q),
+        );
     }
     let poses: Vec<(usize, batchplan::Pose, f32, f32)> = goals
         .iter()
         .filter_map(|g| match *g {
-            Goal::Pose { hand, pose, position_tolerance, rotation_tolerance } => {
-                Some((hand, pose, position_tolerance, rotation_tolerance))
-            }
+            Goal::Pose {
+                hand,
+                pose,
+                position_tolerance,
+                rotation_tolerance,
+            } => Some((hand, pose, position_tolerance, rotation_tolerance)),
             Goal::Joints(_) => None,
         })
         .collect();
@@ -410,13 +531,23 @@ fn candidates(
             .iter()
             .map(|&(hand, pose, _, _)| IkProblem {
                 world: 0,
-                targets: (0..robot.hands()).map(|h| (h == hand).then_some(pose)).collect(),
+                targets: (0..robot.hands())
+                    .map(|h| (h == hand).then_some(pose))
+                    .collect(),
                 seed: Some(start.to_vec()),
             })
             .collect();
         let ik = solve_ik(device, worlds, &problems, &options).map_err(crash)?;
-        let distance = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
-        let keeps_held = |q: &[f32]| (0..robot.dof()).all(|j| group.contains(&j) || (q[j] - start[j]).abs() < 1e-4);
+        let distance = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).powi(2))
+                .sum::<f32>()
+                .sqrt()
+        };
+        let keeps_held = |q: &[f32]| {
+            (0..robot.dof()).all(|j| group.contains(&j) || (q[j] - start[j]).abs() < 1e-4)
+        };
         for p in 0..problems.len() {
             let mut solutions: Vec<&[f32]> = (p * ik.seeds..(p + 1) * ik.seeds)
                 .filter(|&i| ik.success[i])
@@ -426,7 +557,8 @@ fn candidates(
             solutions.sort_by(|a, b| distance(a, start).total_cmp(&distance(b, start)));
             let mut kept: Vec<&[f32]> = vec![];
             for q in solutions {
-                if kept.len() < SOLUTIONS_PER_POSE && kept.iter().all(|k| distance(k, q) > DISTINCT) {
+                if kept.len() < SOLUTIONS_PER_POSE && kept.iter().all(|k| distance(k, q) > DISTINCT)
+                {
                     kept.push(q);
                 }
             }
@@ -436,7 +568,10 @@ fn candidates(
     if out.is_empty() {
         let only_poses = goals.iter().all(|g| matches!(g, Goal::Pose { .. }));
         return Err(if only_poses {
-            Refusal::new(Code::NO_IK_SOLUTION, "no collision-free IK solution for any pose goal")
+            Refusal::new(
+                Code::NO_IK_SOLUTION,
+                "no collision-free IK solution for any pose goal",
+            )
         } else {
             Refusal::new(Code::GOAL_IN_COLLISION, "every goal is in collision")
         });
@@ -447,16 +582,34 @@ fn candidates(
 /// `[world, self]` sphere clearances of each configuration in `q` (`[n, dof]`).
 fn clearances(device: &Device, worlds: &Worlds, q: &[f32]) -> Result<Vec<[f32; 2]>, Refusal> {
     let n = q.len() / device.robot().dof();
-    let e = device.evaluate(worlds, &vec![0; n], q, &CollisionWeights::NONE).map_err(crash)?;
-    Ok(e.world_clearance.into_iter().zip(e.self_clearance).map(|(w, s)| [w, s]).collect())
+    let e = device
+        .evaluate(worlds, &vec![0; n], q, &CollisionWeights::NONE)
+        .map_err(crash)?;
+    Ok(e.world_clearance
+        .into_iter()
+        .zip(e.self_clearance)
+        .map(|(w, s)| [w, s])
+        .collect())
 }
 
 /// Whether every waypoint clears the scene and the robot itself on the robot's meshes, as
 /// MoveIt checks a returned trajectory.
-fn clear_on_meshes(meshes: &MeshModel, world: &World, sampled: &JointTrajectory) -> Result<bool, Refusal> {
+fn clear_on_meshes(
+    meshes: &MeshModel,
+    world: &World,
+    sampled: &JointTrajectory,
+) -> Result<bool, Refusal> {
     let samples = sampled.positions.len() / sampled.dof;
-    let clear = meshes.clearance(std::slice::from_ref(world), &vec![0; samples], &sampled.positions).map_err(crash)?;
-    Ok(clear.iter().all(|[w, s]| *w > 0.0 && *s > 0.0))
+    let clear = meshes
+        .clearance(
+            std::slice::from_ref(world),
+            &vec![0; samples],
+            &sampled.positions,
+        )
+        .map_err(crash)?;
+    Ok(clear
+        .iter()
+        .all(|c| c.world > 0.0 && c.self_collision > 0.0))
 }
 
 fn best_length(result: &PlanResult, problem: usize) -> f32 {
@@ -472,7 +625,11 @@ fn factor(f: f64) -> f32 {
 }
 
 fn code(val: i32, message: &str) -> MoveItErrorCodes {
-    MoveItErrorCodes { val, message: message.to_string(), source: "batchplan".to_string() }
+    MoveItErrorCodes {
+        val,
+        message: message.to_string(),
+        source: "batchplan".to_string(),
+    }
 }
 
 fn crash(e: batchplan::Error) -> Refusal {

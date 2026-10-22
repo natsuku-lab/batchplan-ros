@@ -9,7 +9,9 @@ ROS 2 motion planning with [batchplan](https://github.com/natsuku-lab/batchplan)
 
 Several goal constraints in one request are planned in one batched call, and the shortest valid path wins.
 
-<img src="docs/best_grasp.gif" alt="A simulated Panda in the browser: 24 approach poses around a can, planned in one request; the arm's preview moves to the nearest one past a box." width="600">
+<p align="center">
+  <img src="docs/best_grasp.gif" alt="A simulated Panda in the browser: 24 approach poses around a can, planned in one request; the arm's preview moves to the nearest one past a box." width="600">
+</p>
 
 ## Quick start
 
@@ -63,4 +65,4 @@ In an existing ROS 2 Jazzy workspace, with `colcon-cargo`, `colcon-ros-cargo` an
 
 ## Status
 
-Early: ROS 2 Jazzy only. CI builds and tests the node and the browser demo on Linux (x86-64) and macOS (Apple silicon), and the MoveIt plugin on Linux.
+Early: ROS 2 Jazzy only. CI builds and tests the node and the browser demo on Linux (x86-64) and macOS (Apple silicon), and the MoveIt plugin on Linux. The Rust node follows [Google's Rust style guide](https://google.github.io/styleguide/rustguide.html), as batchplan does; its [contributing guide](https://github.com/natsuku-lab/batchplan/blob/main/CONTRIBUTING.md) has the commands and the choices.
