@@ -197,3 +197,24 @@ def test_the_hand_moves_in_around_the_can_and_the_fingers_close_on_it(ros):
     assert done.result().result.error_code == FollowJointTrajectory.Result.SUCCESSFUL
     settle(ros)
     assert abs(joints[FINGER] - radius) < 1e-3, f"the fingers stopped at {joints[FINGER]:.4f} m"
+
+
+def test_the_planner_outlives_clients_that_come_and_go(ros):
+    """Clients that send a goal and leave, as scripts do when they end. On Lyrical, rclrs 0.8.0 took
+    a wake-up that followed for an error and ended the node (ros2-rust/ros2_rust#730)."""
+    goal = request([joint_goal([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])])
+    for k in range(3):
+        visitor = rclpy.create_node(f"panda_demo_visitor_{k}")
+        client = ActionClient(visitor, MoveGroup, "/batchplan_planner/move_group")
+        assert client.wait_for_server(timeout_sec=10.0)
+        settled = time.time() + 1.0
+        while time.time() < settled:
+            rclpy.spin_once(visitor, timeout_sec=0.1)
+        sent = client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(visitor, sent, timeout_sec=10)
+        assert sent.result(), f"client {k} got no answer"
+        result = sent.result().get_result_async()
+        rclpy.spin_until_future_complete(visitor, result, timeout_sec=10)
+        assert result.result(), f"client {k} got no answer"
+        client.destroy()
+        visitor.destroy_node()

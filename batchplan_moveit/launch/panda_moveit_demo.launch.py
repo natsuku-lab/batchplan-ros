@@ -37,7 +37,12 @@ def generate_launch_description():
         .planning_pipelines(pipelines=["ompl"])
         .to_moveit_configs()
     )
-    spawn = lambda name: Node(package="controller_manager", executable="spawner", arguments=[name, "-c", "/controller_manager"])
+    controllers = str(panda / "config" / "ros2_controllers.yaml")
+    spawn = lambda name: Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=[name, "-c", "/controller_manager", "--param-file", controllers],
+    )
     return LaunchDescription(
         [
             DeclareLaunchArgument("rviz", default_value="true", description="Start RViz"),
@@ -77,14 +82,14 @@ def generate_launch_description():
             Node(
                 package="tf2_ros",
                 executable="static_transform_publisher",
-                arguments=["0", "0", "0", "0", "0", "0", "world", "panda_link0"],
+                arguments=["--frame-id", "world", "--child-frame-id", "panda_link0"],
                 output="log",
             ),
             Node(package="robot_state_publisher", executable="robot_state_publisher", parameters=[moveit_config.robot_description]),
             Node(
                 package="controller_manager",
                 executable="ros2_control_node",
-                parameters=[str(panda / "config" / "ros2_controllers.yaml")],
+                parameters=[controllers],
                 remappings=[("/controller_manager/robot_description", "/robot_description")],
                 output="screen",
             ),

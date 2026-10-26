@@ -22,7 +22,12 @@ def generate_launch_description():
     urdf = xacro.process_file(str(share / "urdf" / "panda.urdf.xacro")).toxml()
     srdf = (share / "config" / "panda.srdf").read_text()
     controllers = str(share / "config" / "controllers.yaml")
-    spawn = lambda name: Node(package="controller_manager", executable="spawner", arguments=[name], output="screen")
+    spawn = lambda name: Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=[name, "--param-file", controllers],
+        output="screen",
+    )
     return LaunchDescription(
         [
             DeclareLaunchArgument("device", default_value="cpu", description="'cpu' or 'gpu'"),

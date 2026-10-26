@@ -2,27 +2,16 @@
 name = "batchplan-ros"
 version = "0.1.0"
 description = "ROS 2 motion planning with batchplan: batched IK and planning on any GPU or plain CPU threads"
-channels = ["robostack-jazzy", "conda-forge"]
+channels = ["conda-forge"]
 platforms = ["linux-64", "linux-aarch64", { platform = "osx-arm64", macos = "14.0" }]
 
 [dependencies]
-ros-jazzy-ros-base = "*"
-ros-jazzy-rmw-cyclonedds-cpp = "*"
-ros-jazzy-moveit-msgs = "*"
-ros-jazzy-control-msgs = "*"
 rust = "1.99.*"
 compilers = "*"
 cmake = "*"
 pkg-config = "*"
 colcon-common-extensions = ">=0.3.0,<0.4"
 colcon-cargo = ">=0.2.0,<0.3"
-ros-jazzy-moveit-resources-panda-description = ">=3.1.0,<4"
-ros-jazzy-robot-state-publisher = ">=3.3.4,<4"
-ros-jazzy-controller-manager = ">=4.49.0,<5"
-ros-jazzy-joint-trajectory-controller = ">=4.43.0,<5"
-ros-jazzy-joint-state-broadcaster = ">=4.43.0,<5"
-ros-jazzy-ros2-control = ">=4.49.0,<5"
-ros-jazzy-xacro = ">=2.1.1,<3"
 viser = ">=1.1,<2"
 yourdfpy = ">=0.0.60,<0.0.61"
 pycollada = ">=0.9,<0.10"
@@ -42,21 +31,63 @@ RMW_IMPLEMENTATION = "rmw_cyclonedds_cpp"
 [target.osx-arm64.activation.env]
 MACOSX_DEPLOYMENT_TARGET = "14.0"
 
+# Each environment builds into its own build/<environment> and install/<environment>.
 [tasks]
 cargo-ament-build = "cargo install --locked --quiet cargo-ament-build@0.1.11 --root .pixi/cargo"
-build = { cmd = "colcon build --symlink-install --packages-ignore batchplan_moveit", depends-on = ["cargo-ament-build"] }
-test = { cmd = "cargo test --manifest-path batchplan_ros/Cargo.toml", depends-on = ["build"] }
+build = { cmd = "colcon build --symlink-install --build-base build/$PIXI_ENVIRONMENT_NAME --install-base install/$PIXI_ENVIRONMENT_NAME --packages-ignore batchplan_moveit", depends-on = ["cargo-ament-build"] }
+test = { cmd = "cargo test --manifest-path batchplan_ros/Cargo.toml --target-dir build/$PIXI_ENVIRONMENT_NAME/batchplan_ros", depends-on = ["build"] }
 test-demo = { cmd = "scripts/run.sh pytest -q batchplan_examples/test", depends-on = ["build"] }
 demo = { cmd = "scripts/run.sh ros2 launch batchplan_examples panda_demo.launch.py", depends-on = ["build"] }
 
-[feature.moveit.dependencies]
+# ROS 2 Lyrical Luth, the 2026 LTS: the default and `moveit` environments.
+[feature.lyrical]
+channels = [{ channel = "robostack-lyrical", priority = 1 }]
+
+[feature.lyrical.dependencies]
+ros-lyrical-ros-base = "*"
+ros-lyrical-rmw-cyclonedds-cpp = "*"
+ros-lyrical-moveit-msgs = "*"
+ros-lyrical-control-msgs = "*"
+ros-lyrical-moveit-resources-panda-description = ">=3.2.1,<4"
+ros-lyrical-robot-state-publisher = ">=3.5.6,<4"
+ros-lyrical-controller-manager = ">=6.10.1,<7"
+ros-lyrical-joint-trajectory-controller = ">=6.9.0,<7"
+ros-lyrical-joint-state-broadcaster = ">=6.9.0,<7"
+ros-lyrical-ros2-control = ">=6.10.1,<7"
+ros-lyrical-xacro = ">=2.1.1,<3"
+
+[feature.lyrical-moveit.dependencies]
+ros-lyrical-moveit = "*"
+ros-lyrical-moveit-resources-panda-moveit-config = "*"
+
+# ROS 2 Jazzy Jalisco, the 2024 LTS: the `jazzy` and `jazzy-moveit` environments.
+[feature.jazzy]
+channels = [{ channel = "robostack-jazzy", priority = 1 }]
+
+[feature.jazzy.dependencies]
+ros-jazzy-ros-base = "*"
+ros-jazzy-rmw-cyclonedds-cpp = "*"
+ros-jazzy-moveit-msgs = "*"
+ros-jazzy-control-msgs = "*"
+ros-jazzy-moveit-resources-panda-description = ">=3.1.0,<4"
+ros-jazzy-robot-state-publisher = ">=3.3.4,<4"
+ros-jazzy-controller-manager = ">=4.49.0,<5"
+ros-jazzy-joint-trajectory-controller = ">=4.43.0,<5"
+ros-jazzy-joint-state-broadcaster = ">=4.43.0,<5"
+ros-jazzy-ros2-control = ">=4.49.0,<5"
+ros-jazzy-xacro = ">=2.1.1,<3"
+
+[feature.jazzy-moveit.dependencies]
 ros-jazzy-moveit = "*"
 ros-jazzy-moveit-resources-panda-moveit-config = "*"
 
 [feature.moveit.tasks]
-build-moveit = { cmd = "colcon build --symlink-install", depends-on = ["cargo-ament-build"] }
+build-moveit = { cmd = "colcon build --symlink-install --build-base build/$PIXI_ENVIRONMENT_NAME --install-base install/$PIXI_ENVIRONMENT_NAME", depends-on = ["cargo-ament-build"] }
 demo-moveit = { cmd = "scripts/run.sh ros2 launch batchplan_moveit panda_moveit_demo.launch.py", depends-on = ["build-moveit"] }
 test-moveit = { cmd = "scripts/run.sh pytest -q batchplan_moveit/test", depends-on = ["build-moveit"] }
 
 [environments]
-moveit = { features = ["moveit"], solve-group = "default" }
+default = { features = ["lyrical"], solve-group = "lyrical" }
+moveit = { features = ["lyrical", "lyrical-moveit", "moveit"], solve-group = "lyrical" }
+jazzy = { features = ["jazzy"], solve-group = "jazzy" }
+jazzy-moveit = { features = ["jazzy", "jazzy-moveit", "moveit"], solve-group = "jazzy" }

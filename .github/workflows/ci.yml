@@ -9,44 +9,54 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The node and the browser demo, built and tested without MoveIt.
+  # The node and the browser demo, built and tested without MoveIt: Lyrical (default) and Jazzy.
   core:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
+        environment: [default, jazzy]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: prefix-dev/setup-pixi@v0.10.2
         with:
           pixi-version: v0.82.0
+          environments: ${{ matrix.environment }}
           cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: batchplan_ros
-      - run: pixi run build
+          key: ${{ matrix.environment }}
+      - run: pixi run -e ${{ matrix.environment }} build
       - name: Lint
+        if: matrix.environment == 'default'
         run: pixi run bash -c "cd batchplan_ros && cargo fmt --check && cargo clippy --all-targets -- -D warnings"
       # Google's Rust style guide's rustfmt options that only nightly rustfmt has, as in batchplan.
       - name: Nightly rustfmt
+        if: matrix.environment == 'default'
         run: |
           rustup toolchain install nightly --profile minimal -c rustfmt
           cd batchplan_ros && cargo +nightly fmt --check -- --config imports_granularity=Module,hex_literal_case=Lower,format_macro_matchers=true
-      - run: pixi run test
-      - run: pixi run test-demo
+      - run: pixi run -e ${{ matrix.environment }} test
+      - run: pixi run -e ${{ matrix.environment }} test-demo
 
-  # The MoveIt plugin, in its own pixi environment.
+  # The MoveIt plugin, in its own pixi environments: Lyrical and Jazzy.
   moveit:
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [moveit, jazzy-moveit]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: prefix-dev/setup-pixi@v0.10.2
         with:
           pixi-version: v0.82.0
-          environments: moveit
+          environments: ${{ matrix.environment }}
           cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: batchplan_ros
-      - run: pixi run -e moveit test-moveit
+          key: ${{ matrix.environment }}
+      - run: pixi run -e ${{ matrix.environment }} test-moveit

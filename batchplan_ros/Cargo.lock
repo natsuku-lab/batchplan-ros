@@ -1392,8 +1392,7 @@ dependencies = [
 [[package]]
 name = "rclrs"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "445cc875d7c153a96d865eadc0550d6d2aca6ba58ff9cc677b49b4dc0e08ec1f"
+source = "git+https://github.com/ros2-rust/ros2_rust?rev=4dfd469bf463367bb3e72b92defe8827dbb3603f#4dfd469bf463367bb3e72b92defe8827dbb3603f"
 dependencies = [
  "ament_rs",
  "async-std",

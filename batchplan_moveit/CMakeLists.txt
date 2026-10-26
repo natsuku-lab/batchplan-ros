@@ -10,7 +10,15 @@ find_package(rclcpp_action REQUIRED)
 
 add_library(batchplan_moveit SHARED src/batchplan_planner.cpp)
 target_compile_features(batchplan_moveit PUBLIC cxx_std_17)
-ament_target_dependencies(batchplan_moveit moveit_core moveit_msgs pluginlib rclcpp rclcpp_action)
+target_link_libraries(batchplan_moveit PUBLIC
+  moveit_core::moveit_planning_interface
+  moveit_core::moveit_planning_scene
+  moveit_core::moveit_robot_state
+  moveit_core::moveit_robot_trajectory
+  ${moveit_msgs_TARGETS}
+  pluginlib::pluginlib
+  rclcpp::rclcpp
+  rclcpp_action::rclcpp_action)
 
 pluginlib_export_plugin_description_file(moveit_core batchplan_moveit_plugin.xml)
 

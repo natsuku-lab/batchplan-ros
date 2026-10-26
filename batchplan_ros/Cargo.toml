@@ -40,3 +40,8 @@ opt-level = 3
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# rclrs 0.8.0 reads rcl_action's return codes as Jazzy's, so on Lyrical a client that leaves ends the
+# node (ros2-rust/ros2_rust#730). Until a release has the fix, build that pull request's commit.
+[patch.crates-io]
+rclrs = { git = "https://github.com/ros2-rust/ros2_rust", rev = "4dfd469bf463367bb3e72b92defe8827dbb3603f" }
