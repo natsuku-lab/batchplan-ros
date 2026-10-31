@@ -6,8 +6,13 @@ ROS 2 motion planning with [batchplan](https://github.com/natsuku-lab/batchplan)
 
 - `~/move_group` (`moveit_msgs/action/MoveGroup`): plans a `MotionPlanRequest` against the scene in `planning_options.planning_scene_diff`, and executes through a `FollowJointTrajectory` controller unless the goal is plan-only.
 - `~/compute_ik` (`moveit_msgs/srv/GetPositionIK`).
+- `~/compute_cartesian_path` (`moveit_msgs/srv/GetCartesianPath`): the hand in straight lines through waypoints, as far as it reaches, with `fraction` saying how far. The service carries no scene (as with `compute_ik`), so it checks the robot and what its start state holds.
 
-Several goal constraints in one request are planned in one batched call, and the shortest valid path wins.
+Several goal constraints in one request are planned in one batched call, and the shortest valid path wins. Planning requests also take:
+
+- `planner_id: "LIN"`, as Pilz's planner names it: the hand moves in a straight line to its one pose goal, in the request's scene.
+- The scene's `allowed_collision_matrix`: the robot's links may touch the objects it allows, as a hand touches what it grasps. Pairs of the robot's own links are the SRDF's.
+- `max_cartesian_speed` on `cartesian_speed_limited_link` (an IK frame): the trajectory keeps that link under the speed, together with the scaling factors.
 
 <p align="center">
   <img src="docs/best_grasp.gif" alt="A simulated Panda in the browser: the poses before 24 grasps of a can, planned in one request; the arm's preview moves to the nearest one past a box, in to the grasp, and closes its fingers on the can." width="600">
@@ -24,7 +29,7 @@ pixi run -e jazzy demo                           # the same on ROS 2 Jazzy
 
 Then open http://localhost:8080: a simulated Panda and its gripper on ros2_control mock hardware. Drag the gizmo to set a goal (IK runs as you drag), add boxes, and plan or plan and execute. No MoveIt and no GPU are needed; `pixi run demo device:=gpu` plans on the GPU.
 
-**Best of N grasps.** "Best grasp" sends one request whose goal constraints are the poses 8 cm before N grasps of a can, each around a different side. The node solves IK for all of them and plans to every solution in one batched call, keeping the shortest path. A second request then plans in to that grasp without the can in its scene, since the fingers may touch what they grasp, and the fingers close on the can through their own trajectory controller; on the robot, the hand then lets go and backs out. `ros2 run batchplan_examples best_grasp.py` times the first request against one request per grasp, next to a running demo. Wall-clock times on an M4 Pro CPU, on Lyrical (the middle of three runs, each the median of 5 requests; other apps running):
+**Best of N grasps.** "Best grasp" sends one request whose goal constraints are the poses 8 cm before N grasps of a can, each around a different side. The node solves IK for all of them and plans to every solution in one batched call, keeping the shortest path. A second request then moves the hand in to that grasp in a straight line (`LIN`), the can still in the scene and the hand allowed to touch it, and the fingers close on the can through their own trajectory controller; on the robot, the hand then lets go and backs out the same way. `ros2 run batchplan_examples best_grasp.py` times the first request against one request per grasp, next to a running demo. Wall-clock times on an M4 Pro CPU, on Lyrical (the middle of three runs, each the median of 5 requests; other apps running):
 
 | Grasps | One request | One request per grasp |
 |---|---|---|
@@ -38,7 +43,7 @@ Then open http://localhost:8080: a simulated Panda and its gripper on ros2_contr
 pixi run -e moveit demo-moveit                   # -e jazzy-moveit on Jazzy
 ```
 
-This is MoveIt's stock Panda demo, with a `batchplan` pipeline next to OMPL. In RViz's MotionPlanning panel, pick "batchplan" under Context → Planning Library, then Plan or Plan & Execute. The `batchplan_moveit` plugin forwards each request, with MoveIt's planning scene, to the planner node, waits within the request's planning time, and hands MoveIt a timed trajectory; MoveIt's own checks and controllers take it from there. Everything without MoveIt keeps working without it: the plugin is its own package and pixi environment.
+This is MoveIt's stock Panda demo, with a `batchplan` pipeline next to OMPL. In RViz's MotionPlanning panel, pick "batchplan" under Context → Planning Library, then Plan or Plan & Execute. The `batchplan_moveit` plugin forwards each request, with MoveIt's planning scene (its allowed collision matrix included), to the planner node, waits within the request's planning time, and hands MoveIt a timed trajectory; MoveIt's own checks and controllers take it from there. Everything without MoveIt keeps working without it: the plugin is its own package and pixi environment.
 
 Through MoveIt's `/plan_kinematic_path`, 20 alternating identical requests per planner on an M4 Pro CPU, on Lyrical (other apps running), medians:
 

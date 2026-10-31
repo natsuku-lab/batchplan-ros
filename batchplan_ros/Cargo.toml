@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-batchplan = "0.2"
+batchplan = "0.3"
 futures = "0.3"
 rclrs = "0.8"
 ros-env = "0.3"

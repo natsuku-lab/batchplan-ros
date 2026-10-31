@@ -8,14 +8,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use batchplan::{
-    CollisionModel, CollisionWeights, Device, IkOptions, IkProblem, JointLimits, JointTrajectory,
-    MeshModel, PlanOptions, PlanProblem, PlanResult, Robot, RobotOptions, SdfOptions, Trajectory,
-    World, Worlds, solve_ik,
+    CollisionModel, CollisionWeights, Device, HandSpeed, IkOptions, IkProblem, JointLimits,
+    JointTrajectory, MeshModel, PlanOptions, PlanProblem, PlanResult, Robot, RobotOptions,
+    SdfOptions, ToolPath, ToolPathOptions, ToolPathStop, Trajectory, World, Worlds, solve_ik,
 };
 use ros_env::moveit_msgs::msg::{
     AttachedCollisionObject, MotionPlanRequest, MoveItErrorCodes, PlanningScene, PositionIKRequest,
     RobotState, RobotTrajectory,
 };
+use ros_env::moveit_msgs::srv::{GetCartesianPath_Request, GetCartesianPath_Response};
 use ros_env::sensor_msgs::msg::JointState;
 
 use crate::goals::{self, Goal};
@@ -88,6 +89,9 @@ const DISTINCT: f32 = 0.05;
 const DEFAULT_BUDGET: f64 = 5.0;
 /// Positions this close outside a limit are moved onto it.
 const LIMIT_TOLERANCE: f32 = 1e-3;
+/// The planner id that asks for the hand to move in a straight line to its goal, as Pilz's
+/// industrial motion planner names it.
+const STRAIGHT: &str = "LIN";
 
 /// Answers MoveIt planning and IK requests for one robot with batchplan.
 pub struct Planner {
@@ -265,7 +269,7 @@ impl Planner {
             .map_or((&self.robot, &self.device, &self.meshes), |h| {
                 (&h.0, &h.1, &h.2)
             });
-        let world = scene::world(scene, &frames, &self.grids)?;
+        let world = scene::world(scene, &frames, &self.grids, robot)?;
         let worlds = device.upload(std::slice::from_ref(&world)).map_err(crash)?;
 
         let clear = clearances(device, &worlds, &start)?;
@@ -285,9 +289,56 @@ impl Planner {
             &self.hands,
             &frames,
         )?;
-        let candidates = candidates(&goals, robot, device, &worlds, &start, &group)?;
         let speed = factor(request.max_velocity_scaling_factor)
             .min(factor(request.max_acceleration_scaling_factor).sqrt());
+        let cap = self.cap(
+            &request.cartesian_speed_limited_link,
+            request.max_cartesian_speed,
+        )?;
+        let start_state = || RobotState {
+            joint_state: state::joint_state(robot, &start),
+            ..Default::default()
+        };
+        if request.planner_id == STRAIGHT {
+            let (hand, pose) = match goals.as_slice() {
+                [Goal::Pose { hand, pose, .. }] => (*hand, *pose),
+                _ => {
+                    return Err(Refusal::new(
+                        Code::INVALID_GOAL_CONSTRAINTS,
+                        "a LIN request needs exactly one pose goal",
+                    ));
+                }
+            };
+            moves_within(robot, hand, &group)?;
+            let path = ToolPath {
+                world: 0,
+                start: start.clone(),
+                hand,
+                waypoints: vec![pose],
+            };
+            let result = batchplan::follow(device, &worlds, &[path], &ToolPathOptions::default())
+                .map_err(crash)?;
+            if let Some(why) = result.stopped[0] {
+                return Err(Refusal::new(
+                    Code::PLANNING_FAILED,
+                    format!(
+                        "the straight line stops {:.0}% of the way: {}",
+                        100.0 * result.fraction[0],
+                        stop(why)
+                    ),
+                ));
+            }
+            let sampled = timed(robot, &result.paths[0], &start, speed, cap, self.dt)?;
+            if !clear_on_meshes(meshes, &world, &sampled)? {
+                return Err(Refusal::new(
+                    Code::PLANNING_FAILED,
+                    "the straight line touches the robot's or the scene's meshes",
+                ));
+            }
+            let trajectory = trajectory::robot_trajectory(&sampled, robot, &group);
+            return Ok((start_state(), trajectory));
+        }
+        let candidates = candidates(&goals, robot, device, &worlds, &start, &group)?;
         let hold: Vec<usize> = (0..robot.dof()).filter(|j| !group.contains(j)).collect();
         let problems: Vec<PlanProblem> = candidates
             .iter()
@@ -323,16 +374,10 @@ impl Planner {
             }
             solved.sort_by(|a, b| a.0.total_cmp(&b.0));
             for (_, path) in solved {
-                let sampled = Trajectory::try_new(robot, path, speed)
-                    .and_then(|t| t.sample(1.0 / self.dt))
-                    .map_err(crash)?;
+                let sampled = timed(robot, path, &start, speed, cap, self.dt)?;
                 if clear_on_meshes(meshes, &world, &sampled)? {
                     let trajectory = trajectory::robot_trajectory(&sampled, robot, &group);
-                    let start_state = RobotState {
-                        joint_state: state::joint_state(robot, &start),
-                        ..Default::default()
-                    };
-                    return Ok((start_state, trajectory));
+                    return Ok((start_state(), trajectory));
                 }
                 touched = true;
             }
@@ -369,6 +414,39 @@ impl Planner {
         let device = self.device.with_robot(&robot).map_err(crash)?;
         let meshes = MeshModel::try_new(&robot).map_err(crash)?;
         Ok(Some((robot, device, meshes)))
+    }
+
+    /// The hand whose IK frame is `link`; with none named, the robot's only hand.
+    fn hand(&self, link: &str) -> Result<usize, Refusal> {
+        let link = match (link, self.hands.as_slice()) {
+            ("", [only]) => only.as_str(),
+            ("", _) => {
+                return Err(Refusal::new(
+                    Code::INVALID_LINK_NAME,
+                    "name the IK link: the robot has several",
+                ));
+            }
+            (name, _) => name,
+        };
+        self.hands.iter().position(|h| h == link).ok_or_else(|| {
+            Refusal::new(
+                Code::INVALID_LINK_NAME,
+                format!("'{link}' is not an IK frame"),
+            )
+        })
+    }
+
+    /// A request's cap on a link's speed (m/s), as a cap on the hand whose IK frame it is; none
+    /// where the request gives no positive speed.
+    fn cap(&self, link: &str, speed: f64) -> Result<Option<HandSpeed>, Refusal> {
+        if !(speed > 0.0 && speed.is_finite()) {
+            return Ok(None);
+        }
+        Ok(Some(HandSpeed {
+            hand: self.hand(link)?,
+            linear: speed as f32,
+            angular: f32::INFINITY,
+        }))
     }
 
     /// The planned joints `group` moves: every one for an empty name.
@@ -428,28 +506,120 @@ impl Planner {
         }
     }
 
+    /// The hand moved in straight lines through `request`'s waypoints, as MoveIt's
+    /// `compute_cartesian_path` moves it, as far as it gets: `fraction` says how much of the path
+    /// the trajectory covers. The service carries no scene, so the motion is checked against the
+    /// robot and the objects it holds, whatever `avoid_collisions` says.
+    pub fn cartesian_path(
+        &self,
+        request: &GetCartesianPath_Request,
+        current: Option<&JointState>,
+    ) -> GetCartesianPath_Response {
+        match self.try_cartesian_path(request, current) {
+            Ok((start_state, solution, fraction)) => GetCartesianPath_Response {
+                start_state,
+                solution,
+                fraction,
+                error_code: code(Code::SUCCESS, ""),
+            },
+            Err(r) => GetCartesianPath_Response {
+                error_code: code(r.code, &r.message),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn try_cartesian_path(
+        &self,
+        request: &GetCartesianPath_Request,
+        current: Option<&JointState>,
+    ) -> Result<(RobotState, RobotTrajectory, f64), Refusal> {
+        let constraints = &request.path_constraints;
+        if !(constraints.joint_constraints.is_empty()
+            && constraints.position_constraints.is_empty()
+            && constraints.orientation_constraints.is_empty()
+            && constraints.visibility_constraints.is_empty())
+        {
+            return Err(Refusal::new(
+                Code::INVALID_GOAL_CONSTRAINTS,
+                "path constraints are not supported",
+            ));
+        }
+        let scene = PlanningScene::default();
+        let group = self.group(&request.group_name)?;
+        let start = self.start(&request.start_state, &scene, current)?;
+        let frames = Frames::new(
+            &self.robot,
+            &start,
+            &self.root,
+            &self.virtual_joints,
+            &[&request.start_state],
+            &scene,
+        );
+        let attached: Vec<&AttachedCollisionObject> = request
+            .start_state
+            .attached_collision_objects
+            .iter()
+            .collect();
+        let holding = self.holding(&attached, &frames)?;
+        let (robot, device) = holding
+            .as_ref()
+            .map_or((&self.robot, &self.device), |h| (&h.0, &h.1));
+        let hand = self.hand(&request.link_name)?;
+        moves_within(robot, hand, &group)?;
+        if request.waypoints.is_empty() {
+            return Err(Refusal::new(
+                Code::INVALID_GOAL_CONSTRAINTS,
+                "the request has no waypoints",
+            ));
+        }
+        let base = frames.pose_of(&request.header.frame_id)?;
+        let waypoints = request
+            .waypoints
+            .iter()
+            .map(|w| base.mul_pose(scene::pose(w)))
+            .collect();
+        let options = ToolPathOptions {
+            step: if request.max_step > 0.0 {
+                request.max_step as f32
+            } else {
+                ToolPathOptions::default().step
+            },
+            ..Default::default()
+        };
+        let path = ToolPath {
+            world: 0,
+            start: start.clone(),
+            hand,
+            waypoints,
+        };
+        let worlds = device.upload(&[World::default()]).map_err(crash)?;
+        let result = batchplan::follow(device, &worlds, &[path], &options).map_err(crash)?;
+        let speed = factor(request.max_velocity_scaling_factor)
+            .min(factor(request.max_acceleration_scaling_factor).sqrt());
+        let cap = self.cap(
+            &request.cartesian_speed_limited_link,
+            request.max_cartesian_speed,
+        )?;
+        let sampled = timed(robot, &result.paths[0], &start, speed, cap, self.dt)?;
+        let start_state = RobotState {
+            joint_state: state::joint_state(robot, &start),
+            ..Default::default()
+        };
+        Ok((
+            start_state,
+            trajectory::robot_trajectory(&sampled, robot, &group),
+            f64::from(result.fraction[0]),
+        ))
+    }
+
     fn try_ik(
         &self,
         request: &PositionIKRequest,
         current: Option<&JointState>,
     ) -> Result<Vec<f32>, Refusal> {
         let seed = self.start(&request.robot_state, &PlanningScene::default(), current)?;
-        let link = match (request.ik_link_name.as_str(), self.hands.as_slice()) {
-            ("", [only]) => only.clone(),
-            ("", _) => {
-                return Err(Refusal::new(
-                    Code::INVALID_LINK_NAME,
-                    "name the IK link: the robot has several",
-                ));
-            }
-            (name, _) => name.to_string(),
-        };
-        let hand = self.hands.iter().position(|h| *h == link).ok_or_else(|| {
-            Refusal::new(
-                Code::INVALID_LINK_NAME,
-                format!("'{link}' is not an IK frame"),
-            )
-        })?;
+        let hand = self.hand(&request.ik_link_name)?;
         let frames = Frames::new(
             &self.robot,
             &seed,
@@ -577,6 +747,80 @@ fn candidates(
         });
     }
     Ok(out)
+}
+
+/// Refuses a straight move whose hand moves joints `group` does not plan.
+fn moves_within(robot: &Robot, hand: usize, group: &[usize]) -> Result<(), Refusal> {
+    match robot
+        .hand_joints(hand)
+        .into_iter()
+        .find(|j| !group.contains(j))
+    {
+        Some(j) => Err(Refusal::new(
+            Code::INVALID_GROUP_NAME,
+            format!(
+                "moving the hand in a straight line moves '{}', which the group does not plan",
+                robot.joint_names()[j]
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Why a straight line stops short, in words.
+fn stop(why: ToolPathStop) -> &'static str {
+    match why {
+        ToolPathStop::Unreachable { .. } => "the next pose is out of reach",
+        ToolPathStop::Collision { .. } => "going on would collide",
+        ToolPathStop::Jump { .. } => "the arm would have to jump between configurations",
+        _ => "it cannot go on",
+    }
+}
+
+/// `path` (B-spline control points, or none for a motion that stays at `start`) timed within the
+/// joints' limits slowed by `speed`, as MoveIt's scaling factors slow them, and with the hand under
+/// `cap` where there is one; sampled every `dt`.
+fn timed(
+    robot: &Robot,
+    path: &[f32],
+    start: &[f32],
+    speed: f32,
+    cap: Option<HandSpeed>,
+    dt: f32,
+) -> Result<JointTrajectory, Refusal> {
+    if path.is_empty() {
+        let zeros = vec![0.0; start.len()];
+        return Ok(JointTrajectory {
+            dof: start.len(),
+            dt,
+            duration: 0.0,
+            positions: start.to_vec(),
+            velocities: zeros.clone(),
+            accelerations: zeros,
+        });
+    }
+    let Some(cap) = cap else {
+        return Trajectory::try_new(robot, path, speed)
+            .and_then(|t| t.sample(1.0 / dt))
+            .map_err(crash);
+    };
+    // Timed at full speed with the cap raised by 1 / speed, then slowed by speed: the joints keep
+    // within their limits scaled by speed (accelerations by its square), and the hand under the cap.
+    let raised = HandSpeed {
+        linear: cap.linear / speed,
+        ..cap
+    };
+    let mut sampled = Trajectory::with_hand_speed(robot, path, &raised)
+        .and_then(|t| t.sample(1.0 / (speed * dt)))
+        .map_err(crash)?;
+    sampled.dt = dt;
+    sampled.duration /= speed;
+    sampled.velocities.iter_mut().for_each(|v| *v *= speed);
+    sampled
+        .accelerations
+        .iter_mut()
+        .for_each(|a| *a *= speed * speed);
+    Ok(sampled)
 }
 
 /// `[world, self]` sphere clearances of each configuration in `q` (`[n, dof]`).

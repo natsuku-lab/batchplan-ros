@@ -9,10 +9,11 @@ use batchplan::{MeshModel, Obstacle, Pose, World};
 use batchplan_ros::{Answer, Planner, PlannerOptions};
 use ros_env::geometry_msgs::msg as geometry;
 use ros_env::moveit_msgs::msg::{
-    AttachedCollisionObject, CollisionObject, Constraints, JointConstraint, MotionPlanRequest,
-    MoveItErrorCodes as Code, OrientationConstraint, PlanningScene, PositionConstraint,
-    PositionIKRequest,
+    AllowedCollisionEntry, AllowedCollisionMatrix, AttachedCollisionObject, CollisionObject,
+    Constraints, JointConstraint, MotionPlanRequest, MoveItErrorCodes as Code,
+    OrientationConstraint, PlanningScene, PositionConstraint, PositionIKRequest, RobotTrajectory,
 };
+use ros_env::moveit_msgs::srv::GetCartesianPath_Request;
 use ros_env::sensor_msgs::msg::JointState;
 use ros_env::shape_msgs::msg::{Mesh, MeshTriangle, SolidPrimitive};
 
@@ -191,13 +192,72 @@ fn succeeded(answer: &Answer) {
 
 /// The planned joints at waypoint `k`, with the joints the trajectory leaves out at `rest`.
 fn waypoint(answer: &Answer, k: usize, rest: &[f32]) -> Vec<f32> {
+    joints_at(&answer.trajectory, k, rest)
+}
+
+fn joints_at(trajectory: &RobotTrajectory, k: usize, rest: &[f32]) -> Vec<f32> {
     let names = PLANNER.robot().joint_names();
-    let t = &answer.trajectory.joint_trajectory;
+    let t = &trajectory.joint_trajectory;
     let mut q = rest.to_vec();
     for (name, v) in t.joint_names.iter().zip(&t.points[k].positions) {
         q[names.iter().position(|n| n == name).unwrap()] = *v as f32;
     }
     q
+}
+
+/// Where the hand's IK frame (panda_link8) is at each waypoint, and when, from a start at `arm`.
+fn hand_path(trajectory: &RobotTrajectory, arm: &[f64]) -> Vec<(f64, Vec3)> {
+    let rest = full(arm);
+    let points = &trajectory.joint_trajectory.points;
+    (0..points.len())
+        .map(|k| {
+            let q = joints_at(trajectory, k, &rest);
+            let at = PLANNER.robot().ee_pose(&q, 0).position;
+            (seconds(&points[k].time_from_start), at)
+        })
+        .collect()
+}
+
+/// The hand's fastest speed between waypoints, m/s.
+fn fastest(path: &[(f64, Vec3)]) -> f64 {
+    path.windows(2)
+        .map(|w| f64::from((w[1].1 - w[0].1).length()) / (w[1].0 - w[0].0))
+        .fold(0.0, f64::max)
+}
+
+/// How far `p` is from the segment from `a` to `b`.
+fn off_segment(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let along = (p - a).dot(b - a) / (b - a).length_squared();
+    (p - (a + (b - a) * along.clamp(0.0, 1.0))).length()
+}
+
+/// A matrix in which `object` and each of `links` may touch as `allowed` says, and nothing else.
+fn allowing(object: &str, links: &[&str], allowed: bool) -> AllowedCollisionMatrix {
+    let names: Vec<String> = [object]
+        .iter()
+        .chain(links)
+        .map(|n| n.to_string())
+        .collect();
+    let entry_values = (0..names.len())
+        .map(|i| AllowedCollisionEntry {
+            enabled: (0..names.len())
+                .map(|j| (i == 0) != (j == 0) && allowed)
+                .collect(),
+        })
+        .collect();
+    AllowedCollisionMatrix {
+        entry_names: names,
+        entry_values,
+        ..Default::default()
+    }
+}
+
+/// A straight move of panda_link8 to `goal`, as Pilz's LIN asks for one.
+fn lin(goal: Pose) -> MotionPlanRequest {
+    MotionPlanRequest {
+        planner_id: "LIN".into(),
+        ..request("panda_arm", vec![pose_goal("panda_link8", "world", goal)])
+    }
 }
 
 fn seconds(d: &ros_env::builtin_interfaces::msg::Duration) -> f64 {
@@ -364,13 +424,11 @@ fn obstacles_in_the_scene_are_avoided() {
     let wall = cuboid("wall", "world", [0.55, 0.0, 0.3], [0.1, 0.3, 0.6]);
     let robot = PLANNER.robot();
     let meshes = MeshModel::try_new(robot).unwrap();
-    let world = World {
-        obstacles: vec![Obstacle::Cuboid {
-            center: Vec3::new(0.55, 0.0, 0.3),
-            half_extents: Vec3::new(0.05, 0.15, 0.3),
-            rotation: Quat::IDENTITY,
-        }],
-    };
+    let world = World::new(vec![Obstacle::Cuboid {
+        center: Vec3::new(0.55, 0.0, 0.3),
+        half_extents: Vec3::new(0.05, 0.15, 0.3),
+        rotation: Quat::IDENTITY,
+    }]);
     let clear = |q: &[f32]| {
         meshes
             .clearance(std::slice::from_ref(&world), &[0], q)
@@ -844,5 +902,216 @@ fn joint_limits_files_give_the_limits_they_enable() {
             limits["panda_joint2"].acceleration
         ),
         (None, Some(3.75))
+    );
+}
+
+#[test]
+fn lin_moves_the_hand_in_a_straight_line() {
+    let start = PLANNER.robot().ee_pose(&full(&READY), 0);
+    let goal = Pose::new(start.position + Vec3::new(0.1, 0.1, -0.2), start.rotation);
+    let answer = plan(&lin(goal), &scene(vec![]), &READY);
+    succeeded(&answer);
+    let path = hand_path(&answer.trajectory, &READY);
+    let off = path
+        .iter()
+        .map(|&(_, p)| off_segment(p, start.position, goal.position))
+        .fold(0.0, f32::max);
+    assert!(
+        off < 2e-3,
+        "the hand strays {:.1} mm from the line",
+        off * 1e3
+    );
+    let end = path.last().unwrap().1;
+    assert!((end - goal.position).length() < 2e-3);
+    // A planned motion to the same pose leaves the line, so the check above tells them apart.
+    let planned = plan(
+        &request("panda_arm", vec![pose_goal("panda_link8", "world", goal)]),
+        &scene(vec![]),
+        &READY,
+    );
+    succeeded(&planned);
+    let strays = hand_path(&planned.trajectory, &READY)
+        .iter()
+        .map(|&(_, p)| off_segment(p, start.position, goal.position))
+        .fold(0.0, f32::max);
+    assert!(
+        strays > 5e-3,
+        "the planned motion strays only {:.1} mm",
+        strays * 1e3
+    );
+
+    // A box across the line, clear of the start and the goal, stops it; LIN takes no joint goals.
+    let on_line = start.position.lerp(goal.position, 0.6);
+    let across = cuboid("box", "world", on_line.to_array().map(f64::from), [0.04; 3]);
+    let blocked = plan(&lin(goal), &scene(vec![across]), &READY);
+    assert_eq!(blocked.error_code.val, Code::PLANNING_FAILED);
+    assert!(
+        blocked.error_code.message.contains("collide"),
+        "{}",
+        blocked.error_code.message
+    );
+    let joints = MotionPlanRequest {
+        planner_id: "LIN".into(),
+        ..request("panda_arm", vec![joint_goal(&ARM, &READY)])
+    };
+    assert_eq!(
+        plan(&joints, &scene(vec![]), &READY).error_code.val,
+        Code::INVALID_GOAL_CONSTRAINTS
+    );
+}
+
+#[test]
+fn the_allowed_collision_matrix_lets_links_touch_objects() {
+    let at = PLANNER
+        .robot()
+        .link_pose(&full(&READY), "panda_leftfinger")
+        .unwrap()
+        .position;
+    let block = cuboid("block", "world", at.to_array().map(f64::from), [0.02; 3]);
+    let away = request(
+        "panda_arm",
+        vec![joint_goal(&ARM, &[0.3, -0.5, 0.0, -2.2, 0.0, 1.7, 0.785])],
+    );
+    let mut touching = scene(vec![block]);
+    let code = |s: &PlanningScene| plan(&away, s, &READY).error_code.val;
+    assert_eq!(code(&touching), Code::START_STATE_IN_COLLISION);
+    let hand = ["panda_hand", "panda_leftfinger", "panda_rightfinger"];
+    touching.allowed_collision_matrix = allowing("block", &hand, true);
+    assert_eq!(code(&touching), Code::SUCCESS);
+    // MoveIt reads a pair from the matrix's upper triangle: the block's row here, as it comes first.
+    let mut upper = allowing("block", &hand, true);
+    upper.entry_values[1..]
+        .iter_mut()
+        .for_each(|row| row.enabled[0] = false);
+    touching.allowed_collision_matrix = upper;
+    assert_eq!(code(&touching), Code::SUCCESS);
+    let mut lower = allowing("block", &hand, true);
+    lower.entry_values[0].enabled.fill(false);
+    touching.allowed_collision_matrix = lower;
+    assert_eq!(code(&touching), Code::START_STATE_IN_COLLISION);
+    // A default entry lets every link touch the block...
+    touching.allowed_collision_matrix = AllowedCollisionMatrix {
+        default_entry_names: vec!["block".into()],
+        default_entry_values: vec![true],
+        ..Default::default()
+    };
+    assert_eq!(code(&touching), Code::SUCCESS);
+    // ...unless an entry for the pair says otherwise.
+    let defaults = touching.allowed_collision_matrix.clone();
+    touching.allowed_collision_matrix = AllowedCollisionMatrix {
+        default_entry_names: defaults.default_entry_names,
+        default_entry_values: defaults.default_entry_values,
+        ..allowing("block", &hand, false)
+    };
+    assert_eq!(code(&touching), Code::START_STATE_IN_COLLISION);
+}
+
+#[test]
+fn a_cartesian_speed_cap_slows_the_hand() {
+    let goal = [0.8, -0.3, 0.2, -1.8, 0.1, 1.9, 0.5];
+    let free = request("panda_arm", vec![joint_goal(&ARM, &goal)]);
+    let run = |r: &MotionPlanRequest| {
+        let answer = plan(r, &scene(vec![]), &READY);
+        succeeded(&answer);
+        answer
+    };
+    let uncapped = fastest(&hand_path(&run(&free).trajectory, &READY));
+    assert!(
+        uncapped > 0.3,
+        "the hand moves at only {uncapped} m/s uncapped"
+    );
+    let mut capped = MotionPlanRequest {
+        cartesian_speed_limited_link: "panda_link8".into(),
+        max_cartesian_speed: 0.1,
+        ..free
+    };
+    let speed = fastest(&hand_path(&run(&capped).trajectory, &READY));
+    assert!(speed < 0.1 * 1.02, "the hand reaches {speed} m/s");
+    // With the joints slowed as well, both hold.
+    (
+        capped.max_velocity_scaling_factor,
+        capped.max_acceleration_scaling_factor,
+    ) = (0.3, 0.09);
+    let slowed = run(&capped);
+    let speed = fastest(&hand_path(&slowed.trajectory, &READY));
+    assert!(speed < 0.1 * 1.02, "the hand reaches {speed} m/s");
+    let robot = PLANNER.robot();
+    let t = &slowed.trajectory.joint_trajectory;
+    for point in &t.points {
+        for (name, v) in t.joint_names.iter().zip(&point.velocities) {
+            let j = robot.joint_names().iter().position(|n| n == name).unwrap();
+            let limit = 0.3 * f64::from(robot.max_velocity()[j]);
+            assert!(
+                v.abs() <= limit * 1.001,
+                "{name} at {v} rad/s, over {limit}"
+            );
+        }
+    }
+    capped.cartesian_speed_limited_link = "panda_link3".into();
+    assert_eq!(
+        plan(&capped, &scene(vec![]), &READY).error_code.val,
+        Code::INVALID_LINK_NAME
+    );
+}
+
+#[test]
+fn cartesian_paths_follow_the_waypoints_as_far_as_they_reach() {
+    let start = PLANNER.robot().ee_pose(&full(&READY), 0);
+    let down = Pose::new(start.position + Vec3::new(0.0, 0.0, -0.15), start.rotation);
+    let across = Pose::new(down.position + Vec3::new(0.0, 0.15, 0.0), start.rotation);
+    let mut asked = GetCartesianPath_Request {
+        group_name: "panda_arm".into(),
+        link_name: "panda_link8".into(),
+        waypoints: vec![pose_msg(down), pose_msg(across)],
+        max_cartesian_speed: 0.1,
+        ..Default::default()
+    };
+    asked.header.frame_id = "world".into();
+    let answer = PLANNER.cartesian_path(&asked, Some(&current(&READY)));
+    assert_eq!(
+        answer.error_code.val,
+        Code::SUCCESS,
+        "{}",
+        answer.error_code.message
+    );
+    assert_eq!(answer.fraction, 1.0);
+    let path = hand_path(&answer.solution, &READY);
+    for &(_, p) in &path {
+        let off = off_segment(p, start.position, down.position).min(off_segment(
+            p,
+            down.position,
+            across.position,
+        ));
+        assert!(
+            off < 2e-3,
+            "the hand strays {:.1} mm from the lines",
+            off * 1e3
+        );
+    }
+    assert!((path.last().unwrap().1 - across.position).length() < 2e-3);
+    assert!(fastest(&path) < 0.1 * 1.02);
+
+    // A last waypoint out of reach: the trajectory covers what the arm reaches, and says how much.
+    asked.waypoints.push(pose_msg(Pose::new(
+        across.position + Vec3::new(2.0, 0.0, 0.0),
+        start.rotation,
+    )));
+    let partial = PLANNER.cartesian_path(&asked, Some(&current(&READY)));
+    assert_eq!(
+        partial.error_code.val,
+        Code::SUCCESS,
+        "{}",
+        partial.error_code.message
+    );
+    assert!(
+        partial.fraction > 0.1 && partial.fraction < 1.0,
+        "fraction {}",
+        partial.fraction
+    );
+    let reached = hand_path(&partial.solution, &READY);
+    assert!(
+        reached
+            .iter()
+            .any(|&(_, p)| (p - across.position).length() < 2e-3)
     );
 }

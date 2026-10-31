@@ -3,7 +3,14 @@
 import numpy as np
 from viser.transforms import SO3
 from geometry_msgs.msg import Pose
-from moveit_msgs.msg import CollisionObject, Constraints, OrientationConstraint, PositionConstraint
+from moveit_msgs.msg import (
+    AllowedCollisionEntry,
+    AllowedCollisionMatrix,
+    CollisionObject,
+    Constraints,
+    OrientationConstraint,
+    PositionConstraint,
+)
 from shape_msgs.msg import SolidPrimitive
 
 # panda_hand is panda_link8 turned -45° about z.
@@ -16,6 +23,9 @@ FINGER = "panda_finger_joint1"
 FINGERS_OPEN = 0.04
 # How far before a grasp the arm stops, along the hand's approach, to move in from there.
 APPROACH = 0.08
+# The links that may touch what the hand grasps: the fingers, and the palm, whose collision spheres
+# reach past its meshes toward what the fingers close on.
+HAND = ("panda_hand", "panda_leftfinger", "panda_rightfinger")
 
 
 def pose_msg(position, wxyz) -> Pose:
@@ -53,6 +63,13 @@ def pose_goal(link: str, frame: str, position, wxyz) -> Constraints:
     orientation.absolute_x_axis_tolerance = orientation.absolute_y_axis_tolerance = 1e-2
     orientation.absolute_z_axis_tolerance = 1e-2
     return Constraints(position_constraints=[position_constraint], orientation_constraints=[orientation])
+
+
+def allowing(obj: str, links) -> AllowedCollisionMatrix:
+    """An allowed collision matrix in which `links` may touch the object `obj`, and nothing else."""
+    names = [obj, *links]
+    rows = [AllowedCollisionEntry(enabled=[(i == 0) != (j == 0) for j in range(len(names))]) for i in range(len(names))]
+    return AllowedCollisionMatrix(entry_names=names, entry_values=rows)
 
 
 def grasp_poses(center, count: int, facing=(0.0, 0.0), back: float = 0.0):

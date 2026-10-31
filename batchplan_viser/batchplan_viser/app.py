@@ -36,6 +36,8 @@ from batchplan_viser.messages import (
     APPROACH,
     FINGER,
     FINGERS_OPEN,
+    HAND,
+    allowing,
     box_object,
     cylinder_object,
     grasp_poses,
@@ -203,8 +205,9 @@ class App(Node):
         threading.Thread(target=self.grasp, args=(execute,), daemon=True).start()
 
     def grasp(self, execute: bool):
-        """Plans to the best of N poses before a grasp of the can in one request, then in to that
-        grasp, and closes the fingers on the can. On the robot, it then lets go and backs out."""
+        """Plans to the best of N poses before a grasp of the can in one request, then moves in to
+        that grasp in a straight line, and closes the fingers on the can. On the robot, it then lets
+        go and backs out the same way."""
         count = int(self.grasp_count.value)
         grasps = grasp_poses(self.can.position, count)
         approaches = grasp_poses(self.can.position, count, back=APPROACH)
@@ -223,9 +226,10 @@ class App(Node):
         waypoints, times = self.waypoints(approach, opened)
         reached = self.tip_pose(waypoints[-1])[0]
         k = min(range(count), key=lambda i: np.linalg.norm(approaches[i][0] - reached))
-        # The fingers may touch what they grasp, so the move in plans without the can.
+        # In a straight line, with the can in the scene and the hand allowed to touch it.
         start = opened if execute else waypoints[-1]
-        inward = self.move([pose_goal(self.tip, self.frame, *grasps[k])], execute, self.objects(can=False), start)
+        touching = allowing("can", HAND)
+        inward = self.move([pose_goal(self.tip, self.frame, *grasps[k])], execute, self.objects(), start, straight=True, allowed=touching)
         if inward is None:
             return
         if execute:
@@ -235,7 +239,7 @@ class App(Node):
             time.sleep(1.0)
             if not self.grip(FINGERS_OPEN):
                 return
-            if self.move([pose_goal(self.tip, self.frame, *approaches[k])], True, self.objects(can=False), opened) is None:
+            if self.move([pose_goal(self.tip, self.frame, *approaches[k])], True, self.objects(), opened, straight=True, allowed=touching) is None:
                 return
         more, later = self.waypoints(inward, opened)
         waypoints += more
@@ -262,9 +266,9 @@ class App(Node):
         handle = wait(self.hand.send_goal_async(goal))
         return handle.accepted and wait(handle.get_result_async()).result.error_code == FollowJointTrajectory.Result.SUCCESSFUL
 
-    def objects(self, can: bool = True):
+    def objects(self):
         objects = [box_object(n, self.frame, c.position, c.wxyz, BOX_SIZE) for n, c, _ in self.boxes]
-        if can and self.can is not None:
+        if self.can is not None:
             objects.append(cylinder_object("can", self.frame, self.can.position, CAN_RADIUS, CAN_HEIGHT))
         return objects
 
@@ -283,12 +287,15 @@ class App(Node):
         )
         self.show(waypoints, times, execute)
 
-    def move(self, goals, execute: bool, objects, start=None):
+    def move(self, goals, execute: bool, objects, start=None, straight=False, allowed=None):
         """Sends one MoveGroup request, from `start` (joint positions over the current ones), and waits
-        for it; None, with the reason shown, if it fails."""
+        for it; None, with the reason shown, if it fails. A `straight` request moves the hand in a
+        straight line to its one pose goal; `allowed` is the scene's allowed collision matrix."""
         goal = MoveGroup.Goal()
         request = goal.request
         request.group_name = self.group
+        if straight:
+            request.planner_id = "LIN"
         request.allowed_planning_time = 2.0
         speed = float(self.speed.value)
         request.max_velocity_scaling_factor, request.max_acceleration_scaling_factor = speed, speed * speed
@@ -299,6 +306,8 @@ class App(Node):
         scene = goal.planning_options.planning_scene_diff
         scene.is_diff = True
         scene.world.collision_objects = objects
+        if allowed is not None:
+            scene.allowed_collision_matrix = allowed
         self.status.content = "Planning..."
         handle = wait(self.planning.send_goal_async(goal))
         if not handle.accepted:

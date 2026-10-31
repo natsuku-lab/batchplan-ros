@@ -2,13 +2,17 @@
 
 use std::collections::HashMap;
 use std::hash::Hasher;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use batchplan::glam::{Quat, Vec3};
-use batchplan::{AttachedObject, Obstacle, Pose, Robot, SdfGrid, SdfOptions, SphereOptions, World};
+use batchplan::{
+    AttachedObject, Obstacle, Pose, Robot, SdfGrid, SdfOptions, SphereOptions, Touch, World,
+};
 use ros_env::geometry_msgs::msg as geometry;
 use ros_env::moveit_msgs::msg::{
-    AttachedCollisionObject, CollisionObject, MoveItErrorCodes as Code, PlanningScene, RobotState,
+    AllowedCollisionMatrix, AttachedCollisionObject, CollisionObject, MoveItErrorCodes as Code,
+    PlanningScene, RobotState,
 };
 use ros_env::shape_msgs::msg::{Mesh, SolidPrimitive};
 
@@ -165,10 +169,17 @@ impl Grids {
     }
 }
 
-/// The scene's collision objects as one world. The scene is taken as the whole world, whatever
-/// each object's operation says, except that removals are skipped.
-pub fn world(scene: &PlanningScene, frames: &Frames, grids: &Grids) -> Result<World, Refusal> {
+/// The scene's collision objects as one world, for `robot`. The scene is taken as the whole world,
+/// whatever each object's operation says, except that removals are skipped. Its allowed collision
+/// matrix lets `robot`'s links touch the objects it allows them to (see [`touches`]).
+pub fn world(
+    scene: &PlanningScene,
+    frames: &Frames,
+    grids: &Grids,
+    robot: &Robot,
+) -> Result<World, Refusal> {
     let mut obstacles = vec![];
+    let mut objects = vec![];
     for object in scene
         .world
         .collision_objects
@@ -176,9 +187,67 @@ pub fn world(scene: &PlanningScene, frames: &Frames, grids: &Grids) -> Result<Wo
         .filter(|o| o.operation != CollisionObject::REMOVE)
     {
         let base = frames.pose_of(&object.header.frame_id)?;
+        let first = obstacles.len();
         obstacles.extend(shapes(object, base, Some(grids))?);
+        objects.push((object.id.as_str(), first..obstacles.len()));
     }
-    Ok(World { obstacles })
+    Ok(World {
+        touch: touches(&scene.allowed_collision_matrix, &objects, robot),
+        ..World::new(obstacles)
+    })
+}
+
+/// The contacts an allowed collision matrix allows between `robot`'s links (held objects
+/// included) and the world's `objects` (each an id and its obstacles), read as MoveIt reads it: the
+/// entry for the pair from the matrix's upper triangle, else the names' default entries, which must
+/// both allow it where both have one. Pairs of the robot's own links are the SRDF's to disable.
+fn touches(
+    acm: &AllowedCollisionMatrix,
+    objects: &[(&str, Range<usize>)],
+    robot: &Robot,
+) -> Vec<Touch> {
+    let index = |names: &[String], name: &str| names.iter().position(|n| n == name);
+    let entry = |a: &str, b: &str| {
+        let (i, j) = (index(&acm.entry_names, a)?, index(&acm.entry_names, b)?);
+        acm.entry_values
+            .get(i.min(j))?
+            .enabled
+            .get(i.max(j))
+            .copied()
+    };
+    let default = |name: &str| {
+        index(&acm.default_entry_names, name).and_then(|i| acm.default_entry_values.get(i).copied())
+    };
+    let allowed = |link: &str, object: &str| {
+        entry(link, object)
+            .or_else(|| match (default(link), default(object)) {
+                (Some(a), Some(b)) => Some(a && b),
+                (a, b) => a.or(b),
+            })
+            .unwrap_or(false)
+    };
+    let links: Vec<&str> = robot
+        .collision_model()
+        .spheres
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let mut out = vec![];
+    for (id, range) in objects {
+        let touching: Vec<&str> = links
+            .iter()
+            .copied()
+            .filter(|link| allowed(link, id))
+            .collect();
+        if !touching.is_empty() {
+            out.extend(
+                range
+                    .clone()
+                    .map(|o| Touch::new(o, touching.iter().copied())),
+            );
+        }
+    }
+    out
 }
 
 /// Objects held by the robot, as shapes in their links' frames.

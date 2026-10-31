@@ -1,6 +1,7 @@
 //! The batchplan planning node: `~/move_group` (`moveit_msgs/action/MoveGroup`) plans, and executes
 //! through a `FollowJointTrajectory` controller when the goal is not plan-only; `~/compute_ik`
-//! (`moveit_msgs/srv/GetPositionIK`) solves IK.
+//! (`moveit_msgs/srv/GetPositionIK`) solves IK; `~/compute_cartesian_path`
+//! (`moveit_msgs/srv/GetCartesianPath`) moves the hand in straight lines through waypoints.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +17,10 @@ use rclrs::{
 use ros_env::control_msgs::action::{FollowJointTrajectory, FollowJointTrajectory_Goal};
 use ros_env::moveit_msgs::action::{MoveGroup, MoveGroup_Feedback, MoveGroup_Result};
 use ros_env::moveit_msgs::msg::{MoveItErrorCodes, RobotTrajectory};
-use ros_env::moveit_msgs::srv::{GetPositionIK, GetPositionIK_Request, GetPositionIK_Response};
+use ros_env::moveit_msgs::srv::{
+    GetCartesianPath, GetCartesianPath_Request, GetPositionIK, GetPositionIK_Request,
+    GetPositionIK_Response,
+};
 use ros_env::sensor_msgs::msg::JointState;
 use ros_env::std_msgs;
 
@@ -158,6 +162,7 @@ fn main() -> Result<()> {
 struct Serving {
     _move_group: ActionServer<MoveGroup>,
     _compute_ik: Service<GetPositionIK>,
+    _compute_cartesian_path: Service<GetCartesianPath>,
 }
 
 fn serve(
@@ -255,19 +260,29 @@ fn serve(
             },
         )?
     };
-    let compute_ik = node.create_service::<GetPositionIK, _>(
-        "~/compute_ik",
-        move |request: GetPositionIK_Request| {
-            let (solution, error_code) = planner.ik(&request.ik_request, current().as_ref());
-            GetPositionIK_Response {
-                solution,
-                error_code,
-            }
+    let compute_ik = {
+        let (planner, current) = (Arc::clone(&planner), current.clone());
+        node.create_service::<GetPositionIK, _>(
+            "~/compute_ik",
+            move |request: GetPositionIK_Request| {
+                let (solution, error_code) = planner.ik(&request.ik_request, current().as_ref());
+                GetPositionIK_Response {
+                    solution,
+                    error_code,
+                }
+            },
+        )?
+    };
+    let compute_cartesian_path = node.create_service::<GetCartesianPath, _>(
+        "~/compute_cartesian_path",
+        move |request: GetCartesianPath_Request| {
+            planner.cartesian_path(&request, current().as_ref())
         },
     )?;
     Ok(Serving {
         _move_group: move_group,
         _compute_ik: compute_ik,
+        _compute_cartesian_path: compute_cartesian_path,
     })
 }
 

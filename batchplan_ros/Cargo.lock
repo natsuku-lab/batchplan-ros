@@ -250,9 +250,9 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "batchplan"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a57bd445c08ef25d7938a420cd784184832eec7652bc4c1c7f72509a66423222"
+checksum = "2020abcf23c66c960e4a0cc4aa516900c7d6b23db8e756920b1dc7267c24145e"
 dependencies = [
  "anyhow",
  "bytemuck",
