@@ -17,8 +17,8 @@ import trimesh
 import yourdfpy
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
-from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
+from moveit_msgs.action import MoveGroup, MoveGroupSequence
+from moveit_msgs.msg import Constraints, JointConstraint, MotionPlanRequest, MotionSequenceItem, MoveItErrorCodes
 from moveit_msgs.srv import GetCartesianPath, GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -27,7 +27,7 @@ from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 from batchplan_viser.app import resolve
-from batchplan_viser.messages import APPROACH, FINGER, HAND, allowing, box_object, cylinder_object, grasp_poses, pose_goal, pose_msg
+from batchplan_viser.messages import APPROACH, BLEND, FINGER, HAND, allowing, box_object, cylinder_object, grasp_poses, pose_goal, pose_msg
 
 ARM = [f"panda_joint{i}" for i in range(1, 8)]
 
@@ -57,9 +57,9 @@ def ros():
     demo.wait(timeout=30)
 
 
-def run(ros, goal):
+def run(ros, goal, client=None):
     node, planner, _ = ros
-    sent = planner.send_goal_async(goal)
+    sent = (client or planner).send_goal_async(goal)
     rclpy.spin_until_future_complete(node, sent, timeout_sec=30)
     result = sent.result().get_result_async()
     rclpy.spin_until_future_complete(node, result, timeout_sec=60)
@@ -206,21 +206,34 @@ def clearance_to_cylinder(ros, trajectory, center, radius: float, height: float)
 
 
 def test_the_hand_moves_in_around_the_can_and_the_fingers_close_on_it(ros):
-    """The browser demo's best grasp, for one grasp: to the pose before it, then in to the grasp in a
-    straight line, the can in the scene both times and the hand allowed to touch it on the way in.
-    The robot's meshes keep clear of the can and end close around it, and the fingers close on it."""
+    """The browser demo's best grasp, for one grasp, as one executed sequence: to the pose before it,
+    then in along the hand's z to the grasp in a straight line without stopping before it, the can
+    in the scene and the hand allowed to touch it. The robot's meshes keep clear of the can and end
+    close around it, and the fingers close on it."""
     center, radius, height = np.array([0.45, 0.25, 0.1]), 0.03, 0.2
-    (grasp,), (approach,) = grasp_poses(center, 1), grasp_poses(center, 1, back=APPROACH)
+    (approach,) = grasp_poses(center, 1, back=APPROACH)
     can = cylinder_object("can", "world", center, radius, height)
-    before = run(ros, request([pose_goal("panda_link8", "world", *approach)], plan_only=False, objects=[can]))
-    assert before.error_code.val == MoveItErrorCodes.SUCCESS, before.error_code.message
-    settle(ros)
-    inward = run(ros, request([pose_goal("panda_link8", "world", *grasp)], plan_only=False, objects=[can], straight=True, allowed=allowing("can", HAND)))
-    assert inward.error_code.val == MoveItErrorCodes.SUCCESS, inward.error_code.message
-    clearance = clearance_to_cylinder(ros, inward.planned_trajectory.joint_trajectory, center, radius, height)
-    assert 0.0 < clearance < 0.015, f"the robot's meshes come within {clearance * 1e3:.1f} mm of the can"
-
+    goal = MoveGroupSequence.Goal()
+    before = request([pose_goal("panda_link8", "world", *approach)]).request
+    along = pose_goal("panda_link8", "panda_link8", (0.0, 0.0, APPROACH), (1.0, 0.0, 0.0, 0.0))
+    inward = MotionPlanRequest(group_name="panda_arm", planner_id="LIN", goal_constraints=[along])
+    goal.request.items = [MotionSequenceItem(req=before, blend_radius=BLEND), MotionSequenceItem(req=inward)]
+    scene = goal.planning_options.planning_scene_diff
+    scene.is_diff = True
+    scene.world.collision_objects = [can]
+    scene.allowed_collision_matrix = allowing("can", HAND)
     node, _, joints = ros
+    sequencing = ActionClient(node, MoveGroupSequence, "/batchplan_planner/sequence_move_group")
+    assert sequencing.wait_for_server(timeout_sec=10.0), "no sequence action"
+    response = run(ros, goal, sequencing).response
+    assert response.error_code.val == MoveItErrorCodes.SUCCESS, response.error_code.message
+    (trajectory,) = response.planned_trajectories
+    clearance = clearance_to_cylinder(ros, trajectory.joint_trajectory, center, radius, height)
+    assert 0.0 < clearance < 0.015, f"the robot's meshes come within {clearance * 1e3:.1f} mm of the can"
+    settle(ros)
+    end = trajectory.joint_trajectory.points[-1].positions
+    assert max(abs(joints[n] - v) for n, v in zip(trajectory.joint_trajectory.joint_names, end)) < 1e-3
+
     hand = ActionClient(node, FollowJointTrajectory, "/panda_hand_controller/follow_joint_trajectory")
     assert hand.wait_for_server(timeout_sec=10.0), "no gripper controller"
     goal = FollowJointTrajectory.Goal()

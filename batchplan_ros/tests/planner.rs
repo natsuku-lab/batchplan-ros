@@ -10,8 +10,9 @@ use batchplan_ros::{Answer, Planner, PlannerOptions};
 use ros_env::geometry_msgs::msg as geometry;
 use ros_env::moveit_msgs::msg::{
     AllowedCollisionEntry, AllowedCollisionMatrix, AttachedCollisionObject, CollisionObject,
-    Constraints, JointConstraint, MotionPlanRequest, MoveItErrorCodes as Code,
-    OrientationConstraint, PlanningScene, PositionConstraint, PositionIKRequest, RobotTrajectory,
+    Constraints, JointConstraint, MotionPlanRequest, MotionSequenceItem, MotionSequenceRequest,
+    MotionSequenceResponse, MoveItErrorCodes as Code, OrientationConstraint, PlanningScene,
+    PositionConstraint, PositionIKRequest, RobotTrajectory,
 };
 use ros_env::moveit_msgs::srv::GetCartesianPath_Request;
 use ros_env::sensor_msgs::msg::JointState;
@@ -741,6 +742,10 @@ fn refusals_carry_moveit_codes() {
         code(&request("legs", vec![goal.clone()]), &READY),
         Code::INVALID_GROUP_NAME
     );
+    // What the request asks for is refused before the scene is looked at.
+    let blocked = scene(vec![on_the_fingers()]);
+    let asking_legs = plan(&request("legs", vec![goal.clone()]), &blocked, &READY);
+    assert_eq!(asking_legs.error_code.val, Code::INVALID_GROUP_NAME);
     assert_eq!(
         code(&request("panda_arm", vec![]), &READY),
         Code::INVALID_GOAL_CONSTRAINTS
@@ -960,14 +965,19 @@ fn lin_moves_the_hand_in_a_straight_line() {
     );
 }
 
-#[test]
-fn the_allowed_collision_matrix_lets_links_touch_objects() {
+/// A block on the left finger at the ready pose.
+fn on_the_fingers() -> CollisionObject {
     let at = PLANNER
         .robot()
         .link_pose(&full(&READY), "panda_leftfinger")
         .unwrap()
         .position;
-    let block = cuboid("block", "world", at.to_array().map(f64::from), [0.02; 3]);
+    cuboid("block", "world", at.to_array().map(f64::from), [0.02; 3])
+}
+
+#[test]
+fn the_allowed_collision_matrix_lets_links_touch_objects() {
+    let block = on_the_fingers();
     let away = request(
         "panda_arm",
         vec![joint_goal(&ARM, &[0.3, -0.5, 0.0, -2.2, 0.0, 1.7, 0.785])],
@@ -1113,5 +1123,240 @@ fn cartesian_paths_follow_the_waypoints_as_far_as_they_reach() {
         reached
             .iter()
             .any(|&(_, p)| (p - across.position).length() < 2e-3)
+    );
+}
+
+/// `items`, each a request and the blend radius of the join after it, planned as one sequence from
+/// `start`.
+fn sequence(
+    items: Vec<(MotionPlanRequest, f64)>,
+    scene: &PlanningScene,
+    start: &[f64],
+) -> MotionSequenceResponse {
+    let items = items
+        .into_iter()
+        .map(|(req, blend_radius)| MotionSequenceItem { req, blend_radius })
+        .collect();
+    PLANNER.plan_sequence(
+        &MotionSequenceRequest { items },
+        scene,
+        Some(&current(start)),
+    )
+}
+
+fn sequenced(response: &MotionSequenceResponse) {
+    assert_eq!(
+        response.error_code.val,
+        Code::SUCCESS,
+        "{}",
+        response.error_code.message
+    );
+}
+
+/// Whether `trajectory` comes to rest at the planned joints `q` between its ends.
+fn rests_at(trajectory: &RobotTrajectory, q: &[f64]) -> bool {
+    let points = &trajectory.joint_trajectory.points;
+    points[1..points.len() - 1].iter().any(|p| {
+        p.velocities.iter().all(|v| v.abs() < 1e-6)
+            && p.positions.iter().zip(q).all(|(a, b)| (a - b).abs() < 1e-3)
+    })
+}
+
+fn ends(trajectory: &RobotTrajectory) -> f64 {
+    seconds(
+        &trajectory
+            .joint_trajectory
+            .points
+            .last()
+            .unwrap()
+            .time_from_start,
+    )
+}
+
+/// A sweep across the front, each motion carrying on roughly where the one before was going.
+const SWEEP: [[f64; 7]; 4] = [
+    [-1.2, -0.6, 0.0, -2.2, 0.0, 1.6, 0.8],
+    [-0.4, -0.3, 0.1, -1.9, 0.1, 1.7, 0.7],
+    [0.4, -0.2, 0.2, -1.8, 0.2, 1.8, 0.6],
+    [1.2, -0.4, 0.3, -2.0, 0.3, 1.9, 0.5],
+];
+
+#[test]
+fn sequences_pass_their_joins_without_stopping_within_their_radii() {
+    // Through the sweep's waypoints, each item slowed by its speed, joined within `radius`.
+    let sweep = |radius: f64, speeds: [f64; 3]| {
+        let items = (1..4)
+            .map(|k| {
+                let mut r = request("panda_arm", vec![joint_goal(&ARM, &SWEEP[k])]);
+                (
+                    r.max_velocity_scaling_factor,
+                    r.max_acceleration_scaling_factor,
+                ) = (speeds[k - 1], speeds[k - 1].powi(2));
+                (r, if k < 3 { radius } else { 0.0 })
+            })
+            .collect();
+        let response = sequence(items, &scene(vec![]), &SWEEP[0]);
+        sequenced(&response);
+        assert_eq!(
+            response.planned_trajectories.len(),
+            1,
+            "one group, one trajectory"
+        );
+        response.planned_trajectories[0].clone()
+    };
+    let stopping = sweep(0.0, [1.0; 3]);
+    assert!(rests_at(&stopping, &SWEEP[1]) && rests_at(&stopping, &SWEEP[2]));
+    let joined = sweep(0.05, [1.0; 3]);
+    assert!(!rests_at(&joined, &SWEEP[1]) && !rests_at(&joined, &SWEEP[2]));
+    let points = &joined.joint_trajectory.points;
+    let interior = &points[1..points.len() - 1];
+    assert!(
+        interior
+            .iter()
+            .all(|p| p.velocities.iter().any(|v| v.abs() > 1e-6)),
+        "the joined sweep stops on the way"
+    );
+    let last = &points.last().unwrap().positions;
+    assert!(
+        last.iter()
+            .zip(&SWEEP[3])
+            .all(|(a, b)| (a - b).abs() < 1e-4)
+    );
+    assert!(
+        ends(&joined) < 0.95 * ends(&stopping),
+        "{} s joined, {} s stopping",
+        ends(&joined),
+        ends(&stopping)
+    );
+    // The hand passes each waypoint within the radius.
+    let path = hand_path(&joined, &SWEEP[0]);
+    for waypoint in &SWEEP[1..3] {
+        let at = PLANNER.robot().ee_pose(&full(waypoint), 0).position;
+        let nearest = path
+            .iter()
+            .map(|&(_, p)| p.distance(at))
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            nearest < 0.05,
+            "the hand passes {nearest} m from a waypoint"
+        );
+    }
+    // Motions timed apart keep the stop between them.
+    let slowed = sweep(0.05, [1.0, 0.5, 0.5]);
+    assert!(rests_at(&slowed, &SWEEP[1]) && !rests_at(&slowed, &SWEEP[2]));
+}
+
+#[test]
+fn each_item_starts_where_the_one_before_ends() {
+    // To a pose, then 8 cm in along the hand's own z: a LIN goal in the hand's frame, which the
+    // second item reads where the first leaves the hand.
+    let start = PLANNER.robot().ee_pose(&full(&READY), 0);
+    let first = Pose::new(start.position + Vec3::new(0.1, -0.1, -0.1), start.rotation);
+    let along = Pose::new(Vec3::new(0.0, 0.0, 0.08), Quat::IDENTITY);
+    let items = |radius: f64| {
+        vec![
+            (
+                request("panda_arm", vec![pose_goal("panda_link8", "world", first)]),
+                radius,
+            ),
+            (
+                MotionPlanRequest {
+                    planner_id: "LIN".into(),
+                    ..request(
+                        "panda_arm",
+                        vec![pose_goal("panda_link8", "panda_link8", along)],
+                    )
+                },
+                0.0,
+            ),
+        ]
+    };
+    let inward = first.position + first.rotation * Vec3::Z * 0.08;
+    for radius in [0.0, 0.03] {
+        let response = sequence(items(radius), &scene(vec![]), &READY);
+        sequenced(&response);
+        assert_eq!(
+            response.sequence_start.joint_state.name,
+            PLANNER.robot().joint_names()
+        );
+        let path = hand_path(&response.planned_trajectories[0], &READY);
+        let end = path.last().unwrap().1;
+        assert!(
+            end.distance(inward) < 2e-3,
+            "radius {radius}: the hand ends {} m from 8 cm in",
+            end.distance(inward)
+        );
+    }
+}
+
+#[test]
+fn a_sequence_returns_a_trajectory_per_run_of_one_group() {
+    let arm = |q: &[f64]| (request("panda_arm", vec![joint_goal(&ARM, q)]), 0.05);
+    let fingers = (
+        request("hand", vec![joint_goal(&["panda_finger_joint1"], &[0.035])]),
+        0.05,
+    );
+    let mut back = arm(&SWEEP[1]);
+    back.1 = 0.0;
+    let response = sequence(
+        vec![arm(&SWEEP[2]), fingers, arm(&SWEEP[3]), back],
+        &scene(vec![]),
+        &SWEEP[1],
+    );
+    sequenced(&response);
+    let names: Vec<&[String]> = response
+        .planned_trajectories
+        .iter()
+        .map(|t| t.joint_trajectory.joint_names.as_slice())
+        .collect();
+    assert_eq!(names, [&ARM[..], &["panda_finger_joint1"], &ARM[..]]);
+    // Each run starts where the one before ends: the last arm run where the first left the arm.
+    let points = |k: usize| &response.planned_trajectories[k].joint_trajectory.points;
+    let (first, hand, last) = (points(0), points(1), points(2));
+    assert_eq!(first.last().unwrap().positions, last[0].positions);
+    assert!((hand.last().unwrap().positions[0] - 0.035).abs() < 1e-5);
+    let end = &last.last().unwrap().positions;
+    assert!(end.iter().zip(&SWEEP[1]).all(|(a, b)| (a - b).abs() < 1e-4));
+}
+
+#[test]
+fn sequences_are_refused_as_pilz_refuses_them() {
+    let to = |q: &[f64], radius: f64| (request("panda_arm", vec![joint_goal(&ARM, q)]), radius);
+    let refusal = |items: Vec<(MotionPlanRequest, f64)>| {
+        let response = sequence(items, &scene(vec![]), &READY);
+        (response.error_code.val, response.error_code.message)
+    };
+    let empty = sequence(vec![], &scene(vec![]), &READY);
+    assert_eq!(empty.error_code.val, Code::SUCCESS);
+    assert!(empty.planned_trajectories.is_empty());
+    assert_eq!(
+        refusal(vec![to(&SWEEP[1], -0.01), to(&SWEEP[2], 0.0)]).0,
+        Code::INVALID_MOTION_PLAN
+    );
+    assert_eq!(
+        refusal(vec![to(&SWEEP[1], 0.05), to(&SWEEP[2], 0.05)]).0,
+        Code::INVALID_MOTION_PLAN,
+        "the last radius is not 0"
+    );
+    let mut restarted = to(&SWEEP[2], 0.0);
+    restarted.0.start_state.joint_state = current(&READY);
+    assert_eq!(
+        refusal(vec![to(&SWEEP[1], 0.05), restarted]).0,
+        Code::INVALID_ROBOT_STATE
+    );
+    let beyond = [3.5, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785];
+    let (code, message) = refusal(vec![to(&SWEEP[1], 0.05), to(&beyond, 0.0)]);
+    assert_eq!(code, Code::INVALID_GOAL_CONSTRAINTS);
+    assert!(message.starts_with("item 1: "), "{message}");
+    // Every item's group is checked before the scene: here the start is in collision too.
+    let mut legs = to(&SWEEP[2], 0.0);
+    legs.0.group_name = "legs".into();
+    let items = vec![to(&SWEEP[1], 0.05), legs];
+    let response = sequence(items, &scene(vec![on_the_fingers()]), &READY);
+    assert_eq!(response.error_code.val, Code::INVALID_GROUP_NAME);
+    assert!(
+        response.error_code.message.starts_with("item 1: "),
+        "{}",
+        response.error_code.message
     );
 }

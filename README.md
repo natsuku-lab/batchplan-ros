@@ -5,6 +5,7 @@ ROS 2 motion planning with [batchplan](https://github.com/natsuku-lab/batchplan)
 `batchplan_planner` is a ROS 2 node that speaks MoveIt's messages without needing MoveIt:
 
 - `~/move_group` (`moveit_msgs/action/MoveGroup`): plans a `MotionPlanRequest` against the scene in `planning_options.planning_scene_diff`, and executes through a `FollowJointTrajectory` controller unless the goal is plan-only.
+- `~/sequence_move_group` (`moveit_msgs/action/MoveGroupSequence`), as Pilz's capability of that name: plans a motion sequence's items one after another, each from where the one before ends, and returns one trajectory per run of items in one group. Each join with a `blend_radius` above 0 passes without stopping, the hand within that radius of where the motions meet, where batchplan's [`join`](https://github.com/natsuku-lab/batchplan/blob/main/docs/planning.md#joining-motions) finds that sooner and clear of collision and the items either side have the same scaling and speed cap; a sequence never takes longer than its motions one after another. The last radius is 0, and only the first item gives a start state.
 - `~/compute_ik` (`moveit_msgs/srv/GetPositionIK`).
 - `~/compute_cartesian_path` (`moveit_msgs/srv/GetCartesianPath`): the hand in straight lines through waypoints, as far as it reaches, with `fraction` saying how far. The service carries no scene (as with `compute_ik`), so it checks the robot and what its start state holds.
 
@@ -15,7 +16,7 @@ Several goal constraints in one request are planned in one batched call, and the
 - `max_cartesian_speed` on `cartesian_speed_limited_link` (an IK frame): the trajectory keeps that link under the speed, together with the scaling factors.
 
 <p align="center">
-  <img src="docs/best_grasp.gif" alt="A simulated Panda in the browser: the poses before 24 grasps of a can, planned in one request; the arm's preview moves to the nearest one past a box, in to the grasp, and closes its fingers on the can." width="600">
+  <img src="docs/best_grasp.gif" alt="A simulated Panda in the browser: the poses before 24 grasps of a can, planned in one motion sequence; the arm's preview moves past a box to the nearest one and on in to the grasp, and closes its fingers on the can." width="600">
 </p>
 
 ## Quick start
@@ -29,7 +30,7 @@ pixi run -e jazzy demo                           # the same on ROS 2 Jazzy
 
 Then open http://localhost:8080: a simulated Panda and its gripper on ros2_control mock hardware. Drag the gizmo to set a goal (IK runs as you drag), add boxes, and plan or plan and execute. No MoveIt and no GPU are needed; `pixi run demo device:=gpu` plans on the GPU.
 
-**Best of N grasps.** "Best grasp" sends one request whose goal constraints are the poses 8 cm before N grasps of a can, each around a different side. The node solves IK for all of them and plans to every solution in one batched call, keeping the shortest path. A second request then moves the hand in to that grasp in a straight line (`LIN`), the can still in the scene and the hand allowed to touch it, and the fingers close on the can through their own trajectory controller; on the robot, the hand then lets go and backs out the same way. `ros2 run batchplan_examples best_grasp.py` times the first request against one request per grasp, next to a running demo. Wall-clock times on an M4 Pro CPU, on Lyrical (the middle of three runs, each the median of 5 requests; other apps running):
+**Best of N grasps.** "Best grasp" sends one motion sequence. Its first item's goal constraints are the poses 8 cm before N grasps of a can, each around a different side: the node solves IK for all of them and plans to every solution in one batched call, keeping the shortest path. The second moves the hand 8 cm in along its own z to the grasp in a straight line (`LIN`, its goal in `panda_link8`'s frame), and a 4 cm blend radius lets the arm pass into it without stopping where that is sooner. The can is in the scene and the hand may touch it. The fingers then close on the can through their own trajectory controller; on the robot, the hand then lets go and backs out the same way. `ros2 run batchplan_examples best_grasp.py` times the first item, as one `MoveGroup` request with every pose, against one request per grasp, next to a running demo. Wall-clock times on an M4 Pro CPU, on Lyrical (the middle of three runs, each the median of 5 requests; other apps running):
 
 | Grasps | One request | One request per grasp |
 |---|---|---|

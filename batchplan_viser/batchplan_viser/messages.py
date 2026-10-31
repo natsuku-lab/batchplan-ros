@@ -21,8 +21,11 @@ GRASP_DEPTH = 0.105
 # The Panda's finger joint, each finger's distance from the middle, and how far it opens.
 FINGER = "panda_finger_joint1"
 FINGERS_OPEN = 0.04
-# How far before a grasp the arm stops, along the hand's approach, to move in from there.
+# How far before a grasp the hand's approach begins, along its z, to move in from there.
 APPROACH = 0.08
+# How far from that pose the hand may leave its path, to move in without stopping there: half the
+# approach, so it is straight for the last half.
+BLEND = APPROACH / 2
 # The links that may touch what the hand grasps: the fingers, and the palm, whose collision spheres
 # reach past its meshes toward what the fingers close on.
 HAND = ("panda_hand", "panda_leftfinger", "panda_rightfinger")

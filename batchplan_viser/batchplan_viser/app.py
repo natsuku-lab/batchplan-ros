@@ -2,10 +2,10 @@
 
 Drag the gizmo to set the goal: IK runs as you drag, and the blue ghost shows where the arm would
 be. Add boxes and drag them around, then Plan to preview the motion in green, or Plan and execute to
-run it on the robot. Best grasp sends one request with the poses before many grasps of the can, which
-the planner plans in one batch, keeping the shortest path; then the arm moves in to that grasp and the
-fingers close on the can. Every request carries the boxes and the can as its scene, so the planner
-keeps no state.
+run it on the robot. Best grasp sends one motion sequence: to the best of the poses before many grasps
+of the can, which the planner plans in one batch, keeping the shortest path, then in to that grasp
+without stopping before it; the fingers then close on the can. Every request carries the boxes and
+the can as its scene, so the planner keeps no state.
 """
 
 import io
@@ -20,8 +20,8 @@ import yourdfpy
 from ament_index_python.packages import get_package_share_directory
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
-from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import MoveItErrorCodes
+from moveit_msgs.action import MoveGroup, MoveGroupSequence
+from moveit_msgs.msg import MotionPlanRequest, MotionSequenceItem, MoveItErrorCodes
 from moveit_msgs.srv import GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
@@ -34,6 +34,7 @@ from viser.extras import ViserUrdf
 
 from batchplan_viser.messages import (
     APPROACH,
+    BLEND,
     FINGER,
     FINGERS_OPEN,
     HAND,
@@ -80,6 +81,7 @@ class App(Node):
         self.joints: dict[str, float] = {}
         self.create_subscription(JointState, "/joint_states", self.on_state, 10)
         self.planning = ActionClient(self, MoveGroup, f"{planner}/move_group")
+        self.sequencing = ActionClient(self, MoveGroupSequence, f"{planner}/sequence_move_group")
         self.ik = self.create_client(GetPositionIK, f"{planner}/compute_ik")
         self.hand = ActionClient(self, FollowJointTrajectory, f"{gripper}/follow_joint_trajectory")
 
@@ -136,8 +138,8 @@ class App(Node):
             gui.add_button("Remove boxes", icon=viser.Icon.TRASH).on_click(lambda _: self.remove_boxes())
         with gui.add_folder("Best of N grasps"):
             gui.add_markdown(
-                "One request with the poses before N grasps of the can: IK for all of them, one batched plan, the shortest "
-                "path wins. Then in to the grasp, and the fingers close."
+                "One sequence: to the poses before N grasps of the can (IK for all of them, one batched plan, the shortest "
+                "path wins), then in to the grasp without stopping before it. Then the fingers close."
             )
             self.grasp_count = gui.add_slider("Grasps", min=1, max=64, step=1, initial_value=16)
             gui.add_button("Best grasp", icon=viser.Icon.HAND_GRAB).on_click(lambda _: self.best_grasp(execute=False))
@@ -205,11 +207,10 @@ class App(Node):
         threading.Thread(target=self.grasp, args=(execute,), daemon=True).start()
 
     def grasp(self, execute: bool):
-        """Plans to the best of N poses before a grasp of the can in one request, then moves in to
-        that grasp in a straight line, and closes the fingers on the can. On the robot, it then lets
-        go and backs out the same way."""
+        """Plans one sequence to the best of N poses before a grasp of the can, then in to that grasp
+        in a straight line without stopping before it, and closes the fingers on the can. On the
+        robot, it then lets go and backs out the same way."""
         count = int(self.grasp_count.value)
-        grasps = grasp_poses(self.can.position, count)
         approaches = grasp_poses(self.can.position, count, back=APPROACH)
         for frame in self.grasps:
             frame.remove()
@@ -220,17 +221,14 @@ class App(Node):
         opened = {FINGER: FINGERS_OPEN}
         if execute and not self.grip(FINGERS_OPEN):
             return
-        approach = self.move([pose_goal(self.tip, self.frame, p, q) for p, q in approaches], execute, self.objects(), opened)
-        if approach is None:
-            return
-        waypoints, times = self.waypoints(approach, opened)
-        reached = self.tip_pose(waypoints[-1])[0]
-        k = min(range(count), key=lambda i: np.linalg.norm(approaches[i][0] - reached))
-        # In a straight line, with the can in the scene and the hand allowed to touch it.
-        start = opened if execute else waypoints[-1]
+        # In and out along the hand's own z, from wherever the motion before leaves it.
+        along = lambda distance: pose_goal(self.tip, self.tip, (0.0, 0.0, distance), (1.0, 0.0, 0.0, 0.0))
+        # The can in the scene, and the hand allowed to touch it as it moves in.
         touching = allowing("can", HAND)
-        inward = self.move([pose_goal(self.tip, self.frame, *grasps[k])], execute, self.objects(), start, straight=True, allowed=touching)
-        if inward is None:
+        before = [pose_goal(self.tip, self.frame, p, q) for p, q in approaches]
+        steps = [(before, False, BLEND), ([along(APPROACH)], True, 0.0)]
+        result = self.sequence(steps, execute, self.objects(), opened, allowed=touching)
+        if result is None:
             return
         if execute:
             # Close on the can, then let go and back out, so the next request does not start around it.
@@ -239,18 +237,16 @@ class App(Node):
             time.sleep(1.0)
             if not self.grip(FINGERS_OPEN):
                 return
-            if self.move([pose_goal(self.tip, self.frame, *approaches[k])], True, self.objects(), opened, straight=True, allowed=touching) is None:
+            if self.move([along(-APPROACH)], True, self.objects(), opened, straight=True, allowed=touching) is None:
                 return
-        more, later = self.waypoints(inward, opened)
-        waypoints += more
-        times += [times[-1] + t for t in later]
+        waypoints, times = self.waypoints(result.planned_trajectories[0], opened)
         # The fingers close on the can in half a second.
         for step in range(1, 11):
             waypoints.append({**waypoints[-1], FINGER: FINGERS_OPEN + (CAN_RADIUS - FINGERS_OPEN) * step / 10})
             times.append(times[-1] + 0.05)
         self.status.content = (
-            f"Best of {count} grasps in **{approach.planning_time * 1e3:.1f} ms**, in to the can in "
-            f"**{inward.planning_time * 1e3:.1f} ms**, {times[-1]:.2f} s of motion with the fingers closing"
+            f"Best of {count} grasps and in to the can in **{result.planning_time * 1e3:.1f} ms**, "
+            f"{times[-1]:.2f} s of motion with the fingers closing"
             + (", executed, then let go and backed out." if execute else ".")
         )
         self.show(waypoints, times, execute)
@@ -280,28 +276,28 @@ class App(Node):
         result = self.move(goals, execute, self.objects())
         if result is None:
             return
-        waypoints, times = self.waypoints(result)
+        waypoints, times = self.waypoints(result.planned_trajectory)
         self.status.content = (
             f"Planned in **{result.planning_time * 1e3:.1f} ms**, {len(waypoints)} waypoints, {times[-1]:.2f} s of motion"
             + (", executed." if execute else ".")
         )
         self.show(waypoints, times, execute)
 
-    def move(self, goals, execute: bool, objects, start=None, straight=False, allowed=None):
-        """Sends one MoveGroup request, from `start` (joint positions over the current ones), and waits
-        for it; None, with the reason shown, if it fails. A `straight` request moves the hand in a
-        straight line to its one pose goal; `allowed` is the scene's allowed collision matrix."""
-        goal = MoveGroup.Goal()
-        request = goal.request
-        request.group_name = self.group
+    def request(self, goals, start=None, straight=False) -> MotionPlanRequest:
+        """A request to plan to `goals` from `start` (joint positions over the current ones); a
+        `straight` one moves the hand in a straight line to its one pose goal."""
+        request = MotionPlanRequest(group_name=self.group, allowed_planning_time=2.0, goal_constraints=goals)
         if straight:
             request.planner_id = "LIN"
-        request.allowed_planning_time = 2.0
         speed = float(self.speed.value)
         request.max_velocity_scaling_factor, request.max_acceleration_scaling_factor = speed, speed * speed
-        request.goal_constraints = goals
         if start:
             request.start_state.joint_state = JointState(name=list(start), position=[float(v) for v in start.values()])
+        return request
+
+    def send(self, client, goal, execute: bool, objects, allowed):
+        """Sends `goal` with the scene of `objects` and the allowed collision matrix `allowed`, and
+        waits for it; None, with the reason shown, if it fails."""
         goal.planning_options.plan_only = not execute
         scene = goal.planning_options.planning_scene_diff
         scene.is_diff = True
@@ -309,20 +305,37 @@ class App(Node):
         if allowed is not None:
             scene.allowed_collision_matrix = allowed
         self.status.content = "Planning..."
-        handle = wait(self.planning.send_goal_async(goal))
+        handle = wait(client.send_goal_async(goal))
         if not handle.accepted:
             self.status.content = "The planner refused the request."
             return None
         result = wait(handle.get_result_async()).result
+        # A sequence's result holds its response; a MoveGroup result is its own.
+        result = getattr(result, "response", result)
         if result.error_code.val != MoveItErrorCodes.SUCCESS:
             self.status.content = f"**Failed** ({result.error_code.val}): {result.error_code.message}"
             return None
         return result
 
-    def waypoints(self, result, joints=None):
-        """The planned trajectory's waypoints, with every joint (the current ones, then `joints`), and
+    def move(self, goals, execute: bool, objects, start=None, straight=False, allowed=None):
+        """Sends one MoveGroup request to `goals` (see `request`) in a scene of `objects`, and waits for it."""
+        return self.send(self.planning, MoveGroup.Goal(request=self.request(goals, start, straight)), execute, objects, allowed)
+
+    def sequence(self, steps, execute: bool, objects, start=None, allowed=None):
+        """Sends one motion sequence of `steps`, each goals, whether straight, and the blend radius of
+        the join after it, from `start`, and waits for it."""
+        items = [
+            MotionSequenceItem(req=self.request(goals, start if k == 0 else None, straight), blend_radius=radius)
+            for k, (goals, straight, radius) in enumerate(steps)
+        ]
+        goal = MoveGroupSequence.Goal()
+        goal.request.items = items
+        return self.send(self.sequencing, goal, execute, objects, allowed)
+
+    def waypoints(self, trajectory, joints=None):
+        """A planned trajectory's waypoints, with every joint (the current ones, then `joints`), and
         their times."""
-        trajectory = result.planned_trajectory.joint_trajectory
+        trajectory = trajectory.joint_trajectory
         current = {**self.joints, **(joints or {})}
         waypoints = [{**current, **dict(zip(trajectory.joint_names, p.positions))} for p in trajectory.points]
         return waypoints, [seconds(p.time_from_start) for p in trajectory.points]

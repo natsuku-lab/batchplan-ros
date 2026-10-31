@@ -1,5 +1,7 @@
 //! The batchplan planning node: `~/move_group` (`moveit_msgs/action/MoveGroup`) plans, and executes
-//! through a `FollowJointTrajectory` controller when the goal is not plan-only; `~/compute_ik`
+//! through a `FollowJointTrajectory` controller when the goal is not plan-only;
+//! `~/sequence_move_group` (`moveit_msgs/action/MoveGroupSequence`) plans and executes a motion
+//! sequence as Pilz's capability of that name does, passing joins without stopping; `~/compute_ik`
 //! (`moveit_msgs/srv/GetPositionIK`) solves IK; `~/compute_cartesian_path`
 //! (`moveit_msgs/srv/GetCartesianPath`) moves the hand in straight lines through waypoints.
 
@@ -15,8 +17,11 @@ use rclrs::{
     Node, RclrsError, RclrsErrorFilter, RequestedGoal, Service, SpinOptions, log_error, log_info,
 };
 use ros_env::control_msgs::action::{FollowJointTrajectory, FollowJointTrajectory_Goal};
-use ros_env::moveit_msgs::action::{MoveGroup, MoveGroup_Feedback, MoveGroup_Result};
-use ros_env::moveit_msgs::msg::{MoveItErrorCodes, RobotTrajectory};
+use ros_env::moveit_msgs::action::{
+    MoveGroup, MoveGroup_Feedback, MoveGroup_Result, MoveGroupSequence, MoveGroupSequence_Feedback,
+    MoveGroupSequence_Result,
+};
+use ros_env::moveit_msgs::msg::{MotionSequenceResponse, MoveItErrorCodes, RobotTrajectory};
 use ros_env::moveit_msgs::srv::{
     GetCartesianPath, GetCartesianPath_Request, GetPositionIK, GetPositionIK_Request,
     GetPositionIK_Response,
@@ -161,6 +166,7 @@ fn main() -> Result<()> {
 /// The node's interfaces, kept alive while it runs.
 struct Serving {
     _move_group: ActionServer<MoveGroup>,
+    _sequence_move_group: ActionServer<MoveGroupSequence>,
     _compute_ik: Service<GetPositionIK>,
     _compute_cartesian_path: Service<GetCartesianPath>,
 }
@@ -173,7 +179,12 @@ fn serve(
 ) -> Result<Serving, RclrsError> {
     let current = move || latest.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let move_group = {
-        let (planner, current, node) = (Arc::clone(&planner), current.clone(), node.clone());
+        let (planner, current, node, controller) = (
+            Arc::clone(&planner),
+            current.clone(),
+            node.clone(),
+            controller.clone(),
+        );
         node.clone().create_action_server::<MoveGroup, _>(
             "~/move_group",
             move |goal: RequestedGoal<MoveGroup>| {
@@ -190,16 +201,15 @@ fn serve(
                     goal.publish_feedback(MoveGroup_Feedback {
                         state: "PLANNING".into(),
                     });
-                    let (tx, rx) = futures::channel::oneshot::channel();
                     let asked = Arc::clone(&request);
-                    std::thread::spawn(move || {
-                        let _ = tx.send(planner.plan(
+                    let planned = off_thread(move || {
+                        planner.plan(
                             &asked.request,
                             &asked.planning_options.planning_scene_diff,
                             current.as_ref(),
-                        ));
+                        )
                     });
-                    let Ok(answer) = rx.await else {
+                    let Some(answer) = planned.await else {
                         let error_code = error(
                             MoveItErrorCodes::CRASH,
                             "planning stopped without an answer",
@@ -260,6 +270,85 @@ fn serve(
             },
         )?
     };
+    let sequence_move_group = {
+        let (planner, current, node) = (Arc::clone(&planner), current.clone(), node.clone());
+        node.clone().create_action_server::<MoveGroupSequence, _>(
+            "~/sequence_move_group",
+            move |goal: RequestedGoal<MoveGroupSequence>| {
+                let (planner, current, controller, node) = (
+                    Arc::clone(&planner),
+                    current(),
+                    controller.clone(),
+                    node.clone(),
+                );
+                async move {
+                    let request = Arc::clone(goal.goal());
+                    let id = goal.goal_id().to_string();
+                    let goal = goal.accept().execute();
+                    goal.publish_feedback(MoveGroupSequence_Feedback {
+                        state: "PLANNING".into(),
+                    });
+                    let asked = Arc::clone(&request);
+                    let planned = off_thread(move || {
+                        planner.plan_sequence(
+                            &asked.request,
+                            &asked.planning_options.planning_scene_diff,
+                            current.as_ref(),
+                        )
+                    });
+                    let Some(mut response) = planned.await else {
+                        let error_code = error(
+                            MoveItErrorCodes::CRASH,
+                            "planning stopped without an answer",
+                        );
+                        return goal.aborted_with(MoveGroupSequence_Result {
+                            response: MotionSequenceResponse {
+                                error_code,
+                                ..Default::default()
+                            },
+                        });
+                    };
+                    let plan_only = request.planning_options.plan_only;
+                    if response.error_code.val == MoveItErrorCodes::SUCCESS && !plan_only {
+                        goal.publish_feedback(MoveGroupSequence_Feedback {
+                            state: "MONITOR".into(),
+                        });
+                        for trajectory in &response.planned_trajectories {
+                            if let Err(message) = execute(controller.as_ref(), trajectory).await {
+                                response.error_code =
+                                    error(MoveItErrorCodes::CONTROL_FAILED, &message);
+                                break;
+                            }
+                        }
+                    }
+                    let succeeded = response.error_code.val == MoveItErrorCodes::SUCCESS;
+                    let what = if plan_only {
+                        "plan"
+                    } else {
+                        "plan and execute"
+                    };
+                    log_info!(
+                        node.logger(),
+                        "goal {}: a sequence of {} item(s), {what}: {} ({:.1} ms planning)",
+                        &id[..8],
+                        request.request.items.len(),
+                        if succeeded {
+                            "done"
+                        } else {
+                            &response.error_code.message
+                        },
+                        response.planning_time * 1e3
+                    );
+                    let result = MoveGroupSequence_Result { response };
+                    if succeeded {
+                        goal.succeeded_with(result)
+                    } else {
+                        goal.aborted_with(result)
+                    }
+                }
+            },
+        )?
+    };
     let compute_ik = {
         let (planner, current) = (Arc::clone(&planner), current.clone());
         node.create_service::<GetPositionIK, _>(
@@ -281,9 +370,20 @@ fn serve(
     )?;
     Ok(Serving {
         _move_group: move_group,
+        _sequence_move_group: sequence_move_group,
         _compute_ik: compute_ik,
         _compute_cartesian_path: compute_cartesian_path,
     })
+}
+
+/// `f`'s result, worked out on a thread of its own so the executor goes on serving; `None` if the
+/// thread panics.
+async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.await.ok()
 }
 
 async fn execute(

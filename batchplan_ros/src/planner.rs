@@ -3,18 +3,20 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hasher;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use batchplan::{
-    CollisionModel, CollisionWeights, Device, HandSpeed, IkOptions, IkProblem, JointLimits,
-    JointTrajectory, MeshModel, PlanOptions, PlanProblem, PlanResult, Robot, RobotOptions,
-    SdfOptions, ToolPath, ToolPathOptions, ToolPathStop, Trajectory, World, Worlds, solve_ik,
+    CollisionModel, CollisionWeights, Device, HandSpeed, IkOptions, IkProblem, JoinOptions,
+    JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem, PlanResult, Robot,
+    RobotOptions, SdfOptions, Sequence, ToolPath, ToolPathOptions, ToolPathStop, Trajectory, World,
+    Worlds, solve_ik,
 };
 use ros_env::moveit_msgs::msg::{
-    AttachedCollisionObject, MotionPlanRequest, MoveItErrorCodes, PlanningScene, PositionIKRequest,
-    RobotState, RobotTrajectory,
+    AttachedCollisionObject, MotionPlanRequest, MotionSequenceRequest, MotionSequenceResponse,
+    MoveItErrorCodes, PlanningScene, PositionIKRequest, RobotState, RobotTrajectory,
 };
 use ros_env::moveit_msgs::srv::{GetCartesianPath_Request, GetCartesianPath_Response};
 use ros_env::sensor_msgs::msg::JointState;
@@ -92,6 +94,40 @@ const LIMIT_TOLERANCE: f32 = 1e-3;
 /// The planner id that asks for the hand to move in a straight line to its goal, as Pilz's
 /// industrial motion planner names it.
 const STRAIGHT: &str = "LIN";
+
+/// What a request's motions are planned in: the robot holding the scene's attached objects, its
+/// device and meshes, the scene's world, and the states that place the robot's frames.
+struct Setting<'a> {
+    robot: &'a Robot,
+    device: &'a Device,
+    meshes: &'a MeshModel,
+    world: &'a World,
+    worlds: &'a Worlds,
+    states: [&'a RobotState; 2],
+    scene: &'a PlanningScene,
+}
+
+/// One planned motion: the joints it moves, its path (B-spline control points, empty for one that
+/// stays where it starts), how its timing is slowed and capped, and the trajectory so timed.
+struct Motion {
+    group: Vec<usize>,
+    path: Vec<f32>,
+    speed: f32,
+    cap: Option<HandSpeed>,
+    sampled: JointTrajectory,
+}
+
+impl Motion {
+    /// Where it ends: its path's last control point, or where it stays.
+    fn end(&self) -> &[f32] {
+        let n = self.sampled.dof;
+        if self.path.is_empty() {
+            &self.sampled.positions[..n]
+        } else {
+            &self.path[self.path.len() - n..]
+        }
+    }
+}
 
 /// Answers MoveIt planning and IK requests for one robot with batchplan.
 pub struct Planner {
@@ -202,13 +238,13 @@ impl Planner {
         current: Option<&JointState>,
     ) -> Answer {
         let begun = Instant::now();
-        let outcome = self.try_plan(request, scene, current, begun);
+        let outcome = self.try_sequence(&[(request, 0.0)], scene, current, begun);
         let planning_time = begun.elapsed().as_secs_f64();
         match outcome {
-            Ok((trajectory_start, trajectory)) => Answer {
+            Ok((trajectory_start, mut trajectories)) => Answer {
                 error_code: code(Code::SUCCESS, ""),
                 trajectory_start,
-                trajectory,
+                trajectory: trajectories.pop().unwrap_or_default(),
                 planning_time,
             },
             Err(r) => Answer {
@@ -220,34 +256,88 @@ impl Planner {
         }
     }
 
-    fn try_plan(
+    /// Plans `request`'s items one after another in `scene`, as Pilz's sequence planner does: each
+    /// starts where the one before ends, the first as [`plan`](Self::plan) starts. There is one
+    /// trajectory per run of items planning one group, which passes each join whose blend radius is
+    /// above 0 without stopping, within that radius, where that is sooner and clear of collision
+    /// and the motions either side are timed alike.
+    pub fn plan_sequence(
         &self,
-        request: &MotionPlanRequest,
+        request: &MotionSequenceRequest,
+        scene: &PlanningScene,
+        current: Option<&JointState>,
+    ) -> MotionSequenceResponse {
+        let begun = Instant::now();
+        let items: Vec<(&MotionPlanRequest, f64)> = request
+            .items
+            .iter()
+            .map(|item| (&item.req, item.blend_radius))
+            .collect();
+        let outcome = self.try_sequence(&items, scene, current, begun);
+        let planning_time = begun.elapsed().as_secs_f64();
+        match outcome {
+            Ok((sequence_start, planned_trajectories)) => MotionSequenceResponse {
+                error_code: code(Code::SUCCESS, ""),
+                sequence_start,
+                planned_trajectories,
+                planning_time,
+            },
+            Err(r) => MotionSequenceResponse {
+                error_code: code(r.code, &r.message),
+                planning_time,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The start and the trajectories of `items`, each a request and the blend radius of the join
+    /// after it.
+    fn try_sequence(
+        &self,
+        items: &[(&MotionPlanRequest, f64)],
         scene: &PlanningScene,
         current: Option<&JointState>,
         begun: Instant,
-    ) -> Result<(RobotState, RobotTrajectory), Refusal> {
-        let seconds = if request.allowed_planning_time > 0.0 {
-            request.allowed_planning_time
-        } else {
-            DEFAULT_BUDGET
+    ) -> Result<(RobotState, Vec<RobotTrajectory>), Refusal> {
+        let Some(&(first, _)) = items.first() else {
+            return Ok((RobotState::default(), vec![]));
         };
-        let budget = Duration::from_secs_f64(seconds);
-        let path = &request.path_constraints;
-        let constrained = !(path.joint_constraints.is_empty()
-            && path.position_constraints.is_empty()
-            && path.orientation_constraints.is_empty()
-            && path.visibility_constraints.is_empty()
-            && request.trajectory_constraints.constraints.is_empty());
-        if constrained {
-            return Err(Refusal::new(
-                Code::INVALID_GOAL_CONSTRAINTS,
-                "path and trajectory constraints are not supported",
-            ));
+        let invalid = |message: String| Refusal::new(Code::INVALID_MOTION_PLAN, message);
+        // An item's refusal, naming the item where there are several.
+        let at = |k: usize| {
+            move |r: Refusal| match items.len() {
+                1 => r,
+                _ => Refusal::new(r.code, format!("item {k}: {}", r.message)),
+            }
+        };
+        // What each request asks for is checked before the scene is built or anything planned.
+        let mut groups = Vec::with_capacity(items.len());
+        for (k, &(request, radius)) in items.iter().enumerate() {
+            groups.push(self.asked(request).map_err(at(k))?);
+            let given = &request.start_state;
+            if k > 0
+                && !(given.joint_state.name.is_empty()
+                    && given.multi_dof_joint_state.joint_names.is_empty()
+                    && given.attached_collision_objects.is_empty())
+            {
+                return Err(Refusal::new(
+                    Code::INVALID_ROBOT_STATE,
+                    format!("item {k} gives a start state: only the first may"),
+                ));
+            }
+            if !(radius >= 0.0 && radius.is_finite()) {
+                return Err(invalid(format!(
+                    "item {k}'s blend radius must be finite and not negative, got {radius}"
+                )));
+            }
+            if k + 1 == items.len() && radius != 0.0 {
+                return Err(invalid(format!(
+                    "the last item's blend radius must be 0, got {radius}"
+                )));
+            }
         }
-        let group = self.group(&request.group_name)?;
-        let start = self.start(&request.start_state, scene, current)?;
-        let states = [&scene.robot_state, &request.start_state];
+        let start = self.start(&first.start_state, scene, current)?;
+        let states = [&scene.robot_state, &first.start_state];
         let frames = Frames::new(
             &self.robot,
             &start,
@@ -256,12 +346,11 @@ impl Planner {
             &states,
             scene,
         );
-
         let attached: Vec<&AttachedCollisionObject> = scene
             .robot_state
             .attached_collision_objects
             .iter()
-            .chain(&request.start_state.attached_collision_objects)
+            .chain(&first.start_state.attached_collision_objects)
             .collect();
         let holding = self.holding(&attached, &frames)?;
         let (robot, device, meshes) = holding
@@ -280,12 +369,175 @@ impl Planner {
                 format!("the start's collision spheres touch {what}"),
             ));
         }
+        let setting = Setting {
+            robot,
+            device,
+            meshes,
+            world: &world,
+            worlds: &worlds,
+            states,
+            scene,
+        };
+        let mut motions: Vec<Motion> = Vec::with_capacity(items.len());
+        for (k, (&(request, _), group)) in items.iter().zip(groups).enumerate() {
+            let from = motions.last().map_or(&start[..], |m| m.end());
+            // The first item's budget counts from the request, the others' from their own start.
+            let begun = if k == 0 { begun } else { Instant::now() };
+            let motion = self
+                .motion(&setting, request, group, from, begun)
+                .map_err(at(k))?;
+            motions.push(motion);
+        }
 
+        // Each join's radius; 0 where the motions either side are timed apart or one stays put.
+        let radii: Vec<f32> = motions
+            .windows(2)
+            .zip(items)
+            .map(|(pair, &(_, radius))| {
+                let (a, b) = (&pair[0], &pair[1]);
+                let alike = a.group == b.group && a.speed == b.speed && a.cap == b.cap;
+                let moving = !a.path.is_empty() && !b.path.is_empty();
+                if alike && moving { radius as f32 } else { 0.0 }
+            })
+            .collect();
+        // Chains of motions whose joins may blend, one join call for them all.
+        let mut chains: Vec<Range<usize>> = vec![];
+        for k in 0..motions.len() {
+            match chains.last_mut() {
+                Some(chain) if radii[k - 1] > 0.0 => chain.end = k + 1,
+                _ => chains.push(k..k + 1),
+            }
+        }
+        let sequences: Vec<Sequence> = chains
+            .iter()
+            .filter(|c| c.len() > 1)
+            .map(|c| Sequence {
+                world: 0,
+                paths: motions[c.clone()].iter().map(|m| m.path.clone()).collect(),
+                blends: radii[c.start..c.end - 1].to_vec(),
+            })
+            .collect();
+        let joined = if sequences.is_empty() {
+            None
+        } else {
+            let o = JoinOptions::default();
+            Some(batchplan::join(device, &worlds, &sequences, &o).map_err(crash)?)
+        };
+        let mut joined = joined.iter().flat_map(|j| j.paths.iter().zip(&j.blends));
+
+        // Each stretch of motions joined, timed and clear of the meshes; a lone motion, or motions
+        // whose joined stretch grazes the meshes, as planned.
+        let n = robot.dof();
+        let mut pieces: Vec<(&[usize], JointTrajectory)> = vec![];
+        for chain in chains {
+            if chain.len() == 1 {
+                let motion = &motions[chain.start];
+                pieces.push((&motion.group, motion.sampled.clone()));
+                continue;
+            }
+            let (stretches, blends) = joined
+                .next()
+                .expect("a joined sequence per chain of several");
+            // A stretch ends at each join that keeps its stop, and at the chain's end.
+            let ends = blends
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.is_none())
+                .map(|(k, _)| chain.start + k + 1)
+                .chain([chain.end]);
+            let mut from = chain.start;
+            for (stretch, to) in stretches.iter().zip(ends) {
+                let planned = &motions[from..to];
+                from = to;
+                let first = &planned[0];
+                if planned.len() > 1 {
+                    let sampled = timed(
+                        robot,
+                        stretch,
+                        &stretch[..n],
+                        first.speed,
+                        first.cap,
+                        self.dt,
+                    )?;
+                    if clear_on_meshes(meshes, &world, &sampled)? {
+                        pieces.push((&first.group, sampled));
+                        continue;
+                    }
+                }
+                pieces.extend(
+                    planned
+                        .iter()
+                        .map(|m| (m.group.as_slice(), m.sampled.clone())),
+                );
+            }
+        }
+        // A trajectory per run of one group, as Pilz builds them.
+        let mut runs: Vec<(&[usize], Vec<JointTrajectory>)> = vec![];
+        for (group, piece) in pieces {
+            match runs.last_mut() {
+                Some((run_group, run)) if *run_group == group => run.push(piece),
+                _ => runs.push((group, vec![piece])),
+            }
+        }
+        let trajectories = runs
+            .iter()
+            .map(|(group, pieces)| trajectory::robot_trajectory(pieces, robot, group))
+            .collect();
+        let start_state = RobotState {
+            joint_state: state::joint_state(robot, &start),
+            ..Default::default()
+        };
+        Ok((start_state, trajectories))
+    }
+
+    /// The joints `request` plans, once its constraints are ones the planner takes.
+    fn asked(&self, request: &MotionPlanRequest) -> Result<Vec<usize>, Refusal> {
+        let path = &request.path_constraints;
+        let constrained = !(path.joint_constraints.is_empty()
+            && path.position_constraints.is_empty()
+            && path.orientation_constraints.is_empty()
+            && path.visibility_constraints.is_empty()
+            && request.trajectory_constraints.constraints.is_empty());
+        if constrained {
+            return Err(Refusal::new(
+                Code::INVALID_GOAL_CONSTRAINTS,
+                "path and trajectory constraints are not supported",
+            ));
+        }
+        self.group(&request.group_name)
+    }
+
+    /// One motion of the joints `group` for `request` from `start` at rest, within the request's
+    /// planning time counted from `begun`: a straight move for planner id `LIN`, otherwise a
+    /// planned path to the nearest reachable goal, timed and clear of the meshes.
+    fn motion(
+        &self,
+        s: &Setting,
+        request: &MotionPlanRequest,
+        group: Vec<usize>,
+        start: &[f32],
+        begun: Instant,
+    ) -> Result<Motion, Refusal> {
+        let seconds = if request.allowed_planning_time > 0.0 {
+            request.allowed_planning_time
+        } else {
+            DEFAULT_BUDGET
+        };
+        let budget = Duration::from_secs_f64(seconds);
+        let frames = Frames::new(
+            &self.robot,
+            start,
+            &self.root,
+            &self.virtual_joints,
+            &s.states,
+            s.scene,
+        );
+        let robot = s.robot;
         let goals = goals::goals(
             &request.goal_constraints,
             robot,
             &group,
-            &start,
+            start,
             &self.hands,
             &frames,
         )?;
@@ -295,9 +547,12 @@ impl Planner {
             &request.cartesian_speed_limited_link,
             request.max_cartesian_speed,
         )?;
-        let start_state = || RobotState {
-            joint_state: state::joint_state(robot, &start),
-            ..Default::default()
+        let motion = |path: Vec<f32>, sampled: JointTrajectory| Motion {
+            group: group.clone(),
+            path,
+            speed,
+            cap,
+            sampled,
         };
         if request.planner_id == STRAIGHT {
             let (hand, pose) = match goals.as_slice() {
@@ -312,12 +567,13 @@ impl Planner {
             moves_within(robot, hand, &group)?;
             let path = ToolPath {
                 world: 0,
-                start: start.clone(),
+                start: start.to_vec(),
                 hand,
                 waypoints: vec![pose],
             };
-            let result = batchplan::follow(device, &worlds, &[path], &ToolPathOptions::default())
-                .map_err(crash)?;
+            let mut result =
+                batchplan::follow(s.device, s.worlds, &[path], &ToolPathOptions::default())
+                    .map_err(crash)?;
             if let Some(why) = result.stopped[0] {
                 return Err(Refusal::new(
                     Code::PLANNING_FAILED,
@@ -328,23 +584,23 @@ impl Planner {
                     ),
                 ));
             }
-            let sampled = timed(robot, &result.paths[0], &start, speed, cap, self.dt)?;
-            if !clear_on_meshes(meshes, &world, &sampled)? {
+            let path = result.paths.swap_remove(0);
+            let sampled = timed(robot, &path, start, speed, cap, self.dt)?;
+            if !clear_on_meshes(s.meshes, s.world, &sampled)? {
                 return Err(Refusal::new(
                     Code::PLANNING_FAILED,
                     "the straight line touches the robot's or the scene's meshes",
                 ));
             }
-            let trajectory = trajectory::robot_trajectory(&sampled, robot, &group);
-            return Ok((start_state(), trajectory));
+            return Ok(motion(path, sampled));
         }
-        let candidates = candidates(&goals, robot, device, &worlds, &start, &group)?;
+        let candidates = candidates(&goals, robot, s.device, s.worlds, start, &group)?;
         let hold: Vec<usize> = (0..robot.dof()).filter(|j| !group.contains(j)).collect();
         let problems: Vec<PlanProblem> = candidates
             .iter()
             .map(|goal| PlanProblem {
                 world: 0,
-                start: start.clone(),
+                start: start.to_vec(),
                 goal: goal.clone(),
                 start_motion: None,
                 hold: hold.clone(),
@@ -364,7 +620,7 @@ impl Planner {
             };
             options.rrt.clearance *= widen;
             options.shortcut.clearance *= widen;
-            let result = batchplan::plan(device, &worlds, &problems, &options).map_err(crash)?;
+            let result = batchplan::plan(s.device, s.worlds, &problems, &options).map_err(crash)?;
             let mut solved: Vec<(f32, &[f32])> = result
                 .solved()
                 .map(|s| (best_length(&result, s.index), s.solution))
@@ -374,10 +630,9 @@ impl Planner {
             }
             solved.sort_by(|a, b| a.0.total_cmp(&b.0));
             for (_, path) in solved {
-                let sampled = timed(robot, path, &start, speed, cap, self.dt)?;
-                if clear_on_meshes(meshes, &world, &sampled)? {
-                    let trajectory = trajectory::robot_trajectory(&sampled, robot, &group);
-                    return Ok((start_state(), trajectory));
+                let sampled = timed(robot, path, start, speed, cap, self.dt)?;
+                if clear_on_meshes(s.meshes, s.world, &sampled)? {
+                    return Ok(motion(path.to_vec(), sampled));
                 }
                 touched = true;
             }
@@ -608,7 +863,7 @@ impl Planner {
         };
         Ok((
             start_state,
-            trajectory::robot_trajectory(&sampled, robot, &group),
+            trajectory::robot_trajectory(std::slice::from_ref(&sampled), robot, &group),
             f64::from(result.fraction[0]),
         ))
     }
