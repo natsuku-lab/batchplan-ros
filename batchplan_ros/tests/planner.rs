@@ -1042,9 +1042,8 @@ fn path_constraints_keep_the_hand_within_them() {
     );
 }
 
-/// A constrained request's goals are planned nearest first, until one has a path, each with an
-/// even share of the time: of two goals the upright hand reaches by turning the base joint, the
-/// plan ends at the nearer.
+/// A constrained request plans its nearest goal alone first: of two goals the upright hand reaches
+/// by turning the base joint, the plan ends at the nearer.
 #[test]
 fn constrained_goals_are_planned_nearest_first() {
     let hand = PLANNER.robot().ee_pose(&full(&READY), 0);

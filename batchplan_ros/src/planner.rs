@@ -91,6 +91,8 @@ const DISTINCT: f32 = 0.05;
 const DEFAULT_BUDGET: f64 = 5.0;
 /// Positions this close outside a limit are moved onto it.
 const LIMIT_TOLERANCE: f32 = 1e-3;
+/// The first round's time slice for constrained goals, as a fraction of the request's budget.
+const FIRST_SLICE: u32 = 16;
 /// The planner id that asks for the hand to move in a straight line to its goal, as Pilz's
 /// industrial motion planner names it.
 const STRAIGHT: &str = "LIN";
@@ -643,35 +645,35 @@ impl Planner {
             .collect();
 
         // A constrained search projects every hop, and one toward a goal it cannot reach on the
-        // constraints spends all the time it is given: constrained goals are planned one at a time,
-        // nearest first, each with an even share of the time left, until one has a path, as OMPL's
-        // constrained planners take goal samples one at a time.
+        // constraints spends all the time it is given. So constrained goals are planned in rounds
+        // that each stop at a time slice, doubling each round, until one has a path: the nearest
+        // alone, then all of them together, as anytime planners restart with more time.
+        let constrained = !constraints.is_empty();
         let mut problems = problems;
-        let batch = if constraints.is_empty() {
-            problems.len()
-        } else {
+        if constrained {
             problems.sort_by(|a, b| distance(&a.goal, start).total_cmp(&distance(&b.goal, start)));
-            1
-        };
+        }
         let mut touched = false;
         // A path that grazes the meshes is planned again keeping twice the clearance.
         for widen in [1.0, 2.0] {
-            let mut found = false;
-            let chunks = problems.len().div_ceil(batch);
-            for (k, problems) in problems.chunks(batch).enumerate() {
+            let (mut found, mut slice) = (false, budget / FIRST_SLICE);
+            for round in 0.. {
                 let remaining = budget.saturating_sub(begun.elapsed());
                 if remaining.is_zero() {
                     break;
                 }
-                let share = remaining / u32::try_from(chunks - k).unwrap_or(u32::MAX);
+                let (batch, given) = match (constrained, round) {
+                    (false, _) => (&problems[..], remaining),
+                    (true, 0) => (&problems[..1], slice.min(remaining)),
+                    (true, _) => (&problems[..], slice.min(remaining)),
+                };
                 let mut options = PlanOptions {
-                    time_budget: Some(share),
+                    time_budget: Some(given),
                     ..Default::default()
                 };
                 options.rrt.clearance *= widen;
                 options.shortcut.clearance *= widen;
-                let result =
-                    batchplan::plan(s.device, s.worlds, problems, &options).map_err(crash)?;
+                let result = batchplan::plan(s.device, s.worlds, batch, &options).map_err(crash)?;
                 let mut solved: Vec<(f32, &[f32])> = result
                     .solved()
                     .map(|s| (best_length(&result, s.index), s.solution))
@@ -685,6 +687,10 @@ impl Planner {
                     }
                     touched = true;
                 }
+                if found || !constrained {
+                    break;
+                }
+                slice *= 2;
             }
             if !found {
                 break;

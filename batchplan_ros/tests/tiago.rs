@@ -268,9 +268,9 @@ const REACHED: [f32; 22] = [
     0.035,
 ];
 
-/// Each constrained goal is planned with an even share of the time left: given the carry's two IK
-/// solutions as joint goals, the nearer of which no constrained search reaches, the request plans
-/// to the farther within its time.
+/// Constrained goals are planned in rounds that each stop at a time slice: given the carry's two
+/// IK solutions as joint goals, the nearer of which no constrained search reaches, the request plans
+/// to the farther well within its time.
 #[test]
 fn a_constrained_goal_out_of_reach_leaves_time_for_the_next() {
     let robot = TIAGO.robot();
@@ -323,5 +323,10 @@ fn a_constrained_goal_out_of_reach_leaves_time_for_the_next() {
         (end[0] - REACHED[0]).abs() < 1e-3,
         "the plan ends with the base at x {}",
         end[0]
+    );
+    assert!(
+        answer.planning_time < 0.5 * request.allowed_planning_time,
+        "planning took {:.1} s",
+        answer.planning_time
     );
 }

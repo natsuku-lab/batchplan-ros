@@ -19,7 +19,7 @@ Several goal constraints in one request without path constraints are planned in 
   - A position constraint is one box around the link's origin, aligned with the axes of the robot's root or of another IK frame.
   - A constraint in another IK frame's frame moves with that hand, as two hands holding one tray keep their places on it.
   - Bounds tighter than batchplan's floors (1 mm and 0.01 rad, twice that relative to another hand) count as the floors.
-  - A constrained request's goals are planned nearest first, each with an even share of the time left, until one has a path, because a constrained search toward a goal it cannot reach spends all the time it is given.
+  - A constrained request plans its nearest goal alone, then all its goals together, in rounds that each stop at a time slice, doubling each round, until one has a path; the shortest found wins. A constrained search toward a goal it cannot reach spends all the time it is given.
   - Joint and visibility path constraints, rotation-vector tolerances, and path constraints on `LIN` requests are refused.
 
 <p align="center">
