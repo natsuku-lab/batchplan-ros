@@ -888,6 +888,52 @@ fn ik_finds_a_configuration_at_the_pose() {
     );
 }
 
+/// IK and pose goals move only their group's joints, as MoveIt's do: with a group that leaves out
+/// the first joint, `compute_ik` and a plan to a pose it reaches with that joint where the start
+/// has it keep it there.
+#[test]
+fn ik_and_pose_goals_keep_the_joints_outside_their_group() {
+    let upper = panda(&SRDF.replace(
+        r#"<group name="hand">"#,
+        r#"<group name="upper_arm"><chain base_link="panda_link1" tip_link="panda_link8"/></group>
+  <group name="hand">"#,
+    ));
+    let start = [0.3, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785];
+    let target = upper
+        .robot()
+        .ee_pose(&full(&[0.3, -0.5, 0.2, -2.0, 0.1, 1.7, 0.6]), 0);
+    let mut ik = PositionIKRequest {
+        group_name: "upper_arm".into(),
+        ik_link_name: "panda_link8".into(),
+        ..Default::default()
+    };
+    ik.pose_stamped.header.frame_id = "world".into();
+    ik.pose_stamped.pose = pose_msg(target);
+    let (solution, error) = upper.ik(&ik, Some(&current(&start)));
+    assert_eq!(error.val, Code::SUCCESS, "{}", error.message);
+    let q: Vec<f32> = solution
+        .joint_state
+        .position
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
+    assert_eq!(
+        q[0], start[0] as f32,
+        "IK moved the joint outside its group"
+    );
+    assert!((upper.robot().ee_pose(&q, 0).position - target.position).length() < 2e-3);
+
+    let request = request("upper_arm", vec![pose_goal("panda_link8", "world", target)]);
+    let answer = upper.plan(&request, &scene(vec![]), Some(&current(&start)));
+    succeeded(&answer);
+    assert_eq!(answer.trajectory.joint_trajectory.joint_names, ARM[1..]);
+    let last = answer.trajectory.joint_trajectory.points.len() - 1;
+    let reached = upper
+        .robot()
+        .ee_pose(&waypoint(&answer, last, &full(&start)), 0);
+    assert!((reached.position - target.position).length() < 2e-3);
+}
+
 #[test]
 fn joint_limits_files_give_the_limits_they_enable() {
     let limits = batchplan_ros::parse_joint_limits(

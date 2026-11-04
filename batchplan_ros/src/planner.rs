@@ -415,6 +415,7 @@ impl Planner {
                 world: 0,
                 paths: motions[c.clone()].iter().map(|m| m.path.clone()).collect(),
                 blends: radii[c.start..c.end - 1].to_vec(),
+                constraints: vec![],
             })
             .collect();
         let joined = if sequences.is_empty() {
@@ -595,7 +596,7 @@ impl Planner {
             return Ok(motion(path, sampled));
         }
         let candidates = candidates(&goals, robot, s.device, s.worlds, start, &group)?;
-        let hold: Vec<usize> = (0..robot.dof()).filter(|j| !group.contains(j)).collect();
+        let hold = outside(robot, &group);
         let problems: Vec<PlanProblem> = candidates
             .iter()
             .map(|goal| PlanProblem {
@@ -604,6 +605,7 @@ impl Planner {
                 goal: goal.clone(),
                 start_motion: None,
                 hold: hold.clone(),
+                constraints: vec![],
             })
             .collect();
 
@@ -875,6 +877,7 @@ impl Planner {
     ) -> Result<Vec<f32>, Refusal> {
         let seed = self.start(&request.robot_state, &PlanningScene::default(), current)?;
         let hand = self.hand(&request.ik_link_name)?;
+        let group = self.group(&request.group_name)?;
         let frames = Frames::new(
             &self.robot,
             &seed,
@@ -894,6 +897,7 @@ impl Planner {
             world: 0,
             targets,
             seed: Some(seed.clone()),
+            hold: outside(&self.robot, &group),
         };
         let result =
             solve_ik(&self.device, &worlds, &[problem], &IkOptions::default()).map_err(crash)?;
@@ -904,8 +908,13 @@ impl Planner {
     }
 }
 
+/// The joints outside `group`, which IK and planning hold where the start has them.
+fn outside(robot: &Robot, group: &[usize]) -> Vec<usize> {
+    (0..robot.dof()).filter(|j| !group.contains(j)).collect()
+}
+
 /// Goal configurations to plan to: joint goals clear of collision, and the nearest distinct IK
-/// solutions of each pose goal that keep the joints outside the group where they start.
+/// solutions of each pose goal, the joints outside the group held where they start.
 fn candidates(
     goals: &[Goal],
     robot: &Robot,
@@ -952,6 +961,7 @@ fn candidates(
             rotation_tolerance: poses.iter().map(|p| p.3).fold(f32::INFINITY, f32::min),
             ..Default::default()
         };
+        let hold = outside(robot, group);
         let problems: Vec<IkProblem> = poses
             .iter()
             .map(|&(hand, pose, _, _)| IkProblem {
@@ -960,6 +970,7 @@ fn candidates(
                     .map(|h| (h == hand).then_some(pose))
                     .collect(),
                 seed: Some(start.to_vec()),
+                hold: hold.clone(),
             })
             .collect();
         let ik = solve_ik(device, worlds, &problems, &options).map_err(crash)?;
@@ -970,14 +981,10 @@ fn candidates(
                 .sum::<f32>()
                 .sqrt()
         };
-        let keeps_held = |q: &[f32]| {
-            (0..robot.dof()).all(|j| group.contains(&j) || (q[j] - start[j]).abs() < 1e-4)
-        };
         for p in 0..problems.len() {
             let mut solutions: Vec<&[f32]> = (p * ik.seeds..(p + 1) * ik.seeds)
                 .filter(|&i| ik.success[i])
                 .map(|i| ik.solution(i))
-                .filter(|q| keeps_held(q))
                 .collect();
             solutions.sort_by(|a, b| distance(a, start).total_cmp(&distance(b, start)));
             let mut kept: Vec<&[f32]> = vec![];
