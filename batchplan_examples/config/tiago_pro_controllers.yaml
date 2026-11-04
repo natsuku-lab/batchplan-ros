@@ -1,0 +1,54 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    whole_body_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    gripper_left_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    gripper_right_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+# The base on its planar joints and both arms; a group that plans fewer of them sends those alone.
+whole_body_controller:
+  ros__parameters:
+    joints:
+      - base_joint_x
+      - base_joint_y
+      - base_joint_theta
+      - arm_left_1_joint
+      - arm_left_2_joint
+      - arm_left_3_joint
+      - arm_left_4_joint
+      - arm_left_5_joint
+      - arm_left_6_joint
+      - arm_left_7_joint
+      - arm_right_1_joint
+      - arm_right_2_joint
+      - arm_right_3_joint
+      - arm_right_4_joint
+      - arm_right_5_joint
+      - arm_right_6_joint
+      - arm_right_7_joint
+    allow_partial_joints_goal: true
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+
+gripper_left_controller:
+  ros__parameters:
+    joints:
+      - gripper_left_finger_joint
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+
+gripper_right_controller:
+  ros__parameters:
+    joints:
+      - gripper_right_finger_joint
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]

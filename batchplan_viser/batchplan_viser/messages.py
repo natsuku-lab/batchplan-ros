@@ -8,6 +8,7 @@ from moveit_msgs.msg import (
     AllowedCollisionMatrix,
     CollisionObject,
     Constraints,
+    JointConstraint,
     OrientationConstraint,
     PositionConstraint,
 )
@@ -55,17 +56,35 @@ def cylinder_object(name: str, frame: str, position, radius: float, height: floa
     return solid(name, frame, position, (1.0, 0.0, 0.0, 0.0), SolidPrimitive.CYLINDER, (height, radius))
 
 
+def positioned(link: str, frame: str, position, size: float, box: bool = False) -> PositionConstraint:
+    """`link`'s origin within `size` of `position` in `frame`: a sphere of that radius, or a box of
+    that side, as path constraints need."""
+    constraint = PositionConstraint(link_name=link, weight=1.0)
+    constraint.header.frame_id = frame
+    shape = SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[size] * 3) if box else SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[size])
+    constraint.constraint_region.primitives = [shape]
+    constraint.constraint_region.primitive_poses = [pose_msg(position, (1.0, 0.0, 0.0, 0.0))]
+    return constraint
+
+
+def oriented(link: str, frame: str, wxyz, tolerances) -> OrientationConstraint:
+    """`link` turned within `tolerances` (x, y, z, as XYZ Euler angles) of `wxyz` in `frame`."""
+    constraint = OrientationConstraint(link_name=link, weight=1.0)
+    constraint.header.frame_id = frame
+    constraint.orientation = pose_msg((0.0, 0.0, 0.0), wxyz).orientation
+    x, y, z = (float(t) for t in tolerances)
+    constraint.absolute_x_axis_tolerance, constraint.absolute_y_axis_tolerance, constraint.absolute_z_axis_tolerance = x, y, z
+    return constraint
+
+
 def pose_goal(link: str, frame: str, position, wxyz) -> Constraints:
-    position_constraint = PositionConstraint(link_name=link, weight=1.0)
-    position_constraint.header.frame_id = frame
-    position_constraint.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[1e-3])]
-    position_constraint.constraint_region.primitive_poses = [pose_msg(position, (1.0, 0.0, 0.0, 0.0))]
-    orientation = OrientationConstraint(link_name=link, weight=1.0)
-    orientation.header.frame_id = frame
-    orientation.orientation = pose_msg((0.0, 0.0, 0.0), wxyz).orientation
-    orientation.absolute_x_axis_tolerance = orientation.absolute_y_axis_tolerance = 1e-2
-    orientation.absolute_z_axis_tolerance = 1e-2
-    return Constraints(position_constraints=[position_constraint], orientation_constraints=[orientation])
+    return Constraints(position_constraints=[positioned(link, frame, position, 1e-3)], orientation_constraints=[oriented(link, frame, wxyz, (1e-2, 1e-2, 1e-2))])
+
+
+def joint_goal(values: dict) -> Constraints:
+    """Each joint at its value in `values` (name to position), within a milliradian."""
+    joints = [JointConstraint(joint_name=name, position=float(v), tolerance_above=1e-3, tolerance_below=1e-3, weight=1.0) for name, v in values.items()]
+    return Constraints(joint_constraints=joints)
 
 
 def allowing(obj: str, links) -> AllowedCollisionMatrix:

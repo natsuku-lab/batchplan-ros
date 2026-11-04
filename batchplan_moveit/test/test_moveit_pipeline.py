@@ -16,7 +16,7 @@ from moveit_msgs.srv import ApplyPlanningScene, GetMotionPlan, QueryPlannerInter
 from rclpy.action import ActionClient
 from sensor_msgs.msg import JointState
 
-from batchplan_viser.messages import box_object, pose_goal
+from batchplan_viser.messages import box_object, oriented, pose_goal
 
 ARM = [f"panda_joint{i}" for i in range(1, 8)]
 BESIDE_WALL = [-1.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.785]
@@ -123,10 +123,30 @@ def test_move_group_executes_batchplans_pose_goals(ros):
     assert max(abs(joints[n] - v) for n, v in final.items()) < 1e-2
 
 
-def test_path_constraints_are_refused_with_a_reason(ros):
+def test_joint_path_constraints_are_refused_with_a_reason(ros):
     node, planning, _ = ros
     request = plan_request(joint_goal(BEYOND_WALL))
     request.motion_plan_request.path_constraints = joint_goal(BESIDE_WALL)
     response = call(node, planning, request).motion_plan_response
     assert response.error_code.val != MoveItErrorCodes.SUCCESS
-    assert "path and trajectory constraints are not supported" in response.error_code.message
+    assert "not joints or visibility" in response.error_code.message
+
+
+def test_orientation_path_constraints_reach_batchplan(ros):
+    """Through MoveIt, a request whose hand must stay within 0.1 rad of pointing down plans when its
+    goal keeps that, and batchplan refuses the goal tilted past it."""
+    node, planning, _ = ros
+    down = Constraints(orientation_constraints=[oriented("panda_link8", "world", (0.0, 1.0, 0.0, 0.0), (0.1, 0.1, math.pi))])
+    request = plan_request(joint_goal(BEYOND_WALL))
+    request.motion_plan_request.path_constraints = down
+    response = call(node, planning, request).motion_plan_response
+    assert response.error_code.val == MoveItErrorCodes.SUCCESS, response.error_code.message
+    tilted = list(BEYOND_WALL)
+    tilted[5] += 0.5
+    request = plan_request(joint_goal(tilted))
+    request.motion_plan_request.path_constraints = down
+    response = call(node, planning, request).motion_plan_response
+    # MoveIt's pipeline reports batchplan's GOAL_VIOLATES_PATH_CONSTRAINTS as a FAILURE, keeping its
+    # message.
+    assert response.error_code.val != MoveItErrorCodes.SUCCESS
+    assert "every goal breaks the path constraints" in response.error_code.message, response.error_code.message

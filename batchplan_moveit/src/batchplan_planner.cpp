@@ -203,12 +203,13 @@ public:
     return context;
   }
 
-  // batchplan plans to joint and pose goals; it does not follow path or trajectory constraints.
+  // batchplan plans to joint and pose goals and keeps path constraints on links' positions and
+  // orientations, which the node checks further; not joint or visibility path constraints, nor
+  // trajectory constraints.
   bool canServiceRequest(const planning_interface::MotionPlanRequest& req) const override
   {
     const auto& path = req.path_constraints;
-    return path.joint_constraints.empty() && path.position_constraints.empty() &&
-           path.orientation_constraints.empty() && path.visibility_constraints.empty() &&
+    return path.joint_constraints.empty() && path.visibility_constraints.empty() &&
            req.trajectory_constraints.constraints.empty();
   }
 

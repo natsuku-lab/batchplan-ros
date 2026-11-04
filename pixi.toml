@@ -17,6 +17,7 @@ yourdfpy = ">=0.0.60,<0.0.61"
 pycollada = ">=0.9,<0.10"
 pytest = ">=9.1.1,<10"
 trimesh = ">=4.12.2,<5"
+scipy = ">=1.15,<2"
 
 [pypi-dependencies]
 colcon-ros-cargo = ">=0.2.0,<0.3"
@@ -35,9 +36,12 @@ MACOSX_DEPLOYMENT_TARGET = "14.0"
 [tasks]
 cargo-ament-build = "cargo install --locked --quiet cargo-ament-build@0.1.11 --root .pixi/cargo"
 build = { cmd = "colcon build --symlink-install --build-base build/$PIXI_ENVIRONMENT_NAME --install-base install/$PIXI_ENVIRONMENT_NAME --packages-ignore batchplan_moveit", depends-on = ["cargo-ament-build"] }
-test = { cmd = "cargo test --manifest-path batchplan_ros/Cargo.toml --target-dir build/$PIXI_ENVIRONMENT_NAME/batchplan_ros", depends-on = ["build"] }
-test-demo = { cmd = "scripts/run.sh pytest -q batchplan_examples/test", depends-on = ["build"] }
-demo = { cmd = "scripts/run.sh ros2 launch batchplan_examples panda_demo.launch.py", depends-on = ["build"] }
+test = { cmd = "cargo test --manifest-path batchplan_ros/Cargo.toml --target-dir build/$PIXI_ENVIRONMENT_NAME/batchplan_ros", depends-on = ["fetch-tiago-pro", "build"] }
+test-demo = { cmd = "scripts/run.sh pytest -q batchplan_examples/test", depends-on = ["fetch-tiago-pro", "build"] }
+demo = { cmd = "scripts/run.sh ros2 launch batchplan_examples demo.launch.py", depends-on = ["build"] }
+# PAL Robotics' TIAGo Pro, fetched at a pinned commit, its base and arms planned as one.
+fetch-tiago-pro = "python scripts/fetch_tiago_pro.py"
+demo-tiago-pro = { cmd = "scripts/run.sh ros2 launch batchplan_examples demo.launch.py robot:=tiago_pro", depends-on = ["fetch-tiago-pro", "build"] }
 
 # ROS 2 Lyrical Luth, the 2026 LTS: the default and `moveit` environments.
 [feature.lyrical]

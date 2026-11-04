@@ -36,7 +36,7 @@ ARM = [f"panda_joint{i}" for i in range(1, 8)]
 def ros():
     os.environ["ROS_DOMAIN_ID"] = str(random.randint(100, 200))
     demo = subprocess.Popen(
-        ["ros2", "launch", "batchplan_examples", "panda_demo.launch.py", "ui:=false"],
+        ["ros2", "launch", "batchplan_examples", "demo.launch.py", "ui:=false"],
         stdout=open(os.environ.get("DEMO_LOG", os.devnull), "w"),
         stderr=subprocess.STDOUT,
         start_new_session=True,

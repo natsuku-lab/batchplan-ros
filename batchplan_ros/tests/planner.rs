@@ -934,6 +934,347 @@ fn ik_and_pose_goals_keep_the_joints_outside_their_group() {
     assert!((reached.position - target.position).length() < 2e-3);
 }
 
+/// The hand's z axis within `tilt` of where it points at `pose`, turning about it freely, as MoveIt
+/// asks for an upright hand: x and y tolerances in XYZ Euler angles, z free.
+fn upright(link: &str, frame: &str, pose: Pose, tilt: f64) -> OrientationConstraint {
+    let mut o = OrientationConstraint {
+        link_name: link.into(),
+        orientation: pose_msg(pose).orientation,
+        absolute_x_axis_tolerance: tilt,
+        absolute_y_axis_tolerance: tilt,
+        absolute_z_axis_tolerance: std::f64::consts::PI,
+        weight: 1.0,
+        ..Default::default()
+    };
+    o.header.frame_id = frame.into();
+    o
+}
+
+/// The hand's origin within a box of `size` around `center`, axis-aligned in `frame`.
+fn boxed(link: &str, frame: &str, center: Vec3, size: [f64; 3]) -> PositionConstraint {
+    let mut p = PositionConstraint {
+        link_name: link.into(),
+        weight: 1.0,
+        ..Default::default()
+    };
+    p.header.frame_id = frame.into();
+    p.constraint_region.primitives.push(SolidPrimitive {
+        type_: SolidPrimitive::BOX,
+        dimensions: size.as_slice().try_into().unwrap(),
+        ..Default::default()
+    });
+    p.constraint_region
+        .primitive_poses
+        .push(pose_msg(Pose::new(center, Quat::IDENTITY)));
+    p
+}
+
+/// A frame the scene places at `pose`, as a fixed frame transform from the planning frame.
+fn fixed_frame(name: &str, pose: Pose) -> geometry::TransformStamped {
+    let mut frame = geometry::TransformStamped {
+        child_frame_id: name.into(),
+        ..Default::default()
+    };
+    frame.header.frame_id = "world".into();
+    let p = pose_msg(pose);
+    frame.transform.translation = geometry::Vector3 {
+        x: p.position.x,
+        y: p.position.y,
+        z: p.position.z,
+    };
+    frame.transform.rotation = p.orientation;
+    frame
+}
+
+/// A reach to the side that turns the hand about the vertical: within path constraints, the hand
+/// stays within 0.03 rad of pointing down (the x tolerance; y allows 0.6) and within 1.5 cm of its
+/// start's height at every waypoint, where the same reach planned without them leaves both. The
+/// orientation is given in a frame tilted 0.4 rad, and the box in a frame 5 cm up and to the side,
+/// so that either taken in the planning frame breaks the start.
+#[test]
+fn path_constraints_keep_the_hand_within_them() {
+    let start = full(&READY);
+    let hand = PLANNER.robot().ee_pose(&start, 0);
+    let goal = Pose::new(
+        hand.position + Vec3::new(0.15, 0.4, 0.0),
+        Quat::from_rotation_z(1.0) * hand.rotation,
+    );
+    let tilted = Pose::new(Vec3::new(0.1, 0.0, 0.2), Quat::from_rotation_x(0.4));
+    let shifted = Pose::new(Vec3::new(0.0, 0.1, 0.05), Quat::IDENTITY);
+    let mut frames = scene(vec![]);
+    frames.fixed_frame_transforms = vec![
+        fixed_frame("tilted", tilted),
+        fixed_frame("shifted", shifted),
+    ];
+    let free = request("panda_arm", vec![pose_goal("panda_link8", "world", goal)]);
+    let mut kept = free.clone();
+    let in_tilted = Pose::new(Vec3::ZERO, tilted.rotation.inverse() * hand.rotation);
+    let mut down = upright("panda_link8", "tilted", in_tilted, 0.03);
+    down.absolute_y_axis_tolerance = 0.6;
+    kept.path_constraints.orientation_constraints = vec![down];
+    kept.path_constraints.position_constraints = vec![boxed(
+        "panda_link8",
+        "shifted",
+        hand.position - shifted.position,
+        [10.0, 10.0, 0.03],
+    )];
+    // The most the hand tilts from pointing down, and strays from its start's height.
+    let most = |answer: &Answer| {
+        succeeded(answer);
+        let points = answer.trajectory.joint_trajectory.points.len();
+        (0..points)
+            .map(|k| PLANNER.robot().ee_pose(&waypoint(answer, k, &start), 0))
+            .map(|at| {
+                let tilt = (at.rotation * Vec3::Z).angle_between(hand.rotation * Vec3::Z);
+                (tilt, (at.position.z - hand.position.z).abs())
+            })
+            .fold((0.0f32, 0.0f32), |m, (t, z)| (m.0.max(t), m.1.max(z)))
+    };
+    let (tilt, height) = most(&plan(&kept, &frames, &READY));
+    assert!(
+        tilt <= 0.03 + 1e-3 && height <= 0.015 + 1e-3,
+        "the hand tilts {tilt:.4} rad and strays {height:.3} m"
+    );
+    let (tilt, height) = most(&plan(&free, &frames, &READY));
+    assert!(
+        tilt > 0.03 && height > 0.015,
+        "without the constraints the hand tilts only {tilt:.4} rad and strays {height:.3} m"
+    );
+}
+
+/// A constrained request's goals are planned nearest first, until one has a path, each with an
+/// even share of the time: of two goals the upright hand reaches by turning the base joint, the
+/// plan ends at the nearer.
+#[test]
+fn constrained_goals_are_planned_nearest_first() {
+    let hand = PLANNER.robot().ee_pose(&full(&READY), 0);
+    let turned = |by: f64| {
+        let mut q = READY;
+        q[0] += by;
+        q
+    };
+    let mut r = request(
+        "panda_arm",
+        vec![
+            joint_goal(&ARM, &turned(1.2)),
+            joint_goal(&ARM, &turned(0.3)),
+        ],
+    );
+    r.path_constraints.orientation_constraints = vec![upright("panda_link8", "world", hand, 0.05)];
+    let answer = plan(&r, &scene(vec![]), &READY);
+    succeeded(&answer);
+    let last = answer.trajectory.joint_trajectory.points.len() - 1;
+    let end = waypoint(&answer, last, &full(&READY));
+    assert!(
+        (end[0] - turned(0.3)[0] as f32).abs() < 1e-3,
+        "the plan ends with joint 1 at {}",
+        end[0]
+    );
+}
+
+/// In a motion sequence, items that keep the same path constraints are joined within their blend
+/// radius, and the join keeps them too; items that keep different ones stop between them.
+#[test]
+fn sequences_keep_their_items_path_constraints() {
+    let hand = PLANNER.robot().ee_pose(&full(&READY), 0);
+    // The base joint turned, then the hand lowered pointing down (joint 6 follows joints 2 and 4).
+    let across = [0.5, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785];
+    let lowered = [0.5, -0.585, 0.0, -2.556, 0.0, 1.971, 0.785];
+    let down = upright("panda_link8", "world", hand, 0.02);
+    let item = |q: &[f64; 7], kept: bool, radius: f64| {
+        let mut r = request("panda_arm", vec![joint_goal(&ARM, q)]);
+        if kept {
+            r.path_constraints.orientation_constraints = vec![down.clone()];
+        }
+        (r, radius)
+    };
+    let joined = sequence(
+        vec![item(&across, true, 0.05), item(&lowered, true, 0.0)],
+        &scene(vec![]),
+        &READY,
+    );
+    sequenced(&joined);
+    let trajectory = &joined.planned_trajectories[0];
+    assert!(
+        !rests_at(trajectory, &across),
+        "items with the same constraints stop between them"
+    );
+    let points = trajectory.joint_trajectory.points.len();
+    let tilt = (0..points)
+        .map(|k| {
+            PLANNER
+                .robot()
+                .ee_pose(&joints_at(trajectory, k, &full(&READY)), 0)
+        })
+        .map(|at| (at.rotation * Vec3::Z).angle_between(hand.rotation * Vec3::Z))
+        .fold(0.0f32, f32::max);
+    assert!(
+        tilt <= 0.02 + 1e-3,
+        "the joined motion tilts the hand {tilt:.4} rad"
+    );
+    let apart = sequence(
+        vec![item(&across, true, 0.05), item(&lowered, false, 0.0)],
+        &scene(vec![]),
+        &READY,
+    );
+    sequenced(&apart);
+    assert!(
+        rests_at(&apart.planned_trajectories[0], &across),
+        "items with different constraints are joined"
+    );
+}
+
+/// A robot link that no joint moves is a fixed frame for path constraints: on a Panda standing on
+/// a link of its own, a constraint in `panda_link0`, fixed to the stand, plans, and one in
+/// `panda_link3` is refused.
+#[test]
+fn links_fixed_to_the_root_frame_path_constraints() {
+    let urdf =
+        std::fs::read_to_string(share().join("moveit_resources_panda_description/urdf/panda.urdf"))
+            .unwrap();
+    let stand = r#"<link name="stand"/>
+  <joint name="stand_joint" type="fixed"><parent link="stand"/><child link="panda_link0"/><origin xyz="0 0 0.1"/></joint>
+  <link name="panda_link0">"#;
+    let urdf = urdf.replacen(r#"<link name="panda_link0">"#, stand, 1);
+    assert!(
+        urdf.contains("stand_joint"),
+        "the URDF has no panda_link0 to stand"
+    );
+    let options = PlannerOptions {
+        package_dirs: vec![share()],
+        cache_dir: Some(std::env::temp_dir().join("batchplan-ros-tests")),
+        ..Default::default()
+    };
+    let srdf = SRDF.replace(r#"child_link="panda_link0""#, r#"child_link="stand""#);
+    let standing = Planner::try_new(&urdf, Some(&srdf), &options).unwrap();
+    let hand = standing.robot().ee_pose(&full(&READY), 0);
+    let mut r = request("panda_arm", vec![joint_goal(&ARM, &BESIDE_READY)]);
+    let in_link0 = Pose::new(Vec3::ZERO, hand.rotation);
+    r.path_constraints.orientation_constraints =
+        vec![upright("panda_link8", "panda_link0", in_link0, 0.05)];
+    let answer = standing.plan(&r, &scene(vec![]), Some(&current(&READY)));
+    succeeded(&answer);
+    r.path_constraints.orientation_constraints[0]
+        .header
+        .frame_id = "panda_link3".into();
+    let answer = standing.plan(&r, &scene(vec![]), Some(&current(&READY)));
+    assert_eq!(
+        answer.error_code.val,
+        Code::FRAME_TRANSFORM_FAILURE,
+        "{}",
+        answer.error_code.message
+    );
+}
+
+/// The ready pose with the base joint turned: the hand still points down.
+const BESIDE_READY: [f64; 7] = [0.4, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785];
+
+/// Path constraints batchplan cannot keep as asked, and ends that break them, are refused with
+/// MoveIt's codes.
+#[test]
+fn path_constraints_it_cannot_keep_are_refused() {
+    let start = full(&READY);
+    let hand = PLANNER.robot().ee_pose(&start, 0);
+    let goal = joint_goal(&ARM, &[0.3, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]);
+    let with = |o: Vec<OrientationConstraint>, p: Vec<PositionConstraint>| {
+        let mut r = request("panda_arm", vec![goal.clone()]);
+        r.path_constraints.orientation_constraints = o;
+        r.path_constraints.position_constraints = p;
+        r
+    };
+    let code = |r: &MotionPlanRequest| plan(r, &scene(vec![]), &READY).error_code.val;
+    let level = upright("panda_link8", "world", hand, 0.05);
+    assert_eq!(code(&with(vec![level.clone()], vec![])), Code::SUCCESS);
+
+    let mut rotation_vector = level.clone();
+    rotation_vector.parameterization = OrientationConstraint::ROTATION_VECTOR;
+    let mut on_a_link = level.clone();
+    on_a_link.header.frame_id = "panda_link3".into();
+    let mut not_a_hand = level.clone();
+    not_a_hand.link_name = "panda_link5".into();
+    let mut twist_without_tilt = level.clone();
+    (
+        twist_without_tilt.absolute_x_axis_tolerance,
+        twist_without_tilt.absolute_y_axis_tolerance,
+        twist_without_tilt.absolute_z_axis_tolerance,
+    ) = (2.0, 2.0, 0.1);
+    let tipped = upright(
+        "panda_link8",
+        "world",
+        Pose::new(hand.position, hand.rotation * Quat::from_rotation_x(0.3)),
+        0.05,
+    );
+    let mut sphere = boxed("panda_link8", "world", hand.position, [1.0, 1.0, 1.0]);
+    sphere.constraint_region.primitives[0] = SolidPrimitive {
+        type_: SolidPrimitive::SPHERE,
+        dimensions: [0.5].as_slice().try_into().unwrap(),
+        ..Default::default()
+    };
+    let mut off_origin = boxed("panda_link8", "world", hand.position, [1.0, 1.0, 1.0]);
+    off_origin.target_point_offset.z = 0.1;
+    let mut turned_box = boxed("panda_link8", "world", hand.position, [1.0, 1.0, 1.0]);
+    turned_box.constraint_region.primitive_poses[0] =
+        pose_msg(Pose::new(hand.position, Quat::from_rotation_z(0.3)));
+    let mut past_a_quarter = level.clone();
+    (
+        past_a_quarter.absolute_x_axis_tolerance,
+        past_a_quarter.absolute_y_axis_tolerance,
+    ) = (2.0, 2.0);
+    let cases = [
+        (
+            with(vec![rotation_vector], vec![]),
+            Code::INVALID_GOAL_CONSTRAINTS,
+        ),
+        (
+            with(vec![past_a_quarter], vec![]),
+            Code::INVALID_GOAL_CONSTRAINTS,
+        ),
+        (with(vec![on_a_link], vec![]), Code::FRAME_TRANSFORM_FAILURE),
+        (with(vec![not_a_hand], vec![]), Code::INVALID_LINK_NAME),
+        (
+            with(vec![twist_without_tilt], vec![]),
+            Code::INVALID_GOAL_CONSTRAINTS,
+        ),
+        (
+            with(vec![tipped], vec![]),
+            Code::START_STATE_VIOLATES_PATH_CONSTRAINTS,
+        ),
+        (with(vec![], vec![sphere]), Code::INVALID_GOAL_CONSTRAINTS),
+        (
+            with(vec![], vec![off_origin]),
+            Code::INVALID_GOAL_CONSTRAINTS,
+        ),
+        (
+            with(vec![], vec![turned_box]),
+            Code::INVALID_GOAL_CONSTRAINTS,
+        ),
+    ];
+    for (k, (r, expected)) in cases.iter().enumerate() {
+        assert_eq!(code(r), *expected, "case {k}");
+    }
+    // The last joint turns the hand about its own z axis, the first about the vertical; the
+    // fourth tilts it.
+    let mut tilting = with(vec![level.clone()], vec![]);
+    tilting.goal_constraints = vec![joint_goal(
+        &ARM,
+        &[0.0, -0.785, 0.0, -2.0, 0.0, 1.571, 0.785],
+    )];
+    assert_eq!(code(&tilting), Code::GOAL_VIOLATES_PATH_CONSTRAINTS);
+    let mut unturned = level.clone();
+    unturned.absolute_z_axis_tolerance = 0.3;
+    let mut twisting = with(vec![unturned], vec![]);
+    twisting.goal_constraints = vec![joint_goal(
+        &ARM,
+        &[0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 1.285],
+    )];
+    assert_eq!(code(&twisting), Code::GOAL_VIOLATES_PATH_CONSTRAINTS);
+    let mut straight = with(vec![level], vec![]);
+    straight.planner_id = "LIN".into();
+    let target = Pose::new(hand.position + Vec3::new(0.0, 0.1, 0.0), hand.rotation);
+    straight.goal_constraints = vec![pose_goal("panda_link8", "world", target)];
+    assert_eq!(code(&straight), Code::INVALID_GOAL_CONSTRAINTS);
+}
+
 #[test]
 fn joint_limits_files_give_the_limits_they_enable() {
     let limits = batchplan_ros::parse_joint_limits(

@@ -9,11 +9,18 @@ ROS 2 motion planning with [batchplan](https://github.com/natsuku-lab/batchplan)
 - `~/compute_ik` (`moveit_msgs/srv/GetPositionIK`): it moves the request's group, and keeps the other joints where the request's state has them, as MoveIt does.
 - `~/compute_cartesian_path` (`moveit_msgs/srv/GetCartesianPath`): the hand in straight lines through waypoints, as far as it reaches, with `fraction` saying how far. The service carries no scene (as with `compute_ik`), so it checks the robot and what its start state holds.
 
-Several goal constraints in one request are planned in one batched call, and the shortest valid path wins. Planning requests also take:
+Several goal constraints in one request without path constraints are planned in one batched call, and the shortest valid path wins. One goal may place several links, such as two hands on a tray, solved as one IK problem. Planning requests also take:
 
 - `planner_id: "LIN"`, as Pilz's planner names it: the hand moves in a straight line to its one pose goal, in the request's scene.
 - The scene's `allowed_collision_matrix`: the robot's links may touch the objects it allows, as a hand touches what it grasps. Pairs of the robot's own links are the SRDF's.
 - `max_cartesian_speed` on `cartesian_speed_limited_link` (an IK frame): the trajectory keeps that link under the speed, together with the scaling factors.
+- Path constraints on IK frames, kept at every point the path is checked at, as batchplan's [hand constraints](https://github.com/natsuku-lab/batchplan/blob/main/docs/planning.md#constraints-along-the-path):
+  - An orientation constraint in XYZ Euler angles, MoveIt's default, bounds the link's tilt by the smaller of its x and y tolerances. That cone keeps both, up to a quarter turn. The z tolerance bounds its turn about its z axis, to within the square of the tilt.
+  - A position constraint is one box around the link's origin, aligned with the axes of the robot's root or of another IK frame.
+  - A constraint in another IK frame's frame moves with that hand, as two hands holding one tray keep their places on it.
+  - Bounds tighter than batchplan's floors (1 mm and 0.01 rad, twice that relative to another hand) count as the floors.
+  - A constrained request's goals are planned nearest first, each with an even share of the time left, until one has a path, because a constrained search toward a goal it cannot reach spends all the time it is given.
+  - Joint and visibility path constraints, rotation-vector tolerances, and path constraints on `LIN` requests are refused.
 
 <p align="center">
   <img src="docs/best_grasp.gif" alt="A simulated Panda in the browser: the poses before 24 grasps of a can, planned in one motion sequence; the arm's preview moves past a box to the nearest one and on in to the grasp, and closes its fingers on the can." width="600">
@@ -30,6 +37,8 @@ pixi run -e jazzy demo                           # the same on ROS 2 Jazzy
 
 Then open http://localhost:8080: a simulated Panda and its gripper on ros2_control mock hardware. Drag the gizmo to set a goal (IK runs as you drag), add boxes, and plan or plan and execute. No MoveIt and no GPU are needed; `pixi run demo device:=gpu` plans on the GPU.
 
+`pixi run demo-tiago-pro` runs PAL Robotics' TIAGo Pro instead, its base and arms planned as one: the gizmo moves the left hand, and the base drives where the arm alone can't reach.
+
 **Best of N grasps.** "Best grasp" sends one motion sequence. Its first item's goal constraints are the poses 8 cm before N grasps of a can, each around a different side: the node solves IK for all of them and plans to every solution in one batched call, keeping the shortest path. The second moves the hand 8 cm in along its own z to the grasp in a straight line (`LIN`, its goal in `panda_link8`'s frame), and a 4 cm blend radius lets the arm pass into it without stopping where that is sooner. The can is in the scene and the hand may touch it. The fingers then close on the can through their own trajectory controller; on the robot, the hand then lets go and backs out the same way. `ros2 run batchplan_examples best_grasp.py` times the first item, as one `MoveGroup` request with every pose, against one request per grasp, next to a running demo. Wall-clock times on an M4 Pro CPU, on Lyrical (the middle of three runs, each the median of 5 requests; other apps running):
 
 | Grasps | One request | One request per grasp |
@@ -37,6 +46,10 @@ Then open http://localhost:8080: a simulated Panda and its gripper on ros2_contr
 | 1 | 12 ms | 10 ms |
 | 8 | 8 ms | 62 ms |
 | 64 | 18 ms | 620 ms |
+
+**A tray carried level, base and arms as one.** On TIAGo Pro, "Carry the tray" takes a tray in both hands from one table, around a wall, to another. That is six MoveGroup requests for the base and both arms: reach, approach, lift, carry, lower and retreat. The grippers close and open through their own controllers. The lift, carry and lower requests carry the tray as an attached object, under two path constraints: the left hand within 3° of level and free to turn about the vertical, and the right hand pinned where it holds the tray in the left hand's frame. The carry's base drives 2.2 m and turns a quarter turn around the wall. The six legs plan in about 0.7 s on an M4 Pro CPU, for 21 s of motion.
+
+TIAGo Pro's description and meshes are PAL Robotics' (Apache 2.0). `pixi run fetch-tiago-pro`, which the TIAGo demo and the tests run first, fetches the flattened copy in Open Planning's roboplan_example_models (MIT) at a pinned commit, checks every file's SHA-256, and writes it to `batchplan_examples/tiago_pro` (git-ignored) with both notices. It also makes the base's planar joint three joints that ros2_control drives, and adds the tray frames the carry constrains.
 
 ## With MoveIt (optional)
 

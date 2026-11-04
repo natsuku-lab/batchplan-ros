@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<!-- TIAGo Pro's planning groups for the browser demo: the base on its planar joints with one arm or
+     both, the torso and head held. scripts/fetch_tiago_pro.py joins the model's disabled pairs to
+     these in batchplan_examples/tiago_pro/tiago_pro.srdf. -->
+<robot name="tiago_pro">
+  <virtual_joint name="world_joint" type="fixed" parent_frame="world" child_link="odom"/>
+  <group name="base_left_arm">
+    <joint name="base_joint_x"/>
+    <joint name="base_joint_y"/>
+    <joint name="base_joint_theta"/>
+    <joint name="arm_left_1_joint"/>
+    <joint name="arm_left_2_joint"/>
+    <joint name="arm_left_3_joint"/>
+    <joint name="arm_left_4_joint"/>
+    <joint name="arm_left_5_joint"/>
+    <joint name="arm_left_6_joint"/>
+    <joint name="arm_left_7_joint"/>
+  </group>
+  <group name="base_arms">
+    <joint name="base_joint_x"/>
+    <joint name="base_joint_y"/>
+    <joint name="base_joint_theta"/>
+    <joint name="arm_left_1_joint"/>
+    <joint name="arm_left_2_joint"/>
+    <joint name="arm_left_3_joint"/>
+    <joint name="arm_left_4_joint"/>
+    <joint name="arm_left_5_joint"/>
+    <joint name="arm_left_6_joint"/>
+    <joint name="arm_left_7_joint"/>
+    <joint name="arm_right_1_joint"/>
+    <joint name="arm_right_2_joint"/>
+    <joint name="arm_right_3_joint"/>
+    <joint name="arm_right_4_joint"/>
+    <joint name="arm_right_5_joint"/>
+    <joint name="arm_right_6_joint"/>
+    <joint name="arm_right_7_joint"/>
+  </group>
+  <group name="gripper_left"><joint name="gripper_left_finger_joint"/></group>
+  <group name="gripper_right"><joint name="gripper_right_finger_joint"/></group>
+  <end_effector name="gripper_left" group="gripper_left" parent_link="gripper_left_tray_link" parent_group="base_left_arm"/>
+  <end_effector name="gripper_right" group="gripper_right" parent_link="gripper_right_tray_link" parent_group="base_arms"/>
+</robot>

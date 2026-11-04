@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use batchplan::{
-    CollisionModel, CollisionWeights, Device, HandSpeed, IkOptions, IkProblem, JoinOptions,
-    JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem, PlanResult, Robot,
-    RobotOptions, SdfOptions, Sequence, ToolPath, ToolPathOptions, ToolPathStop, Trajectory, World,
-    Worlds, solve_ik,
+    CollisionModel, CollisionWeights, Device, HandConstraint, HandSpeed, IkOptions, IkProblem,
+    JoinOptions, JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem, PlanResult,
+    Robot, RobotOptions, SdfOptions, Sequence, ToolPath, ToolPathOptions, ToolPathStop, Trajectory,
+    World, Worlds, solve_ik,
 };
 use ros_env::moveit_msgs::msg::{
     AttachedCollisionObject, MotionPlanRequest, MotionSequenceRequest, MotionSequenceResponse,
@@ -24,7 +24,7 @@ use ros_env::sensor_msgs::msg::JointState;
 use crate::goals::{self, Goal};
 use crate::scene::{self, Fnv, Frames, Grids};
 use crate::srdf::{Srdf, Tree};
-use crate::{Refusal, state, trajectory};
+use crate::{Refusal, constraints, state, trajectory};
 
 type Code = MoveItErrorCodes;
 
@@ -114,6 +114,8 @@ struct Motion {
     path: Vec<f32>,
     speed: f32,
     cap: Option<HandSpeed>,
+    /// What the hands keep along it, which a join passing into or out of it keeps too.
+    constraints: Vec<HandConstraint>,
     sampled: JointTrajectory,
 }
 
@@ -395,7 +397,10 @@ impl Planner {
             .zip(items)
             .map(|(pair, &(_, radius))| {
                 let (a, b) = (&pair[0], &pair[1]);
-                let alike = a.group == b.group && a.speed == b.speed && a.cap == b.cap;
+                let alike = a.group == b.group
+                    && a.speed == b.speed
+                    && a.cap == b.cap
+                    && a.constraints == b.constraints;
                 let moving = !a.path.is_empty() && !b.path.is_empty();
                 if alike && moving { radius as f32 } else { 0.0 }
             })
@@ -415,7 +420,7 @@ impl Planner {
                 world: 0,
                 paths: motions[c.clone()].iter().map(|m| m.path.clone()).collect(),
                 blends: radii[c.start..c.end - 1].to_vec(),
-                constraints: vec![],
+                constraints: motions[c.start].constraints.clone(),
             })
             .collect();
         let joined = if sequences.is_empty() {
@@ -491,18 +496,19 @@ impl Planner {
         Ok((start_state, trajectories))
     }
 
-    /// The joints `request` plans, once its constraints are ones the planner takes.
+    /// The joints `request` plans, once its constraints are ones the planner takes: path
+    /// constraints on links' positions and orientations (`constraints::path`), and no trajectory
+    /// constraints.
     fn asked(&self, request: &MotionPlanRequest) -> Result<Vec<usize>, Refusal> {
         let path = &request.path_constraints;
-        let constrained = !(path.joint_constraints.is_empty()
-            && path.position_constraints.is_empty()
-            && path.orientation_constraints.is_empty()
+        if !(path.joint_constraints.is_empty()
             && path.visibility_constraints.is_empty()
-            && request.trajectory_constraints.constraints.is_empty());
-        if constrained {
+            && request.trajectory_constraints.constraints.is_empty())
+        {
             return Err(Refusal::new(
                 Code::INVALID_GOAL_CONSTRAINTS,
-                "path and trajectory constraints are not supported",
+                "path constraints may bound links' positions and orientations, not joints or \
+                 visibility, and trajectory constraints are not supported",
             ));
         }
         self.group(&request.group_name)
@@ -542,6 +548,13 @@ impl Planner {
             &self.hands,
             &frames,
         )?;
+        let constraints = constraints::path(&request.path_constraints, &self.hands, &frames)?;
+        if let Some(why) = breach(robot, &constraints, start)? {
+            return Err(Refusal::new(
+                Code::START_STATE_VIOLATES_PATH_CONSTRAINTS,
+                format!("the start breaks the path constraints: {why}"),
+            ));
+        }
         let speed = factor(request.max_velocity_scaling_factor)
             .min(factor(request.max_acceleration_scaling_factor).sqrt());
         let cap = self.cap(
@@ -553,11 +566,18 @@ impl Planner {
             path,
             speed,
             cap,
+            constraints: constraints.clone(),
             sampled,
         };
         if request.planner_id == STRAIGHT {
+            if !constraints.is_empty() {
+                return Err(Refusal::new(
+                    Code::INVALID_GOAL_CONSTRAINTS,
+                    "a LIN request's straight line takes no path constraints",
+                ));
+            }
             let (hand, pose) = match goals.as_slice() {
-                [Goal::Pose { hand, pose, .. }] => (*hand, *pose),
+                [Goal::Poses { targets, .. }] if targets.len() == 1 => targets[0],
                 _ => {
                     return Err(Refusal::new(
                         Code::INVALID_GOAL_CONSTRAINTS,
@@ -596,6 +616,19 @@ impl Planner {
             return Ok(motion(path, sampled));
         }
         let candidates = candidates(&goals, robot, s.device, s.worlds, start, &group)?;
+        let mut candidates_kept = Vec::with_capacity(candidates.len());
+        for goal in candidates {
+            if breach(robot, &constraints, &goal)?.is_none() {
+                candidates_kept.push(goal);
+            }
+        }
+        if candidates_kept.is_empty() {
+            return Err(Refusal::new(
+                Code::GOAL_VIOLATES_PATH_CONSTRAINTS,
+                "every goal breaks the path constraints",
+            ));
+        }
+        let candidates = candidates_kept;
         let hold = outside(robot, &group);
         let problems: Vec<PlanProblem> = candidates
             .iter()
@@ -605,38 +638,56 @@ impl Planner {
                 goal: goal.clone(),
                 start_motion: None,
                 hold: hold.clone(),
-                constraints: vec![],
+                constraints: constraints.clone(),
             })
             .collect();
 
+        // A constrained search projects every hop, and one toward a goal it cannot reach on the
+        // constraints spends all the time it is given: constrained goals are planned one at a time,
+        // nearest first, each with an even share of the time left, until one has a path, as OMPL's
+        // constrained planners take goal samples one at a time.
+        let mut problems = problems;
+        let batch = if constraints.is_empty() {
+            problems.len()
+        } else {
+            problems.sort_by(|a, b| distance(&a.goal, start).total_cmp(&distance(&b.goal, start)));
+            1
+        };
         let mut touched = false;
         // A path that grazes the meshes is planned again keeping twice the clearance.
         for widen in [1.0, 2.0] {
-            let remaining = budget.saturating_sub(begun.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-            let mut options = PlanOptions {
-                time_budget: Some(remaining),
-                ..Default::default()
-            };
-            options.rrt.clearance *= widen;
-            options.shortcut.clearance *= widen;
-            let result = batchplan::plan(s.device, s.worlds, &problems, &options).map_err(crash)?;
-            let mut solved: Vec<(f32, &[f32])> = result
-                .solved()
-                .map(|s| (best_length(&result, s.index), s.solution))
-                .collect();
-            if solved.is_empty() {
-                break;
-            }
-            solved.sort_by(|a, b| a.0.total_cmp(&b.0));
-            for (_, path) in solved {
-                let sampled = timed(robot, path, start, speed, cap, self.dt)?;
-                if clear_on_meshes(s.meshes, s.world, &sampled)? {
-                    return Ok(motion(path.to_vec(), sampled));
+            let mut found = false;
+            let chunks = problems.len().div_ceil(batch);
+            for (k, problems) in problems.chunks(batch).enumerate() {
+                let remaining = budget.saturating_sub(begun.elapsed());
+                if remaining.is_zero() {
+                    break;
                 }
-                touched = true;
+                let share = remaining / u32::try_from(chunks - k).unwrap_or(u32::MAX);
+                let mut options = PlanOptions {
+                    time_budget: Some(share),
+                    ..Default::default()
+                };
+                options.rrt.clearance *= widen;
+                options.shortcut.clearance *= widen;
+                let result =
+                    batchplan::plan(s.device, s.worlds, problems, &options).map_err(crash)?;
+                let mut solved: Vec<(f32, &[f32])> = result
+                    .solved()
+                    .map(|s| (best_length(&result, s.index), s.solution))
+                    .collect();
+                found |= !solved.is_empty();
+                solved.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for (_, path) in solved {
+                    let sampled = timed(robot, path, start, speed, cap, self.dt)?;
+                    if clear_on_meshes(s.meshes, s.world, &sampled)? {
+                        return Ok(motion(path.to_vec(), sampled));
+                    }
+                    touched = true;
+                }
+            }
+            if !found {
+                break;
             }
         }
         Err(if begun.elapsed() >= budget {
@@ -908,6 +959,15 @@ impl Planner {
     }
 }
 
+/// The joint-space distance between `a` and `b`.
+fn distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f32>()
+        .sqrt()
+}
+
 /// The joints outside `group`, which IK and planning hold where the start has them.
 fn outside(robot: &Robot, group: &[usize]) -> Vec<usize> {
     (0..robot.dof()).filter(|j| !group.contains(j)).collect()
@@ -943,44 +1003,45 @@ fn candidates(
                 .map(|(q, _)| q),
         );
     }
-    let poses: Vec<(usize, batchplan::Pose, f32, f32)> = goals
-        .iter()
-        .filter_map(|g| match *g {
-            Goal::Pose {
-                hand,
-                pose,
-                position_tolerance,
-                rotation_tolerance,
-            } => Some((hand, pose, position_tolerance, rotation_tolerance)),
-            Goal::Joints(_) => None,
-        })
-        .collect();
+    // Each pose goal's targets, and the tightest tolerances any asks for.
+    let (mut poses, mut position_tolerance, mut rotation_tolerance) =
+        (vec![], f32::INFINITY, f32::INFINITY);
+    for goal in goals {
+        if let Goal::Poses {
+            targets,
+            position_tolerance: p,
+            rotation_tolerance: r,
+        } = goal
+        {
+            poses.push(targets.as_slice());
+            position_tolerance = position_tolerance.min(*p);
+            rotation_tolerance = rotation_tolerance.min(*r);
+        }
+    }
     if !poses.is_empty() {
         let options = IkOptions {
-            position_tolerance: poses.iter().map(|p| p.2).fold(f32::INFINITY, f32::min),
-            rotation_tolerance: poses.iter().map(|p| p.3).fold(f32::INFINITY, f32::min),
+            position_tolerance,
+            rotation_tolerance,
             ..Default::default()
         };
         let hold = outside(robot, group);
         let problems: Vec<IkProblem> = poses
             .iter()
-            .map(|&(hand, pose, _, _)| IkProblem {
+            .map(|placed| IkProblem {
                 world: 0,
                 targets: (0..robot.hands())
-                    .map(|h| (h == hand).then_some(pose))
+                    .map(|h| {
+                        placed
+                            .iter()
+                            .find(|(hand, _)| *hand == h)
+                            .map(|&(_, pose)| pose)
+                    })
                     .collect(),
                 seed: Some(start.to_vec()),
                 hold: hold.clone(),
             })
             .collect();
         let ik = solve_ik(device, worlds, &problems, &options).map_err(crash)?;
-        let distance = |a: &[f32], b: &[f32]| {
-            a.iter()
-                .zip(b)
-                .map(|(x, y)| (x - y).powi(2))
-                .sum::<f32>()
-                .sqrt()
-        };
         for p in 0..problems.len() {
             let mut solutions: Vec<&[f32]> = (p * ik.seeds..(p + 1) * ik.seeds)
                 .filter(|&i| ik.success[i])
@@ -998,7 +1059,7 @@ fn candidates(
         }
     }
     if out.is_empty() {
-        let only_poses = goals.iter().all(|g| matches!(g, Goal::Pose { .. }));
+        let only_poses = goals.iter().all(|g| matches!(g, Goal::Poses { .. }));
         return Err(if only_poses {
             Refusal::new(
                 Code::NO_IK_SOLUTION,
@@ -1009,6 +1070,19 @@ fn candidates(
         });
     }
     Ok(out)
+}
+
+/// Why `q` breaks `constraints`, if it does; a refusal for constraints batchplan cannot keep, such
+/// as a bounded turn about an axis whose tilt is not bounded to a quarter turn.
+fn breach(
+    robot: &Robot,
+    constraints: &[HandConstraint],
+    q: &[f32],
+) -> Result<Option<String>, Refusal> {
+    robot.breach(constraints, q).map_err(|e| match e {
+        batchplan::Error::Input(m) => Refusal::new(Code::INVALID_GOAL_CONSTRAINTS, m),
+        other => crash(other),
+    })
 }
 
 /// Refuses a straight move whose hand moves joints `group` does not plan.

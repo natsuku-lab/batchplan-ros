@@ -2,10 +2,12 @@
 
 Drag the gizmo to set the goal: IK runs as you drag, and the blue ghost shows where the arm would
 be. Add boxes and drag them around, then Plan to preview the motion in green, or Plan and execute to
-run it on the robot. Best grasp sends one motion sequence: to the best of the poses before many grasps
-of the can, which the planner plans in one batch, keeping the shortest path, then in to that grasp
-without stopping before it; the fingers then close on the can. Every request carries the boxes and
-the can as its scene, so the planner keeps no state.
+run it on the robot. On the Panda, Best grasp sends one motion sequence: to the best of the poses
+before many grasps of the can, which the planner plans in one batch, keeping the shortest path, then
+in to that grasp without stopping before it; the fingers then close on the can. On TIAGo Pro, the
+gizmo moves the left hand with the base, and Carry the tray takes a tray in both hands from one
+table round a wall to another, level and held between them (`tray`). Every request carries its
+scene, so the planner keeps no state.
 """
 
 import io
@@ -32,6 +34,7 @@ from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 from viser.extras import ViserUrdf
 
+from batchplan_viser import tray
 from batchplan_viser.messages import (
     APPROACH,
     BLEND,
@@ -47,6 +50,11 @@ from batchplan_viser.messages import (
     seconds,
 )
 
+# Each robot's view, floor, and grippers (their trajectory controllers and finger joints).
+ROBOTS = {
+    "panda": {"camera": ((1.3, 0.9, 0.9), (0.3, 0.0, 0.35)), "floor": 2.0, "grippers": (("/panda_hand_controller", FINGER),)},
+    "tiago_pro": {"camera": ((3.8, -2.2, 3.4), (0.4, 1.3, 0.4)), "floor": 7.0, "grippers": tray.GRIPPERS},
+}
 GHOST = (0.25, 0.55, 1.0, 0.45)
 PREVIEW = (0.3, 0.85, 0.4, 0.55)
 BOX_SIZE = (0.12, 0.12, 0.3)
@@ -71,7 +79,7 @@ class App(Node):
         self.group = self.declare_parameter("group", "").value
         self.tip = self.declare_parameter("tip_link", "").value
         planner = self.declare_parameter("planner", "/batchplan_planner").value
-        gripper = self.declare_parameter("gripper", "/panda_hand_controller").value
+        self.kind = self.declare_parameter("robot", "panda").value
         self.port = self.declare_parameter("port", 8080).value
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
@@ -83,7 +91,7 @@ class App(Node):
         self.planning = ActionClient(self, MoveGroup, f"{planner}/move_group")
         self.sequencing = ActionClient(self, MoveGroupSequence, f"{planner}/sequence_move_group")
         self.ik = self.create_client(GetPositionIK, f"{planner}/compute_ik")
-        self.hand = ActionClient(self, FollowJointTrajectory, f"{gripper}/follow_joint_trajectory")
+        self.hands = [(ActionClient(self, FollowJointTrajectory, f"{c}/follow_joint_trajectory"), joint) for c, joint in ROBOTS[self.kind]["grippers"]]
 
         self.lock = threading.Lock()
         self.ik_busy = self.ik_again = False
@@ -110,7 +118,7 @@ class App(Node):
             time.sleep(0.05)
         self.server = viser.ViserServer(port=self.port)
         camera = self.server.initial_camera
-        camera.position, camera.look_at, camera.up = (1.3, 0.9, 0.9), (0.3, 0.0, 0.35), (0.0, 0.0, 1.0)
+        (camera.position, camera.look_at), camera.up = ROBOTS[self.kind]["camera"], (0.0, 0.0, 1.0)
         self.kinematics = load_urdf(self.description)
         self.frame = self.kinematics.base_link
         # Each robot hangs under a frame of its own, so it can be hidden as a whole.
@@ -120,7 +128,8 @@ class App(Node):
         self.robot = ViserUrdf(self.server, load_urdf(self.description), root_node_name="/robot")
         self.ghost = ViserUrdf(self.server, load_urdf(self.description), root_node_name="/ghost", mesh_color_override=GHOST)
         self.preview = ViserUrdf(self.server, load_urdf(self.description), root_node_name="/preview", mesh_color_override=PREVIEW)
-        self.server.scene.add_grid("/grid", width=2.0, height=2.0, cell_size=0.1)
+        floor = ROBOTS[self.kind]["floor"]
+        self.server.scene.add_grid("/grid", width=floor, height=floor, cell_size=0.1)
 
         position, wxyz = self.tip_pose(self.joints)
         self.goal = self.server.scene.add_transform_controls("/goal", scale=0.2, position=position, wxyz=wxyz)
@@ -136,14 +145,25 @@ class App(Node):
         with gui.add_folder("Scene"):
             gui.add_button("Add box", icon=viser.Icon.BOX).on_click(lambda _: self.add_box())
             gui.add_button("Remove boxes", icon=viser.Icon.TRASH).on_click(lambda _: self.remove_boxes())
-        with gui.add_folder("Best of N grasps"):
-            gui.add_markdown(
-                "One sequence: to the poses before N grasps of the can (IK for all of them, one batched plan, the shortest "
-                "path wins), then in to the grasp without stopping before it. Then the fingers close."
-            )
-            self.grasp_count = gui.add_slider("Grasps", min=1, max=64, step=1, initial_value=16)
-            gui.add_button("Best grasp", icon=viser.Icon.HAND_GRAB).on_click(lambda _: self.best_grasp(execute=False))
-            gui.add_button("Best grasp and execute", icon=viser.Icon.PLAYER_PLAY).on_click(lambda _: self.best_grasp(execute=True))
+        if self.kind == "panda":
+            with gui.add_folder("Best of N grasps"):
+                gui.add_markdown(
+                    "One sequence: to the poses before N grasps of the can (IK for all of them, one batched plan, the shortest "
+                    "path wins), then in to the grasp without stopping before it. Then the fingers close."
+                )
+                self.grasp_count = gui.add_slider("Grasps", min=1, max=64, step=1, initial_value=16)
+                gui.add_button("Best grasp", icon=viser.Icon.HAND_GRAB).on_click(lambda _: self.best_grasp(execute=False))
+                gui.add_button("Best grasp and execute", icon=viser.Icon.PLAYER_PLAY).on_click(lambda _: self.best_grasp(execute=True))
+        else:
+            self.add_tables()
+            with gui.add_folder("Carry a tray"):
+                gui.add_markdown(
+                    "Both hands take the tray, lift it, carry it round the wall and set it on the other table, the base and "
+                    "arms planned as one. While held, the tray stays within 3° of level and the right hand pinned where it "
+                    "holds the tray in the left's frame: MoveIt path constraints."
+                )
+                gui.add_button("Carry the tray", icon=viser.Icon.ROUTE).on_click(lambda _: self.start_carry(execute=False))
+                gui.add_button("Carry the tray and execute", icon=viser.Icon.PLAYER_PLAY).on_click(lambda _: self.start_carry(execute=True))
 
         self.solve_ik()
         while rclpy.ok():
@@ -252,15 +272,79 @@ class App(Node):
         self.show(waypoints, times, execute)
 
     def grip(self, opening: float) -> bool:
-        """Moves the fingers to `opening` (each finger's distance from the middle) in half a second."""
-        if not self.hand.wait_for_server(timeout_sec=2.0):
-            self.status.content = "No gripper controller to close the fingers."
-            return False
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = [FINGER]
-        goal.trajectory.points = [JointTrajectoryPoint(positions=[opening], time_from_start=Duration(nanosec=500_000_000))]
-        handle = wait(self.hand.send_goal_async(goal))
-        return handle.accepted and wait(handle.get_result_async()).result.error_code == FollowJointTrajectory.Result.SUCCESSFUL
+        """Moves every gripper's fingers to `opening` in half a second, all at once."""
+        handles = []
+        for client, joint in self.hands:
+            if not client.wait_for_server(timeout_sec=2.0):
+                self.status.content = "No gripper controller to close the fingers."
+                return False
+            goal = FollowJointTrajectory.Goal()
+            goal.trajectory.joint_names = [joint]
+            goal.trajectory.points = [JointTrajectoryPoint(positions=[opening], time_from_start=Duration(nanosec=500_000_000))]
+            handles.append(wait(client.send_goal_async(goal)))
+        results = [wait(h.get_result_async()).result for h in handles if h.accepted]
+        return len(results) == len(handles) and all(r.error_code == FollowJointTrajectory.Result.SUCCESSFUL for r in results)
+
+    def add_tables(self):
+        """The tray carry's tables and wall, and the tray where it rests."""
+        for name, (xy, size) in tray.TABLES.items():
+            self.server.scene.add_box(f"/tables/{name}", color=(150, 120, 90), dimensions=(*size, tray.TABLE_TOP), position=(*xy, tray.TABLE_TOP / 2))
+        self.server.scene.add_box("/wall", color=(190, 190, 200), dimensions=tray.WALL[1], position=tray.WALL[0])
+        self.tray_box = self.server.scene.add_box("/tray", color=(60, 120, 200), dimensions=tuple(tray.TRAY))
+        self.rest_tray(tray.PICK)
+
+    def rest_tray(self, at):
+        self.tray_box.position, self.tray_box.wxyz = at.translation(), at.rotation().wxyz
+
+    def start_carry(self, execute: bool):
+        threading.Thread(target=self.carry, args=(execute,), daemon=True).start()
+
+    def carry(self, execute: bool):
+        """Plans the tray carry leg by leg (`tray.carry`), with the boxes added too, and plays it on
+        the preview, the tray in the left hand while held; or runs it on the robot, the grippers
+        closing and opening through their controllers."""
+        touch = [link for link in self.kinematics.link_map if link.startswith("gripper_")]
+        speed = float(self.speed.value)
+
+        def send(request, objects, allowed):
+            request.max_velocity_scaling_factor, request.max_acceleration_scaling_factor = speed, speed * speed
+            return self.send(self.planning, MoveGroup.Goal(request=request), execute, objects + self.objects(), allowed)
+
+        self.rest_tray(tray.PICK)
+        grip = self.grip if execute else (lambda _: True)
+        legs = tray.carry(send, grip, self.frame, touch, dict(self.joints))
+        if legs is None:
+            return
+        self.rest_tray(tray.PLACE)
+        planning = sum(result.planning_time for _, result in legs)
+        waypoints, times, holding = [], [], []
+        for name, result in legs:
+            held = name in ("lift", "carry", "lower")
+            fingers = {joint: tray.CLOSED if held else tray.OPEN for _, joint in tray.GRIPPERS}
+            leg, at = self.waypoints(result.planned_trajectory, {**(waypoints[-1] if waypoints else {}), **fingers})
+            begun = times[-1] if times else 0.0
+            waypoints += leg
+            times += [begun + t for t in at]
+            holding += [held] * len(leg)
+        self.status.content = (
+            f"Six legs planned in **{planning * 1e3:.0f} ms**, {times[-1]:.1f} s of motion"
+            + (", executed." if execute else ", the tray level and held between the hands.")
+        )
+        self.show(waypoints, times, execute, play=False)
+        if not execute:
+            in_left = np.linalg.inv(tray.hands(tray.PICK)[0].as_matrix()) @ tray.PICK.as_matrix()
+
+            def ride(waypoint, k):
+                if holding[k]:
+                    self.kinematics.update_cfg(self.configuration(self.robot, waypoint))
+                    at = self.kinematics.get_transform(tray.LEFT, self.frame) @ in_left
+                    self.tray_box.position, self.tray_box.wxyz = at[:3, 3], viser.transforms.SO3.from_matrix(at[:3, :3]).wxyz
+                elif k and holding[k - 1]:
+                    self.rest_tray(tray.PLACE)
+                elif k == 0:
+                    self.rest_tray(tray.PICK)
+
+            self.play(waypoints, times, ride)
 
     def objects(self):
         objects = [box_object(n, self.frame, c.position, c.wxyz, BOX_SIZE) for n, c, _ in self.boxes]
@@ -340,26 +424,30 @@ class App(Node):
         waypoints = [{**current, **dict(zip(trajectory.joint_names, p.positions))} for p in trajectory.points]
         return waypoints, [seconds(p.time_from_start) for p in trajectory.points]
 
-    def show(self, waypoints, times, execute: bool):
+    def show(self, waypoints, times, execute: bool, play: bool = True):
         """Draws the hand's path, and plays the motion on the preview unless the robot ran it."""
         path = np.array([self.tip_pose(w)[0] for w in waypoints])
         self.server.scene.add_line_segments(
             "/path", points=np.stack([path[:-1], path[1:]], axis=1), colors=(60, 200, 90), thickness=0.004
         )
-        if not execute:
+        if play and not execute:
             self.play(waypoints, times)
 
-    def play(self, waypoints, times):
+    def play(self, waypoints, times, each=None):
+        """Plays the waypoints on the preview at their times, calling `each(waypoint, index)` on
+        each as it shows."""
         with self.lock:
             self.playback += 1
             mine = self.playback
         self.preview_frame.visible = True
         begun = time.perf_counter()
-        for waypoint, at in zip(waypoints, times):
+        for k, (waypoint, at) in enumerate(zip(waypoints, times)):
             if self.playback != mine:
                 return
             time.sleep(max(0.0, at - (time.perf_counter() - begun)))
             self.preview.update_cfg(self.configuration(self.preview, waypoint))
+            if each is not None:
+                each(waypoint, k)
 
 
 def wait(future):

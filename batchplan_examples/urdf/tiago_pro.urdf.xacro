@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<!-- PAL Robotics' TIAGo Pro, as scripts/fetch_tiago_pro.py fetches it, on ros2_control mock hardware:
+     the base on its planar joints and both arms in one trajectory controller, each gripper in its own,
+     starting with the arms straight, the torso up 0.2 m, the head tilted down and the grippers open. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="tiago_pro">
+  <xacro:include filename="$(find batchplan_examples)/tiago_pro/tiago_pro.urdf"/>
+
+  <xacro:macro name="joint_interfaces" params="name initial">
+    <joint name="${name}">
+      <command_interface name="position"/>
+      <state_interface name="position"><param name="initial_value">${initial}</param></state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+  </xacro:macro>
+
+  <ros2_control name="TiagoProMock" type="system">
+    <hardware><plugin>mock_components/GenericSystem</plugin></hardware>
+    <xacro:joint_interfaces name="base_joint_x" initial="0.0"/>
+    <xacro:joint_interfaces name="base_joint_y" initial="0.0"/>
+    <xacro:joint_interfaces name="base_joint_theta" initial="0.0"/>
+    <xacro:joint_interfaces name="torso_lift_joint" initial="0.2"/>
+    <xacro:joint_interfaces name="head_1_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="head_2_joint" initial="-0.5"/>
+    <xacro:joint_interfaces name="arm_left_1_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_left_2_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_left_3_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_left_4_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_left_5_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_left_6_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_left_7_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_right_1_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_right_2_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_right_3_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_right_4_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_right_5_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_right_6_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="arm_right_7_joint" initial="0.0"/>
+    <xacro:joint_interfaces name="gripper_left_finger_joint" initial="0.035"/>
+    <xacro:joint_interfaces name="gripper_right_finger_joint" initial="0.035"/>
+  </ros2_control>
+</robot>

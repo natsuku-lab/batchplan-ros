@@ -6,6 +6,7 @@
 #![warn(clippy::must_use_candidate, clippy::return_self_not_must_use)]
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 
+mod constraints;
 mod goals;
 mod limits;
 mod planner;

@@ -102,6 +102,19 @@ impl<'a> Frames<'a> {
         }
     }
 
+    /// Whether `frame` is one of the robot's links that its joints move: one whose pose changes as
+    /// every joint turns or slides by 0.1.
+    pub fn moves(&self, frame: &str) -> bool {
+        let moved: Vec<f32> = self.q.iter().map(|v| v + 0.1).collect();
+        match (
+            self.robot.link_pose(self.q, frame),
+            self.robot.link_pose(&moved, frame),
+        ) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        }
+    }
+
     pub fn pose_of(&self, frame: &str) -> Result<Pose, Refusal> {
         if frame.is_empty() || frame == self.root {
             return Ok(Pose::IDENTITY);

@@ -1,0 +1,123 @@
+# TIAGo Pro's limits as MoveIt's joint_limits.yaml gives them, from the fetched model's planning
+# configuration (tiago_pro/given/tiago_pro_config.yaml): the base on its planar joints, then the arms.
+# The URDF gives the velocities, and the torso's 0.035 m/s, which is why the demo's groups hold it.
+joint_limits:
+  base_joint_x:
+    has_velocity_limits: true
+    max_velocity: 0.5
+    has_acceleration_limits: true
+    max_acceleration: 0.5
+    has_jerk_limits: true
+    max_jerk: 2.0
+  base_joint_y:
+    has_velocity_limits: true
+    max_velocity: 0.5
+    has_acceleration_limits: true
+    max_acceleration: 0.5
+    has_jerk_limits: true
+    max_jerk: 2.0
+  base_joint_theta:
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: true
+    max_acceleration: 1.0
+    has_jerk_limits: true
+    max_jerk: 5.0
+  arm_left_1_joint:
+    has_velocity_limits: true
+    max_velocity: 1.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_left_2_joint:
+    has_velocity_limits: true
+    max_velocity: 1.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_left_3_joint:
+    has_velocity_limits: true
+    max_velocity: 3.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_left_4_joint:
+    has_velocity_limits: true
+    max_velocity: 3.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_left_5_joint:
+    has_velocity_limits: true
+    max_velocity: 3.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_left_6_joint:
+    has_velocity_limits: true
+    max_velocity: 3.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_left_7_joint:
+    has_velocity_limits: true
+    max_velocity: 3.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_right_1_joint:
+    has_velocity_limits: true
+    max_velocity: 1.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_right_2_joint:
+    has_velocity_limits: true
+    max_velocity: 1.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_right_3_joint:
+    has_velocity_limits: true
+    max_velocity: 3.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_right_4_joint:
+    has_velocity_limits: true
+    max_velocity: 3.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_right_5_joint:
+    has_velocity_limits: true
+    max_velocity: 3.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_right_6_joint:
+    has_velocity_limits: true
+    max_velocity: 3.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
+  arm_right_7_joint:
+    has_velocity_limits: true
+    max_velocity: 3.95
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+    has_jerk_limits: true
+    max_jerk: 10.0
