@@ -19,6 +19,8 @@ is missing or changed.
 
 import hashlib
 import sys
+import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -86,13 +88,33 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# Tries per download: GitHub's raw file server answers 503 at times, which a second try gets past,
+# as `curl --retry` allows for.
+ATTEMPTS = 3
+
+
+def download(url: str) -> bytes:
+    """`url`'s content, trying again after a server error or a dropped connection."""
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                return response.read()
+        except urllib.error.HTTPError as e:
+            if e.code < 500 or attempt == ATTEMPTS:
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == ATTEMPTS:
+                raise
+        time.sleep(2**attempt)
+    raise AssertionError("every attempt returns or raises")
+
+
 def fetch(source: str, target: Path, digest: str):
     """Downloads `source` to `target` unless it is already there with `digest`."""
     if target.exists() and sha256(target) == digest:
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(SOURCE + source, timeout=60) as response:
-        data = response.read()
+    data = download(SOURCE + source)
     if hashlib.sha256(data).hexdigest() != digest:
         sys.exit(f"{source}: checksum mismatch")
     target.write_bytes(data)

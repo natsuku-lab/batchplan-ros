@@ -28,6 +28,12 @@ jobs:
         with:
           workspaces: batchplan_ros
           key: ${{ matrix.environment }}
+      # TIAGo Pro, as scripts/fetch_tiago_pro.py fetches it for the tests; it downloads only what is
+      # missing or changed.
+      - uses: actions/cache@v6
+        with:
+          path: batchplan_examples/tiago_pro
+          key: tiago-pro-${{ hashFiles('scripts/fetch_tiago_pro.py') }}
       - run: pixi run -e ${{ matrix.environment }} build
       - name: Lint
         if: matrix.environment == 'default'
