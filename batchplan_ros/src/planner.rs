@@ -26,6 +26,10 @@ use crate::scene::{self, Fnv, Frames, Grids};
 use crate::srdf::{Srdf, Tree};
 use crate::{Refusal, constraints, state, trajectory};
 
+/// The batchplan release whose sphere fit the cache holds: spheres another one fitted are fitted
+/// again. Bump it with a release that changes the fit, as 0.9.0 did.
+const FIT: &str = "batchplan 0.9 fit";
+
 type Code = MoveItErrorCodes;
 
 /// Where batches run.
@@ -177,6 +181,7 @@ impl Planner {
         };
         let cached = o.cache_dir.as_ref().map(|dir| {
             let mut hash = Fnv::default();
+            hash.write(FIT.as_bytes());
             hash.write(urdf.as_bytes());
             hash.write(srdf.unwrap_or_default().as_bytes());
             hash.write(format!("{:?}", options.spheres).as_bytes());
