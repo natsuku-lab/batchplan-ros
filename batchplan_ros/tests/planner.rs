@@ -1371,6 +1371,12 @@ fn the_allowed_collision_matrix_lets_links_touch_objects() {
     let mut touching = scene(vec![block]);
     let code = |s: &PlanningScene| plan(&away, s, &READY).error_code.val;
     assert_eq!(code(&touching), Code::START_STATE_IN_COLLISION);
+    // The refusal names the link and the object it is in.
+    let refused = plan(&away, &touching, &READY).error_code.message;
+    assert!(
+        refused.starts_with("the start collides: panda_") && refused.contains(" mm into 'block'"),
+        "{refused}"
+    );
     let hand = ["panda_hand", "panda_leftfinger", "panda_rightfinger"];
     touching.allowed_collision_matrix = allowing("block", &hand, true);
     assert_eq!(code(&touching), Code::SUCCESS);

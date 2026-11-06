@@ -12,7 +12,7 @@ ROS 2 motion planning with [batchplan](https://github.com/natsuku-lab/batchplan)
 Several goal constraints in one request without path constraints are planned in one batched call, and the shortest valid path wins. One goal may place several links, such as two hands on a tray, solved as one IK problem. Planning requests also take:
 
 - `planner_id: "LIN"`, as Pilz's planner names it: the hand moves in a straight line to its one pose goal, in the request's scene.
-- The scene's `allowed_collision_matrix`: the robot's links may touch the objects it allows, as a hand touches what it grasps. Pairs of the robot's own links are the SRDF's.
+- The scene's `allowed_collision_matrix`: the robot's links may touch the objects it allows, as a hand touches what it grasps. Pairs of the robot's own links are the SRDF's. A start in collision is refused with `START_STATE_IN_COLLISION`, naming the link and the object (or the two links) that collide, and how deep.
 - `max_cartesian_speed` on `cartesian_speed_limited_link` (an IK frame): the trajectory keeps that link under the speed, together with the scaling factors.
 - Path constraints on IK frames, kept at every point the path is checked at, as batchplan's [hand constraints](https://github.com/natsuku-lab/batchplan/blob/main/docs/planning.md#constraints-along-the-path):
   - An orientation constraint in XYZ Euler angles, MoveIt's default, bounds the link's tilt by the smaller of its x and y tolerances. That cone keeps both, up to a quarter turn. The z tolerance bounds its turn about its z axis, to within the square of the tilt.

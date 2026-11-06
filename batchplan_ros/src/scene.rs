@@ -182,16 +182,18 @@ impl Grids {
     }
 }
 
-/// The scene's collision objects as one world, for `robot`. The scene is taken as the whole world,
-/// whatever each object's operation says, except that removals are skipped. Its allowed collision
-/// matrix lets `robot`'s links touch the objects it allows them to (see [`touches`]).
+/// The scene's collision objects as one world, for `robot`, and the id of the object each of its
+/// obstacles comes from. The scene is taken as the whole world, whatever each object's operation
+/// says, except that removals are skipped. Its allowed collision matrix lets `robot`'s links touch
+/// the objects it allows them to (see [`touches`]).
 pub fn world(
     scene: &PlanningScene,
     frames: &Frames,
     grids: &Grids,
     robot: &Robot,
-) -> Result<World, Refusal> {
+) -> Result<(World, Vec<String>), Refusal> {
     let mut obstacles = vec![];
+    let mut ids = vec![];
     let mut objects = vec![];
     for object in scene
         .world
@@ -202,12 +204,14 @@ pub fn world(
         let base = frames.pose_of(&object.header.frame_id)?;
         let first = obstacles.len();
         obstacles.extend(shapes(object, base, Some(grids))?);
+        ids.resize(obstacles.len(), object.id.clone());
         objects.push((object.id.as_str(), first..obstacles.len()));
     }
-    Ok(World {
+    let world = World {
         touch: touches(&scene.allowed_collision_matrix, &objects, robot),
         ..World::new(obstacles)
-    })
+    };
+    Ok((world, ids))
 }
 
 /// The contacts an allowed collision matrix allows between `robot`'s links (held objects

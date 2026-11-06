@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use batchplan::{
-    CollisionModel, CollisionWeights, Device, HandConstraint, HandSpeed, IkOptions, IkProblem,
-    JoinOptions, JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem, PlanResult,
-    Robot, RobotOptions, SdfOptions, Sequence, ToolPath, ToolPathOptions, ToolPathStop, Trajectory,
-    World, Worlds, solve_ik,
+    CollisionModel, CollisionWeights, Contact, Device, HandConstraint, HandSpeed, IkOptions,
+    IkProblem, JoinOptions, JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem,
+    PlanResult, Robot, RobotOptions, SdfOptions, Sequence, ToolPath, ToolPathOptions, ToolPathStop,
+    Trajectory, World, Worlds, solve_ik,
 };
 use ros_env::moveit_msgs::msg::{
     AttachedCollisionObject, MotionPlanRequest, MotionSequenceRequest, MotionSequenceResponse,
@@ -362,15 +362,18 @@ impl Planner {
             .map_or((&self.robot, &self.device, &self.meshes), |h| {
                 (&h.0, &h.1, &h.2)
             });
-        let world = scene::world(scene, &frames, &self.grids, robot)?;
+        let (world, ids) = scene::world(scene, &frames, &self.grids, robot)?;
         let worlds = device.upload(std::slice::from_ref(&world)).map_err(crash)?;
 
-        let clear = clearances(device, &worlds, &start)?;
-        if let Some(&[w, _]) = clear.first().filter(|[w, s]| *w < 0.0 || *s < 0.0) {
-            let what = if w < 0.0 { "an obstacle" } else { "each other" };
+        let contacts = device.contacts(&worlds, &[0], &start, 0.0).map_err(crash)?;
+        if let Some(nearest) = contacts[0].first() {
+            let more = match contacts[0].len() - 1 {
+                0 => String::new(),
+                others => format!(", and {others} more"),
+            };
             return Err(Refusal::new(
                 Code::START_STATE_IN_COLLISION,
-                format!("the start's collision spheres touch {what}"),
+                format!("the start collides: {}{more}", described(nearest, &ids)),
             ));
         }
         let setting = Setting {
@@ -1166,6 +1169,28 @@ fn timed(
 }
 
 /// `[world, self]` sphere clearances of each configuration in `q` (`[n, dof]`).
+/// A contact in words, naming the scene object an obstacle comes from (`ids`, per obstacle).
+fn described(contact: &Contact, ids: &[String]) -> String {
+    match contact {
+        Contact::World {
+            link,
+            obstacle,
+            distance,
+            ..
+        } => format!(
+            "{link} is {:.1} mm into '{}'",
+            -distance * 1e3,
+            ids[*obstacle]
+        ),
+        Contact::SelfCollision {
+            links: [a, b],
+            distance,
+            ..
+        } => format!("{a} and {b} overlap by {:.1} mm", -distance * 1e3),
+        other => format!("{other:?}"),
+    }
+}
+
 fn clearances(device: &Device, worlds: &Worlds, q: &[f32]) -> Result<Vec<[f32; 2]>, Refusal> {
     let n = q.len() / device.robot().dof();
     let e = device
