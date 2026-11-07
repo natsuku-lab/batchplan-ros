@@ -27,8 +27,8 @@ use crate::srdf::{Srdf, Tree};
 use crate::{Refusal, constraints, state, trajectory};
 
 /// The batchplan release whose sphere fit the cache holds: spheres another one fitted are fitted
-/// again. Bump it with a release that changes the fit, as 0.9.0 did.
-const FIT: &str = "batchplan 0.9 fit";
+/// again. Bump it with a release that changes the fit, as 0.9.0 and 0.10.0 did.
+const FIT: &str = "batchplan 0.10 fit";
 
 type Code = MoveItErrorCodes;
 
