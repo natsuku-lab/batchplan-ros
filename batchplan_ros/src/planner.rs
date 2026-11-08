@@ -601,6 +601,7 @@ impl Planner {
                 start: start.to_vec(),
                 hand,
                 waypoints: vec![pose],
+                holding: None,
             };
             let mut result =
                 batchplan::follow(s.device, s.worlds, &[path], &ToolPathOptions::default())
@@ -649,6 +650,7 @@ impl Planner {
                 start_motion: None,
                 hold: hold.clone(),
                 constraints: constraints.clone(),
+                holding: None,
             })
             .collect();
 
@@ -914,6 +916,7 @@ impl Planner {
             start: start.clone(),
             hand,
             waypoints,
+            holding: None,
         };
         let worlds = device.upload(&[World::default()]).map_err(crash)?;
         let result = batchplan::follow(device, &worlds, &[path], &options).map_err(crash)?;
@@ -963,6 +966,7 @@ impl Planner {
             targets,
             seed: Some(seed.clone()),
             hold: outside(&self.robot, &group),
+            holding: None,
         };
         let result =
             solve_ik(&self.device, &worlds, &[problem], &IkOptions::default()).map_err(crash)?;
@@ -1053,6 +1057,7 @@ fn candidates(
                     .collect(),
                 seed: Some(start.to_vec()),
                 hold: hold.clone(),
+                holding: None,
             })
             .collect();
         let ik = solve_ik(device, worlds, &problems, &options).map_err(crash)?;
