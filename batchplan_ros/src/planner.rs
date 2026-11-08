@@ -646,7 +646,7 @@ impl Planner {
             .map(|goal| PlanProblem {
                 world: 0,
                 start: start.to_vec(),
-                goal: goal.clone(),
+                goal: batchplan::Goal::Joints(goal.clone()),
                 start_motion: None,
                 hold: hold.clone(),
                 constraints: constraints.clone(),
@@ -661,7 +661,13 @@ impl Planner {
         let constrained = !constraints.is_empty();
         let mut problems = problems;
         if constrained {
-            problems.sort_by(|a, b| distance(&a.goal, start).total_cmp(&distance(&b.goal, start)));
+            let apart = |p: &PlanProblem| {
+                distance(
+                    p.goal.joints().expect("the goals are configurations"),
+                    start,
+                )
+            };
+            problems.sort_by(|a, b| apart(a).total_cmp(&apart(b)));
         }
         let mut touched = false;
         // A path that grazes the meshes is planned again keeping twice the clearance.
