@@ -11,12 +11,19 @@ mod goals;
 mod limits;
 mod planner;
 mod scene;
+mod search;
 mod srdf;
 mod state;
 mod trajectory;
+mod visualization;
+mod workcell;
+mod world_geometry;
 
 pub use limits::parse as parse_joint_limits;
 pub use planner::{Answer, DeviceKind, Planner, PlannerOptions};
+pub use search::{PlannerSettings, SearchOptions, SearchParameters};
+pub use visualization::scene as collision_scene_markers;
+pub use visualization::spheres as collision_sphere_markers;
 
 /// Why a request was refused, as a MoveIt error code and a message.
 pub(crate) struct Refusal {

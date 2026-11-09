@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 batchplan = "0.10.0"
+mesh-loader = "0.1"
+parry3d-f64 = { version = "0.31", default-features = false, features = ["required-features", "std", "alloc"] }
 futures = "0.3"
 rclrs = "0.8"
 ros-env = "0.3"

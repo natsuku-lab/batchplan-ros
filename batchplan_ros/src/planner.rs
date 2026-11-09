@@ -1,18 +1,19 @@
 //! MoveIt planning requests, each against the scene it carries.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::hash::Hasher;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use batchplan::{
     CollisionModel, CollisionWeights, Contact, Device, HandConstraint, HandSpeed, IkOptions,
-    IkProblem, JoinOptions, JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem,
-    PlanResult, Robot, RobotOptions, SdfOptions, Sequence, ToolPath, ToolPathOptions, ToolPathStop,
-    Trajectory, World, Worlds, solve_ik,
+    IkProblem, JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem, PlanResult,
+    Robot, RobotOptions, SdfOptions, Sequence, SphereOptions, ToolPath, ToolPathOptions,
+    ToolPathStop, Trajectory, World, Worlds, solve_ik,
 };
 use ros_env::moveit_msgs::msg::{
     AttachedCollisionObject, MotionPlanRequest, MotionSequenceRequest, MotionSequenceResponse,
@@ -24,7 +25,10 @@ use ros_env::sensor_msgs::msg::JointState;
 use crate::goals::{self, Goal};
 use crate::scene::{self, Fnv, Frames, Grids};
 use crate::srdf::{Srdf, Tree};
-use crate::{Refusal, constraints, state, trajectory};
+use crate::{
+    PlannerSettings, Refusal, SearchOptions, constraints, state, trajectory, workcell,
+    world_geometry,
+};
 
 /// The batchplan release whose sphere fit the cache holds: spheres another one fitted are fitted
 /// again. Bump it with a release that changes the fit, as 0.9.0 and 0.10.0 did.
@@ -57,8 +61,16 @@ pub struct PlannerOptions {
     pub device: DeviceKind,
     /// Where fitted collision spheres are kept between runs.
     pub cache_dir: Option<PathBuf>,
+    /// Roots whose strict descendants own robot collision geometry; empty selects all links.
+    pub robot_link_roots: Vec<String>,
+    /// Maximum grid spacing in meters for URDF world meshes.
+    pub world_sdf_voxel_size: f32,
+    /// Spheres shared by the selected robot links.
+    pub sphere_budget: usize,
     /// Spacing of returned waypoints, in seconds.
     pub trajectory_dt: f32,
+    /// IK, free-space and Cartesian search settings.
+    pub search: SearchOptions,
 }
 
 impl Default for PlannerOptions {
@@ -69,7 +81,11 @@ impl Default for PlannerOptions {
             ee_links: vec![],
             device: DeviceKind::Cpu { threads: 0 },
             cache_dir: None,
+            sphere_budget: SphereOptions::default().budget,
+            robot_link_roots: vec![],
+            world_sdf_voxel_size: SdfOptions::default().voxel,
             trajectory_dt: 0.02,
+            search: SearchOptions::default(),
         }
     }
 }
@@ -87,12 +103,6 @@ pub struct Answer {
     pub planning_time: f64,
 }
 
-/// IK solutions planned to per pose goal: the nearest distinct ones to the start.
-const SOLUTIONS_PER_POSE: usize = 4;
-/// Solutions nearer than this (radians, joint space) to a kept one are the same solution.
-const DISTINCT: f32 = 0.05;
-/// Planning time when a request allows none.
-const DEFAULT_BUDGET: f64 = 5.0;
 /// Positions this close outside a limit are moved onto it.
 const LIMIT_TOLERANCE: f32 = 1e-3;
 /// The first round's time slice for constrained goals, as a fraction of the request's budget.
@@ -111,6 +121,8 @@ struct Setting<'a> {
     worlds: &'a Worlds,
     states: [&'a RobotState; 2],
     scene: &'a PlanningScene,
+    search: &'a SearchOptions,
+    dt: f32,
 }
 
 /// One planned motion: the joints it moves, its path (B-spline control points, empty for one that
@@ -150,6 +162,20 @@ pub struct Planner {
     hands: Vec<String>,
     grids: Grids,
     dt: f32,
+    search: SearchOptions,
+    configurations: RwLock<HashMap<(String, String), PlannerSettings>>,
+    world_links: Vec<scene::WorldLink>,
+    world_markers: Vec<ros_env::visualization_msgs::msg::Marker>,
+    world_exemptions: Vec<(String, String)>,
+}
+
+fn check_sphere_budget(model: &CollisionModel, budget: usize) -> Result<usize> {
+    let count: usize = model.spheres.values().map(Vec::len).sum();
+    anyhow::ensure!(
+        count <= budget,
+        "URDF collision model uses {count} spheres, exceeding sphere_budget={budget}; increase the budget"
+    );
+    Ok(count)
 }
 
 impl fmt::Debug for Planner {
@@ -165,34 +191,119 @@ impl Planner {
     /// Loads the robot from its URDF and SRDF text: the SRDF's disabled collision pairs and end
     /// effectors, collision spheres fitted once and kept in `o.cache_dir`, and the limits given.
     pub fn try_new(urdf: &str, srdf: Option<&str>, o: &PlannerOptions) -> Result<Self> {
+        Self::try_new_with_scene(urdf, srdf, o, |_, _| Ok(()))
+    }
+
+    /// Reports robot spheres and URDF world markers before planning-data allocation.
+    /// Reporting failures are logged without preventing planning.
+    pub fn try_new_with_scene(
+        urdf: &str,
+        srdf: Option<&str>,
+        o: &PlannerOptions,
+        mut report: impl FnMut(
+            &CollisionModel,
+            &[ros_env::visualization_msgs::msg::Marker],
+        ) -> Result<()>,
+    ) -> Result<Self> {
+        o.search.validate()?;
+        anyhow::ensure!(
+            o.trajectory_dt.is_finite() && o.trajectory_dt > 0.0,
+            "trajectory_dt must be finite and positive"
+        );
         let tree = Tree::parse(urdf)?;
+        anyhow::ensure!(
+            o.sphere_budget > 0,
+            "sphere_budget must be a positive integer"
+        );
         let parsed = srdf.map(Srdf::parse).transpose()?.unwrap_or_default();
+        let partition = workcell::Partition::new(urdf, &o.robot_link_roots)?;
+        let robot_urdf = partition.robot_urdf.as_str();
+        let doc = roxmltree::Document::parse(robot_urdf)?;
+        let minimum = doc
+            .root_element()
+            .children()
+            .filter(|n| n.has_tag_name("link"))
+            .filter(|n| {
+                n.children()
+                    .any(|c| c.has_tag_name("collision") || c.has_tag_name("visual"))
+            })
+            .count();
+        anyhow::ensure!(
+            o.sphere_budget >= minimum,
+            "sphere_budget={} is below the minimum of {} geometry-bearing robot links",
+            o.sphere_budget,
+            minimum
+        );
+        let (world_links, world_markers) = world_geometry::world_model(
+            urdf,
+            partition.robot_links.as_ref(),
+            &o.package_dirs,
+            &SdfOptions {
+                voxel: o.world_sdf_voxel_size,
+                ..Default::default()
+            },
+        )?;
+        let mut world_exemptions = partition.exemptions;
+        world_exemptions.extend(
+            parsed
+                .disabled_collisions()
+                .iter()
+                .filter(|(a, b)| world_links.iter().any(|l| l.name == *a || l.name == *b))
+                .cloned(),
+        );
         let hands = if o.ee_links.is_empty() {
             parsed.tips()
         } else {
             o.ee_links.clone()
         };
+        if let Some(links) = &partition.robot_links {
+            for hand in &hands {
+                anyhow::ensure!(
+                    links.contains(hand),
+                    "IK frame '{hand}' is outside robot_link_roots descendants"
+                );
+            }
+        }
         let mut options = RobotOptions {
             ee_links: hands.clone(),
             package_dirs: o.package_dirs.clone(),
             joint_limits: o.joint_limits.clone(),
             srdf: srdf.map(str::to_string),
+            spheres: SphereOptions {
+                budget: o.sphere_budget,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let cached = o.cache_dir.as_ref().map(|dir| {
             let mut hash = Fnv::default();
             hash.write(FIT.as_bytes());
-            hash.write(urdf.as_bytes());
+            hash.write(robot_urdf.as_bytes());
             hash.write(srdf.unwrap_or_default().as_bytes());
             hash.write(format!("{:?}", options.spheres).as_bytes());
             dir.join(format!("{:016x}.json", hash.finish()))
         });
         if let Some(path) = cached.as_ref().filter(|p| p.exists()) {
-            options.collision_model = Some(CollisionModel::load(path)?);
+            let model = CollisionModel::load(path)?;
+            check_sphere_budget(&model, o.sphere_budget)?;
+            options.collision_model = Some(model);
             // The cached model already holds the SRDF's pairs.
             options.srdf = None;
         }
-        let robot = Robot::from_urdf(urdf, &options)?;
+        let robot = Robot::from_urdf(robot_urdf, &options)?;
+        let count = check_sphere_budget(robot.collision_model(), o.sphere_budget)?;
+        rclrs::log_info!(
+            "batchplan_planner",
+            "budgeted collision model: {} robot spheres (maximum {})",
+            count,
+            o.sphere_budget
+        );
+        if let Err(e) = report(robot.collision_model(), &world_markers) {
+            rclrs::log_error!(
+                "batchplan_planner",
+                "cannot publish collision visualization: {e:#}"
+            );
+        }
         if let Some(path) = cached.filter(|_| options.collision_model.is_none()) {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)
@@ -222,6 +333,11 @@ impl Planner {
             hands,
             grids: Grids::new(SdfOptions::default()),
             dt: o.trajectory_dt,
+            search: o.search.clone(),
+            configurations: RwLock::new(HashMap::new()),
+            world_links,
+            world_markers,
+            world_exemptions,
         })
     }
 
@@ -231,13 +347,91 @@ impl Planner {
         &self.robot
     }
 
+    /// Full link-local collision model for a frame-locked RViz MarkerArray display.
+    #[must_use]
+    pub fn collision_markers(&self) -> ros_env::visualization_msgs::msg::MarkerArray {
+        crate::visualization::scene(self.robot.collision_model(), &self.world_markers)
+    }
+
+    /// Native URDF world obstacles, grouped by link and expressed in that link's frame.
+    pub fn urdf_world_links(&self) -> impl Iterator<Item = (&str, &[batchplan::Obstacle])> {
+        self.world_links
+            .iter()
+            .map(|l| (l.name.as_str(), l.obstacles.as_slice()))
+    }
+
     /// What runs the batches: the GPU adapter, or the CPU's thread count.
     #[must_use]
     pub fn device_name(&self) -> String {
         self.device.name()
     }
 
-    /// Plans `request` in `scene`, whose collision objects are the whole world. The start is
+    /// Settings are copied before planning; edits cannot change an in-flight motion.
+    pub fn planner_settings(&self, group: &str, planner: &str) -> Result<PlannerSettings> {
+        let planner = self.configuration_name(group, planner)?;
+        let configs = self
+            .configurations
+            .read()
+            .map_err(|_| anyhow::anyhow!("planner configuration lock poisoned"))?;
+        Ok(configs
+            .get(&(group.into(), planner.into()))
+            .or_else(|| configs.get(&(String::new(), planner.into())))
+            .cloned()
+            .unwrap_or_else(|| PlannerSettings {
+                search: self.search.clone(),
+                trajectory_dt: self.dt,
+            }))
+    }
+
+    /// Standard MoveIt configuration updates are validated atomically.
+    pub fn set_planner_parameters(
+        &self,
+        group: &str,
+        planner: &str,
+        values: &BTreeMap<String, String>,
+        replace: bool,
+    ) -> Result<()> {
+        let planner = self.configuration_name(group, planner)?;
+        let mut configs = self
+            .configurations
+            .write()
+            .map_err(|_| anyhow::anyhow!("planner configuration lock poisoned"))?;
+        let key = (group.into(), planner.into());
+        let defaults = PlannerSettings {
+            search: self.search.clone(),
+            trajectory_dt: self.dt,
+        };
+        let previous = if replace {
+            &defaults
+        } else {
+            configs
+                .get(&key)
+                .or_else(|| configs.get(&(String::new(), planner.into())))
+                .unwrap_or(&defaults)
+        };
+        let settings = previous.with_parameters(values)?;
+        configs.insert(key, settings);
+        Ok(())
+    }
+
+    fn configuration_name<'a>(&self, group: &str, planner: &'a str) -> Result<&'a str> {
+        if !group.is_empty() {
+            self.group(group)
+                .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+        }
+        let planner = if planner.is_empty() {
+            "batchplan"
+        } else {
+            planner
+        };
+        anyhow::ensure!(
+            matches!(planner, "batchplan" | STRAIGHT),
+            "unknown planner '{planner}'"
+        );
+        Ok(planner)
+    }
+
+    /// Plans `request` in `scene`, whose objects augment the URDF world. The start is
     /// `current` (the latest joint states), overridden by the scene's robot state and then the
     /// request's start state.
     pub fn plan(
@@ -345,6 +539,13 @@ impl Planner {
                 )));
             }
         }
+        let settings = items
+            .iter()
+            .map(|(request, _)| {
+                self.planner_settings(&request.group_name, &request.planner_id)
+                    .map_err(|e| invalid(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let start = self.start(&first.start_state, scene, current)?;
         let states = [&scene.robot_state, &first.start_state];
         let frames = Frames::new(
@@ -367,7 +568,14 @@ impl Planner {
             .map_or((&self.robot, &self.device, &self.meshes), |h| {
                 (&h.0, &h.1, &h.2)
             });
-        let (world, ids) = scene::world(scene, &frames, &self.grids, robot)?;
+        let (world, ids) = scene::world(
+            scene,
+            &frames,
+            &self.grids,
+            robot,
+            &self.world_links,
+            &self.world_exemptions,
+        )?;
         let worlds = device.upload(std::slice::from_ref(&world)).map_err(crash)?;
 
         let contacts = device.contacts(&worlds, &[0], &start, 0.0).map_err(crash)?;
@@ -381,17 +589,19 @@ impl Planner {
                 format!("the start collides: {}{more}", described(nearest, &ids)),
             ));
         }
-        let setting = Setting {
-            robot,
-            device,
-            meshes,
-            world: &world,
-            worlds: &worlds,
-            states,
-            scene,
-        };
         let mut motions: Vec<Motion> = Vec::with_capacity(items.len());
         for (k, (&(request, _), group)) in items.iter().zip(groups).enumerate() {
+            let setting = Setting {
+                robot,
+                device,
+                meshes,
+                world: &world,
+                worlds: &worlds,
+                states,
+                scene,
+                search: &settings[k].search,
+                dt: settings[k].trajectory_dt,
+            };
             let from = motions.last().map_or(&start[..], |m| m.end());
             // The first item's budget counts from the request, the others' from their own start.
             let begun = if k == 0 { begun } else { Instant::now() };
@@ -436,8 +646,14 @@ impl Planner {
         let joined = if sequences.is_empty() {
             None
         } else {
-            let o = JoinOptions::default();
-            Some(batchplan::join(device, &worlds, &sequences, &o).map_err(crash)?)
+            // A shared blend batch must meet the finest resolution requested by any item.
+            let join = batchplan::JoinOptions {
+                resolution: settings
+                    .iter()
+                    .map(|s| s.search.join.resolution)
+                    .fold(f32::INFINITY, f32::min),
+            };
+            Some(batchplan::join(device, &worlds, &sequences, &join).map_err(crash)?)
         };
         let mut joined = joined.iter().flat_map(|j| j.paths.iter().zip(&j.blends));
 
@@ -473,7 +689,10 @@ impl Planner {
                         &stretch[..n],
                         first.speed,
                         first.cap,
-                        self.dt,
+                        settings[chain.clone()]
+                            .iter()
+                            .map(|s| s.trajectory_dt)
+                            .fold(f32::INFINITY, f32::min),
                     )?;
                     if clear_on_meshes(meshes, &world, &sampled)? {
                         pieces.push((&first.group, sampled));
@@ -535,10 +754,56 @@ impl Planner {
         start: &[f32],
         begun: Instant,
     ) -> Result<Motion, Refusal> {
+        if !request.allowed_planning_time.is_finite()
+            || Duration::try_from_secs_f64(request.allowed_planning_time.max(0.0)).is_err()
+        {
+            return Err(Refusal::new(
+                Code::INVALID_MOTION_PLAN,
+                "allowed_planning_time must be finite and representable as a duration",
+            ));
+        }
         let seconds = if request.allowed_planning_time > 0.0 {
             request.allowed_planning_time
         } else {
-            DEFAULT_BUDGET
+            s.search.default_planning_time
+        };
+        let mut last = Refusal::new(Code::TIMED_OUT, "planning time exhausted");
+        for attempt in 0..request.num_planning_attempts.max(1) {
+            if begun.elapsed().as_secs_f64() >= seconds {
+                break;
+            }
+            match self.motion_attempt(s, request, group.clone(), start, begun, attempt as u64) {
+                Ok(motion) => return Ok(motion),
+                Err(r)
+                    if matches!(
+                        r.code,
+                        Code::PLANNING_FAILED | Code::NO_IK_SOLUTION | Code::TIMED_OUT
+                    ) =>
+                {
+                    last = r;
+                }
+                Err(r) => return Err(r),
+            }
+            if request.planner_id == STRAIGHT {
+                break;
+            }
+        }
+        Err(last)
+    }
+
+    fn motion_attempt(
+        &self,
+        s: &Setting,
+        request: &MotionPlanRequest,
+        group: Vec<usize>,
+        start: &[f32],
+        begun: Instant,
+        attempt: u64,
+    ) -> Result<Motion, Refusal> {
+        let seconds = if request.allowed_planning_time > 0.0 {
+            request.allowed_planning_time
+        } else {
+            s.search.default_planning_time
         };
         let budget = Duration::from_secs_f64(seconds);
         let frames = Frames::new(
@@ -557,6 +822,7 @@ impl Planner {
             start,
             &self.hands,
             &frames,
+            &s.search.ik,
         )?;
         let constraints = constraints::path(&request.path_constraints, &self.hands, &frames)?;
         if let Some(why) = breach(robot, &constraints, start)? {
@@ -602,9 +868,8 @@ impl Planner {
                 hand,
                 waypoints: vec![pose],
             };
-            let mut result =
-                batchplan::follow(s.device, s.worlds, &[path], &ToolPathOptions::default())
-                    .map_err(crash)?;
+            let mut result = batchplan::follow(s.device, s.worlds, &[path], &s.search.cartesian)
+                .map_err(crash)?;
             if let Some(why) = result.stopped[0] {
                 return Err(Refusal::new(
                     Code::PLANNING_FAILED,
@@ -616,7 +881,7 @@ impl Planner {
                 ));
             }
             let path = result.paths.swap_remove(0);
-            let sampled = timed(robot, &path, start, speed, cap, self.dt)?;
+            let sampled = timed(robot, &path, start, speed, cap, s.dt)?;
             if !clear_on_meshes(s.meshes, s.world, &sampled)? {
                 return Err(Refusal::new(
                     Code::PLANNING_FAILED,
@@ -625,7 +890,8 @@ impl Planner {
             }
             return Ok(motion(path, sampled));
         }
-        let candidates = candidates(&goals, robot, s.device, s.worlds, start, &group)?;
+        let search = s.search.for_attempt(attempt);
+        let candidates = candidates(&goals, robot, s.device, s.worlds, start, &group, &search)?;
         let mut candidates_kept = Vec::with_capacity(candidates.len());
         for goal in candidates {
             if breach(robot, &constraints, &goal)?.is_none() {
@@ -677,7 +943,7 @@ impl Planner {
                 };
                 let mut options = PlanOptions {
                     time_budget: Some(given),
-                    ..Default::default()
+                    ..search.planning
                 };
                 options.rrt.clearance *= widen;
                 options.shortcut.clearance *= widen;
@@ -689,7 +955,7 @@ impl Planner {
                 found |= !solved.is_empty();
                 solved.sort_by(|a, b| a.0.total_cmp(&b.0));
                 for (_, path) in solved {
-                    let sampled = timed(robot, path, start, speed, cap, self.dt)?;
+                    let sampled = timed(robot, path, start, speed, cap, s.dt)?;
                     if clear_on_meshes(s.meshes, s.world, &sampled)? {
                         return Ok(motion(path.to_vec(), sampled));
                     }
@@ -810,7 +1076,7 @@ impl Planner {
     }
 
     /// The configuration nearest `request`'s seed that puts its link at its pose, checked against
-    /// the robot itself (the service carries no scene).
+    /// the robot and URDF world (the service carries no additional scene).
     pub fn ik(
         &self,
         request: &PositionIKRequest,
@@ -831,7 +1097,7 @@ impl Planner {
     /// The hand moved in straight lines through `request`'s waypoints, as MoveIt's
     /// `compute_cartesian_path` moves it, as far as it gets: `fraction` says how much of the path
     /// the trajectory covers. The service carries no scene, so the motion is checked against the
-    /// robot and the objects it holds, whatever `avoid_collisions` says.
+    /// robot, URDF world and the objects it holds, whatever `avoid_collisions` says.
     pub fn cartesian_path(
         &self,
         request: &GetCartesianPath_Request,
@@ -856,6 +1122,9 @@ impl Planner {
         request: &GetCartesianPath_Request,
         current: Option<&JointState>,
     ) -> Result<(RobotState, RobotTrajectory, f64), Refusal> {
+        let settings = self
+            .planner_settings(&request.group_name, "batchplan")
+            .map_err(|e| Refusal::new(Code::INVALID_MOTION_PLAN, e.to_string()))?;
         let constraints = &request.path_constraints;
         if !(constraints.joint_constraints.is_empty()
             && constraints.position_constraints.is_empty()
@@ -905,9 +1174,9 @@ impl Planner {
             step: if request.max_step > 0.0 {
                 request.max_step as f32
             } else {
-                ToolPathOptions::default().step
+                settings.search.cartesian.step
             },
-            ..Default::default()
+            ..settings.search.cartesian
         };
         let path = ToolPath {
             world: 0,
@@ -915,7 +1184,15 @@ impl Planner {
             hand,
             waypoints,
         };
-        let worlds = device.upload(&[World::default()]).map_err(crash)?;
+        let (world, _) = scene::world(
+            &scene,
+            &frames,
+            &self.grids,
+            robot,
+            &self.world_links,
+            &self.world_exemptions,
+        )?;
+        let worlds = device.upload(&[world]).map_err(crash)?;
         let result = batchplan::follow(device, &worlds, &[path], &options).map_err(crash)?;
         let speed = factor(request.max_velocity_scaling_factor)
             .min(factor(request.max_acceleration_scaling_factor).sqrt());
@@ -923,7 +1200,14 @@ impl Planner {
             &request.cartesian_speed_limited_link,
             request.max_cartesian_speed,
         )?;
-        let sampled = timed(robot, &result.paths[0], &start, speed, cap, self.dt)?;
+        let sampled = timed(
+            robot,
+            &result.paths[0],
+            &start,
+            speed,
+            cap,
+            settings.trajectory_dt,
+        )?;
         let start_state = RobotState {
             joint_state: state::joint_state(robot, &start),
             ..Default::default()
@@ -940,8 +1224,12 @@ impl Planner {
         request: &PositionIKRequest,
         current: Option<&JointState>,
     ) -> Result<Vec<f32>, Refusal> {
+        let settings = self
+            .planner_settings(&request.group_name, "batchplan")
+            .map_err(|e| Refusal::new(Code::INVALID_MOTION_PLAN, e.to_string()))?;
         let seed = self.start(&request.robot_state, &PlanningScene::default(), current)?;
         let hand = self.hand(&request.ik_link_name)?;
+        let scene = PlanningScene::default();
         let group = self.group(&request.group_name)?;
         let frames = Frames::new(
             &self.robot,
@@ -949,12 +1237,20 @@ impl Planner {
             &self.root,
             &self.virtual_joints,
             &[&request.robot_state],
-            &PlanningScene::default(),
+            &scene,
         );
         let target = frames
             .pose_of(&request.pose_stamped.header.frame_id)?
             .mul_pose(scene::pose(&request.pose_stamped.pose));
-        let worlds = self.device.upload(&[World::default()]).map_err(crash)?;
+        let (world, _) = scene::world(
+            &scene,
+            &frames,
+            &self.grids,
+            &self.robot,
+            &self.world_links,
+            &self.world_exemptions,
+        )?;
+        let worlds = self.device.upload(&[world]).map_err(crash)?;
         let targets = (0..self.robot.hands())
             .map(|h| (h == hand).then_some(target))
             .collect();
@@ -965,7 +1261,7 @@ impl Planner {
             hold: outside(&self.robot, &group),
         };
         let result =
-            solve_ik(&self.device, &worlds, &[problem], &IkOptions::default()).map_err(crash)?;
+            solve_ik(&self.device, &worlds, &[problem], &settings.search.ik).map_err(crash)?;
         result
             .nearest(0, &seed)
             .map(<[f32]>::to_vec)
@@ -996,6 +1292,7 @@ fn candidates(
     worlds: &Worlds,
     start: &[f32],
     group: &[usize],
+    search: &SearchOptions,
 ) -> Result<Vec<Vec<f32>>, Refusal> {
     let mut out = vec![];
     let mut joint_goals = vec![];
@@ -1036,7 +1333,7 @@ fn candidates(
         let options = IkOptions {
             position_tolerance,
             rotation_tolerance,
-            ..Default::default()
+            ..search.ik
         };
         let hold = outside(robot, group);
         let problems: Vec<IkProblem> = poses
@@ -1064,7 +1361,10 @@ fn candidates(
             solutions.sort_by(|a, b| distance(a, start).total_cmp(&distance(b, start)));
             let mut kept: Vec<&[f32]> = vec![];
             for q in solutions {
-                if kept.len() < SOLUTIONS_PER_POSE && kept.iter().all(|k| distance(k, q) > DISTINCT)
+                if kept.len() < search.solutions_per_pose
+                    && kept
+                        .iter()
+                        .all(|k| distance(k, q) > search.solution_distance)
                 {
                     kept.push(q);
                 }
@@ -1173,7 +1473,6 @@ fn timed(
     Ok(sampled)
 }
 
-/// `[world, self]` sphere clearances of each configuration in `q` (`[n, dof]`).
 /// A contact in words, naming the scene object an obstacle comes from (`ids`, per obstacle).
 fn described(contact: &Contact, ids: &[String]) -> String {
     match contact {
@@ -1196,6 +1495,7 @@ fn described(contact: &Contact, ids: &[String]) -> String {
     }
 }
 
+/// `[world, self]` sphere clearances of each configuration in `q` (`[n, dof]`).
 fn clearances(device: &Device, worlds: &Worlds, q: &[f32]) -> Result<Vec<[f32; 2]>, Refusal> {
     let n = q.len() / device.robot().dof();
     let e = device
