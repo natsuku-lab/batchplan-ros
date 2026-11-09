@@ -28,6 +28,7 @@ use ros_env::moveit_msgs::srv::{
 };
 use ros_env::sensor_msgs::msg::JointState;
 use ros_env::std_msgs;
+use ros_env::visualization_msgs::msg::MarkerArray;
 
 fn main() -> Result<()> {
     let context = Context::default_from_env()?;
@@ -48,22 +49,45 @@ fn main() -> Result<()> {
     let device = text("device")?;
     let cache_dir = text("cache_dir")?;
     let controller_action = text("controller_action")?;
-    let ee_links: Arc<[Arc<str>]> = node
+    let ee_links_parameter = node
         .declare_parameter("ee_links")
         .default(Arc::from(Vec::<Arc<str>>::new()))
-        .mandatory()?
-        .get();
-    let threads = node
+        .read_only()?;
+    let ee_links: Arc<[Arc<str>]> = ee_links_parameter.get();
+    let roots_parameter = node
+        .declare_parameter("robot_link_roots")
+        .default(Arc::from(Vec::<Arc<str>>::new()))
+        .read_only()?;
+    let robot_link_roots: Arc<[Arc<str>]> = roots_parameter.get();
+    let voxel_parameter = node
+        .declare_parameter::<f64>("world_sdf_voxel_size")
+        .default(0.01)
+        .read_only()?;
+    let world_sdf_voxel_size = voxel_parameter.get() as f32;
+    anyhow::ensure!(
+        world_sdf_voxel_size.is_finite() && world_sdf_voxel_size > 0.0,
+        "world_sdf_voxel_size must be finite and positive"
+    );
+    let threads_parameter = node
         .declare_parameter::<i64>("cpu_threads")
         .default(0)
-        .mandatory()?
-        .get();
-    let dt = node
+        .read_only()?;
+    let threads = usize::try_from(threads_parameter.get()).context("cpu_threads must be nonnegative")?;
+    let dt_parameter = node
         .declare_parameter::<f64>("trajectory_dt")
         .default(0.02)
-        .mandatory()?
-        .get();
-
+        .read_only()?;
+    let dt = dt_parameter.get();
+    let budget_parameter = node
+        .declare_parameter::<i64>("sphere_budget")
+        .default(64)
+        .read_only()?;
+    let sphere_budget =
+        usize::try_from(budget_parameter.get()).context("sphere_budget must be a positive integer")?;
+    anyhow::ensure!(
+        sphere_budget > 0,
+        "sphere_budget must be a positive integer"
+    );
     let joint_limits = if limits_file.is_empty() {
         Default::default()
     } else {
@@ -75,9 +99,11 @@ fn main() -> Result<()> {
         package_dirs: package_dirs(),
         joint_limits,
         ee_links: ee_links.iter().map(|s| s.to_string()).collect(),
+        robot_link_roots: robot_link_roots.iter().map(|s| s.to_string()).collect(),
+        world_sdf_voxel_size,
         device: match device.as_str() {
             "" | "cpu" => DeviceKind::Cpu {
-                threads: usize::try_from(threads).unwrap_or(0),
+                threads,
             },
             "gpu" => DeviceKind::Gpu,
             other => anyhow::bail!("device must be 'cpu' or 'gpu', not '{other}'"),
@@ -88,6 +114,7 @@ fn main() -> Result<()> {
             PathBuf::from(cache_dir)
         }),
         trajectory_dt: dt as f32,
+        sphere_budget,
     };
 
     let latest: Arc<Mutex<Option<JointState>>> = Arc::new(Mutex::new(None));
@@ -100,6 +127,8 @@ fn main() -> Result<()> {
     let controller = (!controller_action.is_empty())
         .then(|| node.create_action_client::<FollowJointTrajectory>(controller_action.as_str()))
         .transpose()?;
+    let collision_spheres =
+        node.create_publisher::<MarkerArray>("~/collision_spheres".transient_local().reliable())?;
 
     // The planner is built once, from the parameter or the first description published, on a
     // thread of its own, since fitting spheres to a new robot takes seconds. Its action and service
@@ -119,9 +148,19 @@ fn main() -> Result<()> {
                 Arc::clone(&latest),
                 controller.clone(),
             );
+            let collision_spheres = collision_spheres.clone();
             std::thread::spawn(move || {
                 let begun = Instant::now();
-                let planner = match Planner::try_new(&urdf, srdf.as_deref(), &options) {
+                let planner = match Planner::try_new_with_scene(
+                    &urdf,
+                    srdf.as_deref(),
+                    &options,
+                    |model, world| {
+                        collision_spheres
+                            .publish(batchplan_ros::collision_scene_markers(model, world))?;
+                        Ok(())
+                    },
+                ) {
                     Ok(p) => Arc::new(p),
                     Err(e) => {
                         return log_error!(node.logger(), "cannot plan for this robot: {e:#}");

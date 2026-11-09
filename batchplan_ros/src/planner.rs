@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use batchplan::{
     CollisionModel, CollisionWeights, Contact, Device, HandConstraint, HandSpeed, IkOptions,
     IkProblem, JoinOptions, JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem,
-    PlanResult, Robot, RobotOptions, SdfOptions, Sequence, ToolPath, ToolPathOptions, ToolPathStop,
-    Trajectory, World, Worlds, solve_ik,
+    PlanResult, Robot, RobotOptions, SdfOptions, Sequence, SphereOptions, ToolPath,
+    ToolPathOptions, ToolPathStop, Trajectory, World, Worlds, solve_ik,
 };
 use ros_env::moveit_msgs::msg::{
     AttachedCollisionObject, MotionPlanRequest, MotionSequenceRequest, MotionSequenceResponse,
@@ -24,7 +24,7 @@ use ros_env::sensor_msgs::msg::JointState;
 use crate::goals::{self, Goal};
 use crate::scene::{self, Fnv, Frames, Grids};
 use crate::srdf::{Srdf, Tree};
-use crate::{Refusal, constraints, state, trajectory};
+use crate::{Refusal, constraints, state, trajectory, workcell, world_geometry};
 
 /// The batchplan release whose sphere fit the cache holds: spheres another one fitted are fitted
 /// again. Bump it with a release that changes the fit, as 0.9.0 and 0.10.0 did.
@@ -57,6 +57,12 @@ pub struct PlannerOptions {
     pub device: DeviceKind,
     /// Where fitted collision spheres are kept between runs.
     pub cache_dir: Option<PathBuf>,
+    /// Roots whose strict descendants own robot collision geometry; empty selects all links.
+    pub robot_link_roots: Vec<String>,
+    /// Maximum grid spacing in meters for URDF world meshes.
+    pub world_sdf_voxel_size: f32,
+    /// Spheres shared by the selected robot links.
+    pub sphere_budget: usize,
     /// Spacing of returned waypoints, in seconds.
     pub trajectory_dt: f32,
 }
@@ -69,6 +75,9 @@ impl Default for PlannerOptions {
             ee_links: vec![],
             device: DeviceKind::Cpu { threads: 0 },
             cache_dir: None,
+            sphere_budget: SphereOptions::default().budget,
+            robot_link_roots: vec![],
+            world_sdf_voxel_size: SdfOptions::default().voxel,
             trajectory_dt: 0.02,
         }
     }
@@ -150,6 +159,18 @@ pub struct Planner {
     hands: Vec<String>,
     grids: Grids,
     dt: f32,
+    world_links: Vec<scene::WorldLink>,
+    world_markers: Vec<ros_env::visualization_msgs::msg::Marker>,
+    world_exemptions: Vec<(String, String)>,
+}
+
+fn check_sphere_budget(model: &CollisionModel, budget: usize) -> Result<usize> {
+    let count: usize = model.spheres.values().map(Vec::len).sum();
+    anyhow::ensure!(
+        count <= budget,
+        "URDF collision model uses {count} spheres, exceeding sphere_budget={budget}; increase the budget"
+    );
+    Ok(count)
 }
 
 impl fmt::Debug for Planner {
@@ -165,34 +186,118 @@ impl Planner {
     /// Loads the robot from its URDF and SRDF text: the SRDF's disabled collision pairs and end
     /// effectors, collision spheres fitted once and kept in `o.cache_dir`, and the limits given.
     pub fn try_new(urdf: &str, srdf: Option<&str>, o: &PlannerOptions) -> Result<Self> {
+        Self::try_new_with_scene(urdf, srdf, o, |_, _| Ok(()))
+    }
+
+    /// Reports robot spheres and URDF world markers before planning-data allocation.
+    /// Reporting failures are logged without preventing planning.
+    pub fn try_new_with_scene(
+        urdf: &str,
+        srdf: Option<&str>,
+        o: &PlannerOptions,
+        mut report: impl FnMut(
+            &CollisionModel,
+            &[ros_env::visualization_msgs::msg::Marker],
+        ) -> Result<()>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            o.trajectory_dt.is_finite() && o.trajectory_dt > 0.0,
+            "trajectory_dt must be finite and positive"
+        );
         let tree = Tree::parse(urdf)?;
+        anyhow::ensure!(
+            o.sphere_budget > 0,
+            "sphere_budget must be a positive integer"
+        );
         let parsed = srdf.map(Srdf::parse).transpose()?.unwrap_or_default();
+        let partition = workcell::Partition::new(urdf, &o.robot_link_roots)?;
+        let robot_urdf = partition.robot_urdf.as_str();
+        let doc = roxmltree::Document::parse(robot_urdf)?;
+        let minimum = doc
+            .root_element()
+            .children()
+            .filter(|n| n.has_tag_name("link"))
+            .filter(|n| {
+                n.children()
+                    .any(|c| c.has_tag_name("collision") || c.has_tag_name("visual"))
+            })
+            .count();
+        anyhow::ensure!(
+            o.sphere_budget >= minimum,
+            "sphere_budget={} is below the minimum of {} geometry-bearing robot links",
+            o.sphere_budget,
+            minimum
+        );
+        let (world_links, world_markers) = world_geometry::world_model(
+            urdf,
+            partition.robot_links.as_ref(),
+            &o.package_dirs,
+            &SdfOptions {
+                voxel: o.world_sdf_voxel_size,
+                ..Default::default()
+            },
+        )?;
+        let mut world_exemptions = partition.exemptions;
+        world_exemptions.extend(
+            parsed
+                .disabled_collisions()
+                .iter()
+                .filter(|(a, b)| world_links.iter().any(|l| l.name == *a || l.name == *b))
+                .cloned(),
+        );
         let hands = if o.ee_links.is_empty() {
             parsed.tips()
         } else {
             o.ee_links.clone()
         };
+        if let Some(links) = &partition.robot_links {
+            for hand in &hands {
+                anyhow::ensure!(
+                    links.contains(hand),
+                    "IK frame '{hand}' is outside robot_link_roots descendants"
+                );
+            }
+        }
         let mut options = RobotOptions {
             ee_links: hands.clone(),
             package_dirs: o.package_dirs.clone(),
             joint_limits: o.joint_limits.clone(),
             srdf: srdf.map(str::to_string),
+            spheres: SphereOptions {
+                budget: o.sphere_budget,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let cached = o.cache_dir.as_ref().map(|dir| {
             let mut hash = Fnv::default();
             hash.write(FIT.as_bytes());
-            hash.write(urdf.as_bytes());
+            hash.write(robot_urdf.as_bytes());
             hash.write(srdf.unwrap_or_default().as_bytes());
             hash.write(format!("{:?}", options.spheres).as_bytes());
             dir.join(format!("{:016x}.json", hash.finish()))
         });
         if let Some(path) = cached.as_ref().filter(|p| p.exists()) {
-            options.collision_model = Some(CollisionModel::load(path)?);
+            let model = CollisionModel::load(path)?;
+            check_sphere_budget(&model, o.sphere_budget)?;
+            options.collision_model = Some(model);
             // The cached model already holds the SRDF's pairs.
             options.srdf = None;
         }
-        let robot = Robot::from_urdf(urdf, &options)?;
+        let robot = Robot::from_urdf(robot_urdf, &options)?;
+        let count = check_sphere_budget(robot.collision_model(), o.sphere_budget)?;
+        rclrs::log_info!(
+            "batchplan_planner",
+            "budgeted collision model: {} robot spheres (maximum {})",
+            count,
+            o.sphere_budget
+        );
+        if let Err(e) = report(robot.collision_model(), &world_markers) {
+            rclrs::log_error!(
+                "batchplan_planner",
+                "cannot publish collision visualization: {e:#}"
+            );
+        }
         if let Some(path) = cached.filter(|_| options.collision_model.is_none()) {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)
@@ -222,6 +327,9 @@ impl Planner {
             hands,
             grids: Grids::new(SdfOptions::default()),
             dt: o.trajectory_dt,
+            world_links,
+            world_markers,
+            world_exemptions,
         })
     }
 
@@ -231,13 +339,26 @@ impl Planner {
         &self.robot
     }
 
+    /// Full link-local collision model for a frame-locked RViz MarkerArray display.
+    #[must_use]
+    pub fn collision_markers(&self) -> ros_env::visualization_msgs::msg::MarkerArray {
+        crate::visualization::scene(self.robot.collision_model(), &self.world_markers)
+    }
+
+    /// Native URDF world obstacles, grouped by link and expressed in that link's frame.
+    pub fn urdf_world_links(&self) -> impl Iterator<Item = (&str, &[batchplan::Obstacle])> {
+        self.world_links
+            .iter()
+            .map(|l| (l.name.as_str(), l.obstacles.as_slice()))
+    }
+
     /// What runs the batches: the GPU adapter, or the CPU's thread count.
     #[must_use]
     pub fn device_name(&self) -> String {
         self.device.name()
     }
 
-    /// Plans `request` in `scene`, whose collision objects are the whole world. The start is
+    /// Plans `request` in `scene`, whose objects augment the URDF world. The start is
     /// `current` (the latest joint states), overridden by the scene's robot state and then the
     /// request's start state.
     pub fn plan(
@@ -367,7 +488,14 @@ impl Planner {
             .map_or((&self.robot, &self.device, &self.meshes), |h| {
                 (&h.0, &h.1, &h.2)
             });
-        let (world, ids) = scene::world(scene, &frames, &self.grids, robot)?;
+        let (world, ids) = scene::world(
+            scene,
+            &frames,
+            &self.grids,
+            robot,
+            &self.world_links,
+            &self.world_exemptions,
+        )?;
         let worlds = device.upload(std::slice::from_ref(&world)).map_err(crash)?;
 
         let contacts = device.contacts(&worlds, &[0], &start, 0.0).map_err(crash)?;
@@ -810,7 +938,7 @@ impl Planner {
     }
 
     /// The configuration nearest `request`'s seed that puts its link at its pose, checked against
-    /// the robot itself (the service carries no scene).
+    /// the robot and URDF world (the service carries no additional scene).
     pub fn ik(
         &self,
         request: &PositionIKRequest,
@@ -831,7 +959,7 @@ impl Planner {
     /// The hand moved in straight lines through `request`'s waypoints, as MoveIt's
     /// `compute_cartesian_path` moves it, as far as it gets: `fraction` says how much of the path
     /// the trajectory covers. The service carries no scene, so the motion is checked against the
-    /// robot and the objects it holds, whatever `avoid_collisions` says.
+    /// robot, URDF world and the objects it holds, whatever `avoid_collisions` says.
     pub fn cartesian_path(
         &self,
         request: &GetCartesianPath_Request,
@@ -915,7 +1043,15 @@ impl Planner {
             hand,
             waypoints,
         };
-        let worlds = device.upload(&[World::default()]).map_err(crash)?;
+        let (world, _) = scene::world(
+            &scene,
+            &frames,
+            &self.grids,
+            robot,
+            &self.world_links,
+            &self.world_exemptions,
+        )?;
+        let worlds = device.upload(&[world]).map_err(crash)?;
         let result = batchplan::follow(device, &worlds, &[path], &options).map_err(crash)?;
         let speed = factor(request.max_velocity_scaling_factor)
             .min(factor(request.max_acceleration_scaling_factor).sqrt());
@@ -943,18 +1079,27 @@ impl Planner {
         let seed = self.start(&request.robot_state, &PlanningScene::default(), current)?;
         let hand = self.hand(&request.ik_link_name)?;
         let group = self.group(&request.group_name)?;
+        let scene = PlanningScene::default();
         let frames = Frames::new(
             &self.robot,
             &seed,
             &self.root,
             &self.virtual_joints,
             &[&request.robot_state],
-            &PlanningScene::default(),
+            &scene,
         );
         let target = frames
             .pose_of(&request.pose_stamped.header.frame_id)?
             .mul_pose(scene::pose(&request.pose_stamped.pose));
-        let worlds = self.device.upload(&[World::default()]).map_err(crash)?;
+        let (world, _) = scene::world(
+            &scene,
+            &frames,
+            &self.grids,
+            &self.robot,
+            &self.world_links,
+            &self.world_exemptions,
+        )?;
+        let worlds = self.device.upload(&[world]).map_err(crash)?;
         let targets = (0..self.robot.hands())
             .map(|h| (h == hand).then_some(target))
             .collect();

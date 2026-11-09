@@ -4,24 +4,43 @@ The robot comes from the latched /robot_description topic unless `robot_descript
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
 ARGUMENTS = {
-    "robot_description_semantic": ("", "SRDF text: planning groups, end effectors, disabled collisions"),
-    "joint_limits_file": ("", "MoveIt joint_limits.yaml"),
-    "device": ("cpu", "'cpu' or 'gpu'"),
-    "controller_action": ("", "FollowJointTrajectory action used to execute plans"),
+    "robot_description_semantic": ("", str, "SRDF text: planning groups, end effectors, disabled collisions"),
+    "joint_limits_file": ("", str, "MoveIt joint_limits.yaml"),
+    "device": ("cpu", str, "'cpu' or 'gpu'"),
+    "controller_action": ("", str, "FollowJointTrajectory action used to execute plans"),
+    "sphere_budget": ("64", int, "Collision spheres shared by selected robot links"),
+    "world_sdf_voxel_size": ("0.01", float, "Maximum URDF world mesh SDF grid spacing in meters"),
+    "trajectory_dt": ("0.02", float, "Returned trajectory sample interval in seconds"),
 }
 
 
 def generate_launch_description():
-    declared = [DeclareLaunchArgument(name, default_value=default, description=doc) for name, (default, doc) in ARGUMENTS.items()]
-    parameters = {name: ParameterValue(LaunchConfiguration(name), value_type=str) for name in ARGUMENTS}
+    declared = [DeclareLaunchArgument(name, default_value=default, description=doc) for name, (default, _, doc) in ARGUMENTS.items()]
+    parameters = {
+        name: ParameterValue(LaunchConfiguration(name), value_type=value_type)
+        for name, (_, value_type, _) in ARGUMENTS.items()
+    }
+    declared.append(
+        DeclareLaunchArgument(
+            "robot_link_roots", default_value="[]",
+            description="YAML list of roots whose strict descendants use robot spheres; [] selects all",
+        )
+    )
     return LaunchDescription(
         declared
-        + [Node(package="batchplan_ros", executable="batchplan_planner", output="screen", parameters=[parameters])]
+        + [OpaqueFunction(function=_planner_node, args=[parameters])]
     )
+
+
+def _planner_node(context, parameters):
+    parameters = dict(parameters)
+    if LaunchConfiguration("robot_link_roots").perform(context).strip() not in ("", "[]"):
+        parameters["robot_link_roots"] = ParameterValue(LaunchConfiguration("robot_link_roots"))
+    return [Node(package="batchplan_ros", executable="batchplan_planner", output="screen", parameters=[parameters])]

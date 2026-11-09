@@ -18,6 +18,12 @@ use ros_env::shape_msgs::msg::{Mesh, SolidPrimitive};
 
 use crate::Refusal;
 
+/// Obstacles retained in one URDF link's local frame.
+pub(crate) struct WorldLink {
+    pub name: String,
+    pub obstacles: Vec<Obstacle>,
+}
+
 pub fn pose(p: &geometry::Pose) -> Pose {
     Pose {
         position: Vec3::new(
@@ -191,16 +197,36 @@ pub fn world(
     frames: &Frames,
     grids: &Grids,
     robot: &Robot,
+    links: &[WorldLink],
+    exemptions: &[(String, String)],
 ) -> Result<(World, Vec<String>), Refusal> {
     let mut obstacles = vec![];
     let mut ids = vec![];
     let mut objects = vec![];
-    for object in scene
-        .world
-        .collision_objects
-        .iter()
-        .filter(|o| o.operation != CollisionObject::REMOVE)
-    {
+    for link in links {
+        let base = frames.pose_of(&link.name)?;
+        let first = obstacles.len();
+        obstacles.extend(
+            link.obstacles
+                .iter()
+                .map(|o| o.placed(base.mul_pose(o.pose()))),
+        );
+        ids.resize(obstacles.len(), link.name.clone());
+        objects.push((link.name.as_str(), first..obstacles.len()));
+    }
+    for object in &scene.world.collision_objects {
+        if links.iter().any(|l| l.name == object.id) {
+            return Err(Refusal::new(
+                Code::INVALID_OBJECT_NAME,
+                format!(
+                    "scene object '{}' conflicts with a URDF world link",
+                    object.id
+                ),
+            ));
+        }
+        if object.operation == CollisionObject::REMOVE {
+            continue;
+        }
         let base = frames.pose_of(&object.header.frame_id)?;
         let first = obstacles.len();
         obstacles.extend(shapes(object, base, Some(grids))?);
@@ -208,7 +234,7 @@ pub fn world(
         objects.push((object.id.as_str(), first..obstacles.len()));
     }
     let world = World {
-        touch: touches(&scene.allowed_collision_matrix, &objects, robot),
+        touch: touches(&scene.allowed_collision_matrix, &objects, robot, exemptions),
         ..World::new(obstacles)
     };
     Ok((world, ids))
@@ -222,6 +248,7 @@ fn touches(
     acm: &AllowedCollisionMatrix,
     objects: &[(&str, Range<usize>)],
     robot: &Robot,
+    exemptions: &[(String, String)],
 ) -> Vec<Touch> {
     let index = |names: &[String], name: &str| names.iter().position(|n| n == name);
     let entry = |a: &str, b: &str| {
@@ -241,7 +268,11 @@ fn touches(
                 (Some(a), Some(b)) => Some(a && b),
                 (a, b) => a.or(b),
             })
-            .unwrap_or(false)
+            .unwrap_or_else(|| {
+                exemptions
+                    .iter()
+                    .any(|(a, b)| (a == link && b == object) || (b == link && a == object))
+            })
     };
     let links: Vec<&str> = robot
         .collision_model()

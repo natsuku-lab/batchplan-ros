@@ -72,6 +72,82 @@ batchplan keeps the configuration's jerk limits, which MoveIt's default time par
 
 To use it with your robot's MoveIt configuration, add `batchplan_planning.yaml` (from `batchplan_moveit/config`) to your config package's planning pipelines, and run `batchplan_planner` with the robot's SRDF and joint limits as `panda_moveit_demo.launch.py` does.
 
+The planner node's positive integer `sphere_budget` parameter (also an argument to
+`planner.launch.py`, default `64`) controls the collision-sphere fit for the selected
+robot links. With no `robot_link_roots`, this retains the legacy whole-URDF behavior,
+including fixed tables and fixtures. Large robot models need a larger budget:
+coarse spheres extend beyond the actual collision geometry and can reject goals
+that MoveIt accepts. Increasing the budget refines that approximation without
+disabling collisions or changing the trajectory's final mesh checks. Sphere fits
+are cached separately for each budget; restart the planner after changing it.
+The budget is a hard maximum for URDF robot spheres in budgeted mode. Models
+that cannot fit it, including cached models, are rejected rather than exceeding
+the cap. It is not a target sphere count; the native fitter may use coarser,
+more inflated spheres to meet the budget.
+
+### Robot subtrees and URDF world geometry
+
+Set the string-array parameter `robot_link_roots`, for example:
+
+```yaml
+robot_link_roots: [ur/base_link]
+world_sdf_voxel_size: 0.01
+```
+
+Only the **strict descendants** of these links own robot collision geometry; the
+named roots themselves are not included unless they descend from another selected
+root. Multiple roots select the union of their descendants. An empty list retains
+the all-robot behavior. Unknown roots, empty descendant selections, and non-fixed
+joints outside the selected subtrees fail explicitly: URDF world links must be
+rigidly attached to the workcell root.
+
+All kinematic links, joints and frame transforms are retained. Only collision
+ownership changes: robot links use spheres and final mesh checks; other links use
+native oriented boxes, spheres and cylinders. The world loader also accepts
+`<capsule radius="..." length="..."/>`, where length is the central segment's length.
+Each collision origin's translation and rotation are composed with its link's
+transform, including separate origins for multiple collision elements.
+World meshes use conservative SDFs directly, not sphere or primitive fitting.
+Watertight, consistently oriented, non-self-intersecting solid meshes are required;
+nested shells/cavities are rejected.
+Disconnected shells, including shells touching only at a vertex, are split and
+oriented independently. Repeated Collada `instance_geometry` references and
+`instance_node` elements are rejected explicitly because the current importer
+does not preserve their instances. Bake those instances into unique mesh geometry
+before using the file for world collisions; single-instance Collada remains supported.
+
+World collision mesh files larger than 64 MiB are rejected before loading.
+`world_sdf_voxel_size` is the maximum grid spacing in meters. The native SDF
+builder rejects grids above 67,108,864 points and grids exceeding its numeric
+limits before allocating grid data; resolution is never coarsened to make a grid
+fit. These are fixed resource limits, not estimates of available system memory.
+
+URDF world obstacles are retained alongside the request's planning scene, including
+for IK and Cartesian services that carry no scene. SRDF and adjacent/rigid-link
+exemptions survive the robot/world split; explicit request ACM entries override
+them. Request objects cannot reuse URDF world-link ids to replace or remove them.
+Robot caches are keyed by the collision-filtered URDF, so an all-robot cache cannot
+be reused for a different collision partition.
+
+Standalone launch example:
+
+```bash
+ros2 launch batchplan_ros planner.launch.py 'robot_link_roots:=[ur/base_link]'
+```
+
+### Collision visualization
+
+`~/collision_spheres` publishes the **whole URDF collision model** as
+`visualization_msgs/msg/MarkerArray`, with reliable transient-local QoS. Add an RViz
+MarkerArray display with matching durability. Markers use link-local coordinates
+and are frame-locked, so they follow the robot's TF. Equal-radius spheres are
+batched for rendering. This is visualization only, not duplicate MoveIt obstacles.
+Publication failures are logged but do not prevent planner initialization.
+Robot spheres are cyan; native world shapes are orange. World SDF markers show
+their source triangle surfaces, not a meshed SDF inflation halo. The markers
+represent the URDF model (including fixed fixtures), not world objects from
+individual planning requests.
+
 ## Your own robot
 
 To plan for your own robot without MoveIt, run the node next to its `robot_state_publisher`:
