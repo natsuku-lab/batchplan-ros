@@ -98,6 +98,15 @@ actual planning scene. The plugin does not repeat this expensive scan inside the
 search time budget or rerun successful native searches on adapter rejection.
 Differences between collision models can still cause validation failures.
 
+Both standalone actions accept cancellation during planning and execution.
+Canceled planning results are discarded without sending a controller goal; native
+planning already in progress may finish in its worker thread. During execution,
+cancellation is forwarded to the specific controller goal, including a goal whose
+acceptance is still pending. The action remains canceling until the controller
+confirms a terminal result. A refused cancellation is reported as `CONTROL_FAILED`,
+not as a successful stop. MoveIt contexts cancel only their own requests; canceling
+a queued context does not affect the active context or submit another goal.
+
 The backend exposes every native `IkOptions`, `PlanOptions`, `RrtOptions`,
 `ShortcutOptions`, `ToolPathOptions` and `JoinOptions` search field. The `PlanOptions.time_budget` field is represented by
 the request's planning time, with `default_planning_time` (5 seconds) as fallback.

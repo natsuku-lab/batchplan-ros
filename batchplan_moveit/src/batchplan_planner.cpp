@@ -2,6 +2,7 @@
 // batchplan_planner node's MoveGroup action, and the timed trajectory it returns is the plan.
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -33,6 +34,14 @@ using GetPlannerParams = moveit_msgs::srv::GetPlannerParams;
 using SetPlannerParams = moveit_msgs::srv::SetPlannerParams;
 using Clock = std::chrono::steady_clock;
 
+struct Cancellation
+{
+  std::atomic_bool requested{ false };
+  std::mutex mutex;
+  bool cancel_on_accept{ false };
+  rclcpp_action::ClientGoalHandle<MoveGroup>::SharedPtr goal;
+};
+
 // The action client, on a node and executor of its own: waiting for an answer never needs
 // move_group's executor, which is busy calling the planner.
 class Client
@@ -59,13 +68,22 @@ public:
 
   // The shared deadline includes waiting for another context and applying its settings.
   MoveGroup::Result plan(const MoveGroup::Goal& goal, const Parameters& parameters,
-                        Clock::time_point deadline)
+                        Clock::time_point deadline, const std::shared_ptr<Cancellation>& cancellation)
   {
     // Applying a configuration and planning with it must not interleave with another context.
     std::unique_lock<std::timed_mutex> planning_lock(planning_mutex_, std::defer_lock);
-    if (!planning_lock.try_lock_until(deadline))
-      return failure(MoveItErrorCodes::TIMED_OUT, "planning client is busy");
+    while (!cancellation->requested)
+    {
+      if (planning_lock.try_lock_until(std::min(deadline, Clock::now() + std::chrono::milliseconds(10))))
+        break;
+      if (Clock::now() >= deadline)
+        return failure(MoveItErrorCodes::TIMED_OUT, "planning client is busy");
+    }
+    if (cancellation->requested)
+      return failure(MoveItErrorCodes::PREEMPTED, "planning cancelled");
     const auto configure_error = configure(goal.request, parameters, deadline);
+    if (cancellation->requested)
+      return failure(MoveItErrorCodes::PREEMPTED, "planning cancelled");
     if (!configure_error.empty())
       return failure(Clock::now() >= deadline ? MoveItErrorCodes::TIMED_OUT :
                                                MoveItErrorCodes::INVALID_MOTION_PLAN, configure_error);
@@ -77,21 +95,34 @@ public:
     configured.request.allowed_planning_time = std::chrono::duration<double>(deadline - Clock::now()).count();
     if (configured.request.allowed_planning_time <= 0.0)
       return failure(MoveItErrorCodes::TIMED_OUT, "planning time exhausted before sending request");
-    auto sent = client_->async_send_goal(configured);
+    rclcpp_action::Client<MoveGroup>::SendGoalOptions options;
+    options.goal_response_callback =
+        [client = std::weak_ptr<rclcpp_action::Client<MoveGroup>>(client_), cancellation](auto handle) {
+          std::lock_guard<std::mutex> lock(cancellation->mutex);
+          cancellation->goal = handle;
+          // Acceptance may arrive after terminate() or even after this plan timed out.
+          if (handle && cancellation->cancel_on_accept)
+            if (auto active = client.lock())
+              active->async_cancel_goal(handle);
+        };
+    std::unique_lock<std::mutex> cancellation_lock(cancellation->mutex);
+    if (cancellation->requested)
+      return failure(MoveItErrorCodes::PREEMPTED, "planning cancelled");
+    auto sent = client_->async_send_goal(configured, options);
+    cancellation_lock.unlock();
     if (sent.wait_until(deadline) != std::future_status::ready)
+    {
+      cancel(cancellation);
       return failure(MoveItErrorCodes::TIMED_OUT, "batchplan_planner did not take the request in time");
+    }
     auto handle = sent.get();
     if (!handle)
       return failure(MoveItErrorCodes::FAILURE, "batchplan_planner refused the request");
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      current_ = handle;
-    }
     auto answer = client_->async_get_result(handle);
     const bool answered = answer.wait_until(deadline + std::chrono::milliseconds(500)) == std::future_status::ready;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      current_.reset();
+      std::lock_guard<std::mutex> lock(cancellation->mutex);
+      cancellation->goal.reset();
     }
     if (!answered)
     {
@@ -104,11 +135,12 @@ public:
     return *wrapped.result;
   }
 
-  void cancel()
+  void cancel(const std::shared_ptr<Cancellation>& cancellation)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (current_)
-      client_->async_cancel_goal(current_);
+    std::lock_guard<std::mutex> lock(cancellation->mutex);
+    cancellation->cancel_on_accept = true;
+    if (cancellation->goal)
+      client_->async_cancel_goal(cancellation->goal);
   }
 
   std::optional<Parameters> parameters(const std::string& group, const std::string& planner,
@@ -215,9 +247,7 @@ private:
   rclcpp::Client<SetPlannerParams>::SharedPtr set_params_;
   rclcpp::executors::SingleThreadedExecutor executor_;
   std::thread spinner_;
-  std::mutex mutex_;
   std::timed_mutex planning_mutex_;
-  rclcpp_action::ClientGoalHandle<MoveGroup>::SharedPtr current_;
 };
 
 class BatchplanPlanningContext : public planning_interface::PlanningContext
@@ -233,6 +263,13 @@ public:
   void solve(planning_interface::MotionPlanResponse& res) override
   {
     res.trajectory.reset();
+    std::shared_ptr<Cancellation> cancellation;
+    {
+      std::lock_guard<std::mutex> lock(cancellation_mutex_);
+      if (!cancellation_->requested)
+        cancellation_ = std::make_shared<Cancellation>();
+      cancellation = cancellation_;
+    }
     const auto begun = std::chrono::steady_clock::now();
     const auto& request = getMotionPlanRequest();
     MoveGroup::Goal goal;
@@ -247,9 +284,9 @@ public:
     const double seconds = request.allowed_planning_time;
     res.planner_id = "batchplan";
     moveit::core::robotStateToRobotStateMsg(start, res.start_state);
-    res.error_code.val = MoveItErrorCodes::TIMED_OUT;
+    res.error_code.val = MoveItErrorCodes::PREEMPTED;
     res.error_code.source = "batchplan_moveit";
-    res.error_code.message = "planning time exhausted";
+    res.error_code.message = "planning cancelled";
     if (!std::isfinite(seconds) || seconds <= 0.0 ||
         seconds > std::chrono::duration<double>(Clock::duration::max() - begun.time_since_epoch()).count() - 1.0)
     {
@@ -258,13 +295,23 @@ public:
       return;
     }
     const auto deadline = begun + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
-    const auto result = client_->plan(goal, parameters_, deadline);
-    res.error_code = result.error_code;
-    if (result.error_code.val == MoveItErrorCodes::SUCCESS)
+    if (!cancellation->requested)
     {
-      auto trajectory = std::make_shared<robot_trajectory::RobotTrajectory>(model_, getGroupName());
-      trajectory->setRobotTrajectoryMsg(start, result.planned_trajectory);
-      res.trajectory = trajectory;
+      // The backend owns native search attempts; MoveIt's response adapter owns final validation.
+      const auto result = client_->plan(goal, parameters_, deadline, cancellation);
+      res.error_code = result.error_code;
+      if (result.error_code.val == MoveItErrorCodes::SUCCESS)
+      {
+        auto trajectory = std::make_shared<robot_trajectory::RobotTrajectory>(model_, getGroupName());
+        trajectory->setRobotTrajectoryMsg(start, result.planned_trajectory);
+        res.trajectory = trajectory;
+      }
+    }
+    if (cancellation->requested)
+    {
+      res.trajectory.reset();
+      res.error_code.val = MoveItErrorCodes::PREEMPTED;
+      res.error_code.message = "planning cancelled";
     }
     res.planning_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - begun).count();
   }
@@ -285,18 +332,24 @@ public:
 
   bool terminate() override
   {
-    client_->cancel();
+    std::lock_guard<std::mutex> lock(cancellation_mutex_);
+    cancellation_->requested = true;
+    client_->cancel(cancellation_);
     return true;
   }
 
   void clear() override
   {
+    std::lock_guard<std::mutex> lock(cancellation_mutex_);
+    cancellation_ = std::make_shared<Cancellation>();
   }
 
 private:
   moveit::core::RobotModelConstPtr model_;
   std::shared_ptr<Client> client_;
   Parameters parameters_;
+  std::mutex cancellation_mutex_;
+  std::shared_ptr<Cancellation> cancellation_ = std::make_shared<Cancellation>();
 };
 
 class BatchplanPlannerManager : public planning_interface::PlannerManager

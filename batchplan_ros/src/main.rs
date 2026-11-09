@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::collections::BTreeMap;
+use std::future::{Future, pending};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -14,8 +15,9 @@ use std::time::Instant;
 use anyhow::{Context as _, Result};
 use batchplan_ros::{DeviceKind, Planner, PlannerOptions, SearchOptions};
 use rclrs::{
-    ActionClient, ActionServer, Context, CreateBasicExecutor, GoalStatusCode, IntoPrimitiveOptions,
-    Node, RclrsError, RclrsErrorFilter, RequestedGoal, Service, SpinOptions, log_error, log_info,
+    ActionClient, ActionServer, CancelResponseCode, Context, CreateBasicExecutor, GoalClient,
+    GoalStatusCode, IntoPrimitiveOptions, Node, RclrsError, RclrsErrorFilter, RequestedGoal,
+    RequestedGoalClient, Service, SpinOptions, log_error, log_info,
 };
 use ros_env::control_msgs::action::{FollowJointTrajectory, FollowJointTrajectory_Goal};
 use ros_env::moveit_msgs::action::{
@@ -305,7 +307,16 @@ fn serve(
                             current.as_ref(),
                         )
                     });
-                    let Some(answer) = planned.await else {
+                    let Some(answer) = cancellable(
+                        planned, goal.unless_cancel_requested(pending::<()>()),
+                    ).await else {
+                        log_info!(node.logger(), "goal {}: planning cancelled", &id[..8]);
+                        return goal.begin_cancelling().cancelled_with(MoveGroup_Result {
+                            error_code: error(MoveItErrorCodes::PREEMPTED, "planning cancelled"),
+                            ..Default::default()
+                        });
+                    };
+                    let Some(answer) = answer else {
                         let error_code = error(
                             MoveItErrorCodes::CRASH,
                             "planning stopped without an answer",
@@ -328,13 +339,26 @@ fn serve(
                         goal.publish_feedback(MoveGroup_Feedback {
                             state: "MONITOR".into(),
                         });
-                        match execute(controller.as_ref(), &result.planned_trajectory).await {
-                            Ok(()) => {
+                        let mut execution = Execution::default();
+                        match cancellable(
+                            execution.run(controller.as_ref(), &result.planned_trajectory),
+                            goal.unless_cancel_requested(pending::<()>()),
+                        ).await {
+                            Some(Ok(())) => {
                                 result.executed_trajectory = result.planned_trajectory.clone()
                             }
-                            Err(message) => {
+                            Some(Err(message)) => {
                                 result.error_code =
                                     error(MoveItErrorCodes::CONTROL_FAILED, &message)
+                            }
+                            None => {
+                                let goal = goal.begin_cancelling();
+                                result.error_code = execution.cancel(&node).await;
+                                return if result.error_code.val == MoveItErrorCodes::PREEMPTED {
+                                    goal.cancelled_with(result)
+                                } else {
+                                    goal.aborted_with(result)
+                                };
                             }
                         }
                     }
@@ -392,7 +416,18 @@ fn serve(
                             current.as_ref(),
                         )
                     });
-                    let Some(mut response) = planned.await else {
+                    let Some(response) = cancellable(
+                        planned, goal.unless_cancel_requested(pending::<()>()),
+                    ).await else {
+                        log_info!(node.logger(), "goal {}: planning cancelled", &id[..8]);
+                        return goal.begin_cancelling().cancelled_with(MoveGroupSequence_Result {
+                            response: MotionSequenceResponse {
+                                error_code: error(MoveItErrorCodes::PREEMPTED, "planning cancelled"),
+                                ..Default::default()
+                            },
+                        });
+                    };
+                    let Some(mut response) = response else {
                         let error_code = error(
                             MoveItErrorCodes::CRASH,
                             "planning stopped without an answer",
@@ -410,10 +445,27 @@ fn serve(
                             state: "MONITOR".into(),
                         });
                         for trajectory in &response.planned_trajectories {
-                            if let Err(message) = execute(controller.as_ref(), trajectory).await {
-                                response.error_code =
-                                    error(MoveItErrorCodes::CONTROL_FAILED, &message);
-                                break;
+                            let mut execution = Execution::default();
+                            match cancellable(
+                                execution.run(controller.as_ref(), trajectory),
+                                goal.unless_cancel_requested(pending::<()>()),
+                            ).await {
+                                Some(Ok(())) => {}
+                                Some(Err(message)) => {
+                                    response.error_code =
+                                        error(MoveItErrorCodes::CONTROL_FAILED, &message);
+                                    break;
+                                }
+                                None => {
+                                    let goal = goal.begin_cancelling();
+                                    response.error_code = execution.cancel(&node).await;
+                                    let result = MoveGroupSequence_Result { response };
+                                    return if result.response.error_code.val == MoveItErrorCodes::PREEMPTED {
+                                        goal.cancelled_with(result)
+                                    } else {
+                                        goal.aborted_with(result)
+                                    };
+                                }
                             }
                         }
                     }
@@ -484,27 +536,79 @@ async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
     rx.await.ok()
 }
 
-async fn execute(
-    controller: Option<&ActionClient<FollowJointTrajectory>>,
-    trajectory: &RobotTrajectory,
-) -> Result<(), String> {
-    let controller = controller.ok_or("set controller_action to execute; the node only plans")?;
-    let goal = FollowJointTrajectory_Goal {
-        trajectory: trajectory.joint_trajectory.clone(),
-        ..Default::default()
-    };
-    let accepted = controller
-        .request_goal(goal)
-        .await
-        .ok_or("the controller rejected the trajectory")?;
-    let (status, result) = accepted.result.await;
-    if status == GoalStatusCode::Succeeded && result.error_code == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "the controller ended with {status:?}: {}",
-            result.error_string
-        ))
+// Poll cancellation first so already-ready work cannot dispatch a trajectory after cancellation.
+async fn cancellable<T>(work: impl Future<Output = T>, cancellation: impl Future) -> Option<T> {
+    match futures::future::select(Box::pin(cancellation), Box::pin(work)).await {
+        futures::future::Either::Left(_) => None,
+        futures::future::Either::Right((result, _)) => Some(result),
+    }
+}
+
+#[derive(Default)]
+struct Execution {
+    pending: Option<RequestedGoalClient<FollowJointTrajectory>>,
+    active: Option<GoalClient<FollowJointTrajectory>>,
+}
+
+impl Execution {
+    async fn run(
+        &mut self,
+        controller: Option<&ActionClient<FollowJointTrajectory>>,
+        trajectory: &RobotTrajectory,
+    ) -> Result<(), String> {
+        let controller = controller.ok_or("set controller_action to execute; the node only plans")?;
+        let goal = FollowJointTrajectory_Goal {
+            trajectory: trajectory.joint_trajectory.clone(),
+            ..Default::default()
+        };
+        let requested = controller.try_request_goal(goal).map_err(|e| e.to_string())?;
+        self.active = self.pending.insert(requested).await;
+        self.pending = None;
+        let accepted = self.active.as_mut().ok_or("the controller rejected the trajectory")?;
+        let (status, result) = (&mut accepted.result).await;
+        self.active = None;
+        if status == GoalStatusCode::Succeeded && result.error_code == 0 {
+            Ok(())
+        } else {
+            Err(format!("the controller ended with {status:?}: {}", result.error_string))
+        }
+    }
+
+    async fn cancel(&mut self, node: &Node) -> MoveItErrorCodes {
+        match self.stop().await {
+            Ok(message) => {
+                log_info!(node.logger(), "{message}");
+                error(MoveItErrorCodes::PREEMPTED, message)
+            }
+            Err(message) => {
+                log_error!(node.logger(), "cannot confirm controller stop: {message}");
+                error(MoveItErrorCodes::CONTROL_FAILED, &message)
+            }
+        }
+    }
+
+    async fn stop(&mut self) -> Result<&'static str, String> {
+        // Do not drop an in-flight request: it may still be accepted and start moving.
+        if let Some(requested) = self.pending.take() {
+            self.active = requested.await;
+        }
+        let Some(active) = self.active.take() else {
+            return Ok("goal cancelled; no controller goal is active");
+        };
+        let response = active.cancellation.try_cancel().map_err(|e| e.to_string())?.await;
+        // Some servers return Accept with an empty goals_canceling list when their callback rejects.
+        if response.code != CancelResponseCode::GoalTerminated
+            && (response.code != CancelResponseCode::Accept || response.stamp.is_none())
+        {
+            return Err(format!("controller did not accept cancellation: {:?}", response.code));
+        }
+        let (status, result) = active.result.await;
+        match status {
+            GoalStatusCode::Cancelled => Ok("goal cancelled; controller stopped"),
+            GoalStatusCode::Succeeded if result.error_code == 0 =>
+                Ok("goal cancelled after the controller had already completed"),
+            _ => Err(format!("the controller ended with {status:?}: {}", result.error_string)),
+        }
     }
 }
 
