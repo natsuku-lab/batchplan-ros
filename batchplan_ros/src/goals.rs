@@ -1,7 +1,7 @@
 //! MoveIt goal constraints as joint goals or poses for IK.
 
 use batchplan::glam::Vec3;
-use batchplan::{Pose, Robot};
+use batchplan::{IkOptions, Pose, Robot};
 use ros_env::moveit_msgs::msg::{Constraints, MoveItErrorCodes as Code};
 use ros_env::shape_msgs::msg::SolidPrimitive;
 
@@ -19,10 +19,6 @@ pub enum Goal {
     },
 }
 
-/// The tightest tolerances batchplan's IK reaches by default.
-const POSITION_TOLERANCE: f32 = 1e-3;
-const ROTATION_TOLERANCE: f32 = 1e-2;
-
 /// Each goal constraint as a goal. `group` lists the joints that move; a joint goal must give each
 /// of them, and may name others only at their start values. `hands` are the IK frames' names.
 pub fn goals(
@@ -32,6 +28,7 @@ pub fn goals(
     start: &[f32],
     hands: &[String],
     frames: &Frames,
+    ik: &IkOptions,
 ) -> Result<Vec<Goal>, Refusal> {
     let refuse = |message: String| Refusal::new(Code::INVALID_GOAL_CONSTRAINTS, message);
     if constraints.is_empty() {
@@ -47,7 +44,7 @@ pub fn goals(
             let pose_parts = c.position_constraints.len() + c.orientation_constraints.len();
             match (joints, pose_parts) {
                 (true, 0) => joint_goal(c, robot, group, start).map_err(refuse),
-                (false, 1..) => pose_goal(c, hands, frames).map_err(refuse),
+                (false, 1..) => pose_goal(c, hands, frames, ik).map_err(refuse),
                 _ => Err(refuse(
                     "each goal must be joint constraints, or a position and an orientation constraint for each link it places".into(),
                 )),
@@ -91,14 +88,19 @@ fn joint_goal(
 
 /// A goal placing each link a position and an orientation constraint name, at most one of each
 /// per link, as one IK problem.
-fn pose_goal(c: &Constraints, hands: &[String], frames: &Frames) -> Result<Goal, String> {
+fn pose_goal(
+    c: &Constraints,
+    hands: &[String],
+    frames: &Frames,
+    ik: &IkOptions,
+) -> Result<Goal, String> {
     if c.position_constraints.len() != c.orientation_constraints.len() {
         return Err(
             "a pose goal needs a position and an orientation constraint for each link".into(),
         );
     }
     let (mut targets, mut position_tolerance, mut rotation_tolerance) =
-        (vec![], POSITION_TOLERANCE, ROTATION_TOLERANCE);
+        (vec![], ik.position_tolerance, ik.rotation_tolerance);
     for p in &c.position_constraints {
         let mut matching = c
             .orientation_constraints
@@ -134,7 +136,7 @@ fn pose_goal(c: &Constraints, hands: &[String], frames: &Frames) -> Result<Goal,
         let size = match (shape.type_, shape.dimensions.as_slice()) {
             (SolidPrimitive::SPHERE, [r]) => *r as f32,
             (SolidPrimitive::BOX, [x, y, z]) => (x.min(*y).min(*z) * 0.5) as f32,
-            _ => POSITION_TOLERANCE,
+            _ => ik.position_tolerance,
         };
         let frame = |name: &str| frames.pose_of(name).map_err(|r| r.message);
         let center = frame(&p.header.frame_id)?
@@ -149,9 +151,9 @@ fn pose_goal(c: &Constraints, hands: &[String], frames: &Frames) -> Result<Goal,
             .absolute_x_axis_tolerance
             .min(o.absolute_y_axis_tolerance)
             .min(o.absolute_z_axis_tolerance) as f32;
-        position_tolerance = position_tolerance.min(size.clamp(1e-5, POSITION_TOLERANCE));
+        position_tolerance = position_tolerance.min(size.max(1e-5).min(ik.position_tolerance));
         if angle > 0.0 {
-            rotation_tolerance = rotation_tolerance.min(angle.clamp(1e-4, ROTATION_TOLERANCE));
+            rotation_tolerance = rotation_tolerance.min(angle.max(1e-4).min(ik.rotation_tolerance));
         }
         targets.push((hand, Pose { position, rotation }));
     }

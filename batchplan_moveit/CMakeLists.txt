@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(batchplan_moveit LANGUAGES CXX)
+project(batchplan_moveit LANGUAGES C CXX)
 
 find_package(ament_cmake REQUIRED)
 find_package(moveit_core REQUIRED)

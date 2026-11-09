@@ -1,18 +1,19 @@
 //! MoveIt planning requests, each against the scene it carries.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::hash::Hasher;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use batchplan::{
     CollisionModel, CollisionWeights, Contact, Device, HandConstraint, HandSpeed, IkOptions,
-    IkProblem, JoinOptions, JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem,
-    PlanResult, Robot, RobotOptions, SdfOptions, Sequence, SphereOptions, ToolPath,
-    ToolPathOptions, ToolPathStop, Trajectory, World, Worlds, solve_ik,
+    IkProblem, JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem, PlanResult,
+    Robot, RobotOptions, SdfOptions, Sequence, SphereOptions, ToolPath, ToolPathOptions,
+    ToolPathStop, Trajectory, World, Worlds, solve_ik,
 };
 use ros_env::moveit_msgs::msg::{
     AttachedCollisionObject, MotionPlanRequest, MotionSequenceRequest, MotionSequenceResponse,
@@ -24,7 +25,10 @@ use ros_env::sensor_msgs::msg::JointState;
 use crate::goals::{self, Goal};
 use crate::scene::{self, Fnv, Frames, Grids};
 use crate::srdf::{Srdf, Tree};
-use crate::{Refusal, constraints, state, trajectory, workcell, world_geometry};
+use crate::{
+    PlannerSettings, Refusal, SearchOptions, constraints, state, trajectory, workcell,
+    world_geometry,
+};
 
 /// The batchplan release whose sphere fit the cache holds: spheres another one fitted are fitted
 /// again. Bump it with a release that changes the fit, as 0.9.0 and 0.10.0 did.
@@ -65,6 +69,8 @@ pub struct PlannerOptions {
     pub sphere_budget: usize,
     /// Spacing of returned waypoints, in seconds.
     pub trajectory_dt: f32,
+    /// IK, free-space and Cartesian search settings.
+    pub search: SearchOptions,
 }
 
 impl Default for PlannerOptions {
@@ -79,6 +85,7 @@ impl Default for PlannerOptions {
             robot_link_roots: vec![],
             world_sdf_voxel_size: SdfOptions::default().voxel,
             trajectory_dt: 0.02,
+            search: SearchOptions::default(),
         }
     }
 }
@@ -96,12 +103,6 @@ pub struct Answer {
     pub planning_time: f64,
 }
 
-/// IK solutions planned to per pose goal: the nearest distinct ones to the start.
-const SOLUTIONS_PER_POSE: usize = 4;
-/// Solutions nearer than this (radians, joint space) to a kept one are the same solution.
-const DISTINCT: f32 = 0.05;
-/// Planning time when a request allows none.
-const DEFAULT_BUDGET: f64 = 5.0;
 /// Positions this close outside a limit are moved onto it.
 const LIMIT_TOLERANCE: f32 = 1e-3;
 /// The first round's time slice for constrained goals, as a fraction of the request's budget.
@@ -120,6 +121,8 @@ struct Setting<'a> {
     worlds: &'a Worlds,
     states: [&'a RobotState; 2],
     scene: &'a PlanningScene,
+    search: &'a SearchOptions,
+    dt: f32,
 }
 
 /// One planned motion: the joints it moves, its path (B-spline control points, empty for one that
@@ -159,6 +162,8 @@ pub struct Planner {
     hands: Vec<String>,
     grids: Grids,
     dt: f32,
+    search: SearchOptions,
+    configurations: RwLock<HashMap<(String, String), PlannerSettings>>,
     world_links: Vec<scene::WorldLink>,
     world_markers: Vec<ros_env::visualization_msgs::msg::Marker>,
     world_exemptions: Vec<(String, String)>,
@@ -200,6 +205,7 @@ impl Planner {
             &[ros_env::visualization_msgs::msg::Marker],
         ) -> Result<()>,
     ) -> Result<Self> {
+        o.search.validate()?;
         anyhow::ensure!(
             o.trajectory_dt.is_finite() && o.trajectory_dt > 0.0,
             "trajectory_dt must be finite and positive"
@@ -327,6 +333,8 @@ impl Planner {
             hands,
             grids: Grids::new(SdfOptions::default()),
             dt: o.trajectory_dt,
+            search: o.search.clone(),
+            configurations: RwLock::new(HashMap::new()),
             world_links,
             world_markers,
             world_exemptions,
@@ -356,6 +364,71 @@ impl Planner {
     #[must_use]
     pub fn device_name(&self) -> String {
         self.device.name()
+    }
+
+    /// Settings are copied before planning; edits cannot change an in-flight motion.
+    pub fn planner_settings(&self, group: &str, planner: &str) -> Result<PlannerSettings> {
+        let planner = self.configuration_name(group, planner)?;
+        let configs = self
+            .configurations
+            .read()
+            .map_err(|_| anyhow::anyhow!("planner configuration lock poisoned"))?;
+        Ok(configs
+            .get(&(group.into(), planner.into()))
+            .or_else(|| configs.get(&(String::new(), planner.into())))
+            .cloned()
+            .unwrap_or_else(|| PlannerSettings {
+                search: self.search.clone(),
+                trajectory_dt: self.dt,
+            }))
+    }
+
+    /// Standard MoveIt configuration updates are validated atomically.
+    pub fn set_planner_parameters(
+        &self,
+        group: &str,
+        planner: &str,
+        values: &BTreeMap<String, String>,
+        replace: bool,
+    ) -> Result<()> {
+        let planner = self.configuration_name(group, planner)?;
+        let mut configs = self
+            .configurations
+            .write()
+            .map_err(|_| anyhow::anyhow!("planner configuration lock poisoned"))?;
+        let key = (group.into(), planner.into());
+        let defaults = PlannerSettings {
+            search: self.search.clone(),
+            trajectory_dt: self.dt,
+        };
+        let previous = if replace {
+            &defaults
+        } else {
+            configs
+                .get(&key)
+                .or_else(|| configs.get(&(String::new(), planner.into())))
+                .unwrap_or(&defaults)
+        };
+        let settings = previous.with_parameters(values)?;
+        configs.insert(key, settings);
+        Ok(())
+    }
+
+    fn configuration_name<'a>(&self, group: &str, planner: &'a str) -> Result<&'a str> {
+        if !group.is_empty() {
+            self.group(group)
+                .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+        }
+        let planner = if planner.is_empty() {
+            "batchplan"
+        } else {
+            planner
+        };
+        anyhow::ensure!(
+            matches!(planner, "batchplan" | STRAIGHT),
+            "unknown planner '{planner}'"
+        );
+        Ok(planner)
     }
 
     /// Plans `request` in `scene`, whose objects augment the URDF world. The start is
@@ -466,6 +539,13 @@ impl Planner {
                 )));
             }
         }
+        let settings = items
+            .iter()
+            .map(|(request, _)| {
+                self.planner_settings(&request.group_name, &request.planner_id)
+                    .map_err(|e| invalid(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let start = self.start(&first.start_state, scene, current)?;
         let states = [&scene.robot_state, &first.start_state];
         let frames = Frames::new(
@@ -509,17 +589,19 @@ impl Planner {
                 format!("the start collides: {}{more}", described(nearest, &ids)),
             ));
         }
-        let setting = Setting {
-            robot,
-            device,
-            meshes,
-            world: &world,
-            worlds: &worlds,
-            states,
-            scene,
-        };
         let mut motions: Vec<Motion> = Vec::with_capacity(items.len());
         for (k, (&(request, _), group)) in items.iter().zip(groups).enumerate() {
+            let setting = Setting {
+                robot,
+                device,
+                meshes,
+                world: &world,
+                worlds: &worlds,
+                states,
+                scene,
+                search: &settings[k].search,
+                dt: settings[k].trajectory_dt,
+            };
             let from = motions.last().map_or(&start[..], |m| m.end());
             // The first item's budget counts from the request, the others' from their own start.
             let begun = if k == 0 { begun } else { Instant::now() };
@@ -564,8 +646,14 @@ impl Planner {
         let joined = if sequences.is_empty() {
             None
         } else {
-            let o = JoinOptions::default();
-            Some(batchplan::join(device, &worlds, &sequences, &o).map_err(crash)?)
+            // A shared blend batch must meet the finest resolution requested by any item.
+            let join = batchplan::JoinOptions {
+                resolution: settings
+                    .iter()
+                    .map(|s| s.search.join.resolution)
+                    .fold(f32::INFINITY, f32::min),
+            };
+            Some(batchplan::join(device, &worlds, &sequences, &join).map_err(crash)?)
         };
         let mut joined = joined.iter().flat_map(|j| j.paths.iter().zip(&j.blends));
 
@@ -601,7 +689,10 @@ impl Planner {
                         &stretch[..n],
                         first.speed,
                         first.cap,
-                        self.dt,
+                        settings[chain.clone()]
+                            .iter()
+                            .map(|s| s.trajectory_dt)
+                            .fold(f32::INFINITY, f32::min),
                     )?;
                     if clear_on_meshes(meshes, &world, &sampled)? {
                         pieces.push((&first.group, sampled));
@@ -663,10 +754,56 @@ impl Planner {
         start: &[f32],
         begun: Instant,
     ) -> Result<Motion, Refusal> {
+        if !request.allowed_planning_time.is_finite()
+            || Duration::try_from_secs_f64(request.allowed_planning_time.max(0.0)).is_err()
+        {
+            return Err(Refusal::new(
+                Code::INVALID_MOTION_PLAN,
+                "allowed_planning_time must be finite and representable as a duration",
+            ));
+        }
         let seconds = if request.allowed_planning_time > 0.0 {
             request.allowed_planning_time
         } else {
-            DEFAULT_BUDGET
+            s.search.default_planning_time
+        };
+        let mut last = Refusal::new(Code::TIMED_OUT, "planning time exhausted");
+        for attempt in 0..request.num_planning_attempts.max(1) {
+            if begun.elapsed().as_secs_f64() >= seconds {
+                break;
+            }
+            match self.motion_attempt(s, request, group.clone(), start, begun, attempt as u64) {
+                Ok(motion) => return Ok(motion),
+                Err(r)
+                    if matches!(
+                        r.code,
+                        Code::PLANNING_FAILED | Code::NO_IK_SOLUTION | Code::TIMED_OUT
+                    ) =>
+                {
+                    last = r;
+                }
+                Err(r) => return Err(r),
+            }
+            if request.planner_id == STRAIGHT {
+                break;
+            }
+        }
+        Err(last)
+    }
+
+    fn motion_attempt(
+        &self,
+        s: &Setting,
+        request: &MotionPlanRequest,
+        group: Vec<usize>,
+        start: &[f32],
+        begun: Instant,
+        attempt: u64,
+    ) -> Result<Motion, Refusal> {
+        let seconds = if request.allowed_planning_time > 0.0 {
+            request.allowed_planning_time
+        } else {
+            s.search.default_planning_time
         };
         let budget = Duration::from_secs_f64(seconds);
         let frames = Frames::new(
@@ -685,6 +822,7 @@ impl Planner {
             start,
             &self.hands,
             &frames,
+            &s.search.ik,
         )?;
         let constraints = constraints::path(&request.path_constraints, &self.hands, &frames)?;
         if let Some(why) = breach(robot, &constraints, start)? {
@@ -730,9 +868,8 @@ impl Planner {
                 hand,
                 waypoints: vec![pose],
             };
-            let mut result =
-                batchplan::follow(s.device, s.worlds, &[path], &ToolPathOptions::default())
-                    .map_err(crash)?;
+            let mut result = batchplan::follow(s.device, s.worlds, &[path], &s.search.cartesian)
+                .map_err(crash)?;
             if let Some(why) = result.stopped[0] {
                 return Err(Refusal::new(
                     Code::PLANNING_FAILED,
@@ -744,7 +881,7 @@ impl Planner {
                 ));
             }
             let path = result.paths.swap_remove(0);
-            let sampled = timed(robot, &path, start, speed, cap, self.dt)?;
+            let sampled = timed(robot, &path, start, speed, cap, s.dt)?;
             if !clear_on_meshes(s.meshes, s.world, &sampled)? {
                 return Err(Refusal::new(
                     Code::PLANNING_FAILED,
@@ -753,7 +890,8 @@ impl Planner {
             }
             return Ok(motion(path, sampled));
         }
-        let candidates = candidates(&goals, robot, s.device, s.worlds, start, &group)?;
+        let search = s.search.for_attempt(attempt);
+        let candidates = candidates(&goals, robot, s.device, s.worlds, start, &group, &search)?;
         let mut candidates_kept = Vec::with_capacity(candidates.len());
         for goal in candidates {
             if breach(robot, &constraints, &goal)?.is_none() {
@@ -805,7 +943,7 @@ impl Planner {
                 };
                 let mut options = PlanOptions {
                     time_budget: Some(given),
-                    ..Default::default()
+                    ..search.planning
                 };
                 options.rrt.clearance *= widen;
                 options.shortcut.clearance *= widen;
@@ -817,7 +955,7 @@ impl Planner {
                 found |= !solved.is_empty();
                 solved.sort_by(|a, b| a.0.total_cmp(&b.0));
                 for (_, path) in solved {
-                    let sampled = timed(robot, path, start, speed, cap, self.dt)?;
+                    let sampled = timed(robot, path, start, speed, cap, s.dt)?;
                     if clear_on_meshes(s.meshes, s.world, &sampled)? {
                         return Ok(motion(path.to_vec(), sampled));
                     }
@@ -984,6 +1122,9 @@ impl Planner {
         request: &GetCartesianPath_Request,
         current: Option<&JointState>,
     ) -> Result<(RobotState, RobotTrajectory, f64), Refusal> {
+        let settings = self
+            .planner_settings(&request.group_name, "batchplan")
+            .map_err(|e| Refusal::new(Code::INVALID_MOTION_PLAN, e.to_string()))?;
         let constraints = &request.path_constraints;
         if !(constraints.joint_constraints.is_empty()
             && constraints.position_constraints.is_empty()
@@ -1033,9 +1174,9 @@ impl Planner {
             step: if request.max_step > 0.0 {
                 request.max_step as f32
             } else {
-                ToolPathOptions::default().step
+                settings.search.cartesian.step
             },
-            ..Default::default()
+            ..settings.search.cartesian
         };
         let path = ToolPath {
             world: 0,
@@ -1059,7 +1200,14 @@ impl Planner {
             &request.cartesian_speed_limited_link,
             request.max_cartesian_speed,
         )?;
-        let sampled = timed(robot, &result.paths[0], &start, speed, cap, self.dt)?;
+        let sampled = timed(
+            robot,
+            &result.paths[0],
+            &start,
+            speed,
+            cap,
+            settings.trajectory_dt,
+        )?;
         let start_state = RobotState {
             joint_state: state::joint_state(robot, &start),
             ..Default::default()
@@ -1076,10 +1224,13 @@ impl Planner {
         request: &PositionIKRequest,
         current: Option<&JointState>,
     ) -> Result<Vec<f32>, Refusal> {
+        let settings = self
+            .planner_settings(&request.group_name, "batchplan")
+            .map_err(|e| Refusal::new(Code::INVALID_MOTION_PLAN, e.to_string()))?;
         let seed = self.start(&request.robot_state, &PlanningScene::default(), current)?;
         let hand = self.hand(&request.ik_link_name)?;
-        let group = self.group(&request.group_name)?;
         let scene = PlanningScene::default();
+        let group = self.group(&request.group_name)?;
         let frames = Frames::new(
             &self.robot,
             &seed,
@@ -1110,7 +1261,7 @@ impl Planner {
             hold: outside(&self.robot, &group),
         };
         let result =
-            solve_ik(&self.device, &worlds, &[problem], &IkOptions::default()).map_err(crash)?;
+            solve_ik(&self.device, &worlds, &[problem], &settings.search.ik).map_err(crash)?;
         result
             .nearest(0, &seed)
             .map(<[f32]>::to_vec)
@@ -1141,6 +1292,7 @@ fn candidates(
     worlds: &Worlds,
     start: &[f32],
     group: &[usize],
+    search: &SearchOptions,
 ) -> Result<Vec<Vec<f32>>, Refusal> {
     let mut out = vec![];
     let mut joint_goals = vec![];
@@ -1181,7 +1333,7 @@ fn candidates(
         let options = IkOptions {
             position_tolerance,
             rotation_tolerance,
-            ..Default::default()
+            ..search.ik
         };
         let hold = outside(robot, group);
         let problems: Vec<IkProblem> = poses
@@ -1209,7 +1361,10 @@ fn candidates(
             solutions.sort_by(|a, b| distance(a, start).total_cmp(&distance(b, start)));
             let mut kept: Vec<&[f32]> = vec![];
             for q in solutions {
-                if kept.len() < SOLUTIONS_PER_POSE && kept.iter().all(|k| distance(k, q) > DISTINCT)
+                if kept.len() < search.solutions_per_pose
+                    && kept
+                        .iter()
+                        .all(|k| distance(k, q) > search.solution_distance)
                 {
                     kept.push(q);
                 }
@@ -1318,7 +1473,6 @@ fn timed(
     Ok(sampled)
 }
 
-/// `[world, self]` sphere clearances of each configuration in `q` (`[n, dof]`).
 /// A contact in words, naming the scene object an obstacle comes from (`ids`, per obstacle).
 fn described(contact: &Contact, ids: &[String]) -> String {
     match contact {
@@ -1341,6 +1495,7 @@ fn described(contact: &Contact, ids: &[String]) -> String {
     }
 }
 
+/// `[world, self]` sphere clearances of each configuration in `q` (`[n, dof]`).
 fn clearances(device: &Device, worlds: &Worlds, q: &[f32]) -> Result<Vec<[f32; 2]>, Refusal> {
     let n = q.len() / device.robot().dof();
     let e = device

@@ -85,6 +85,81 @@ that cannot fit it, including cached models, are rejected rather than exceeding
 the cap. It is not a target sphere count; the native fitter may use coarser,
 more inflated spheres to meet the budget.
 
+### Search settings and MoveIt controls
+
+MoveIt's `allowed_planning_time` and `num_planning_attempts` are supported.
+Attempts share one overall time budget and stop at the first valid result.
+Each retry changes the IK, optimization and RRT seeds; zero attempts means one.
+`LIN` follows a fixed Cartesian line rather than retrying alternate paths.
+MoveIt velocity/acceleration scaling and Cartesian speed caps remain supported.
+The backend owns search attempts and varies their seeds on native search failure.
+MoveIt's `ValidateSolution` response adapter performs final validation with the
+actual planning scene. The plugin does not repeat this expensive scan inside the
+search time budget or rerun successful native searches on adapter rejection.
+Differences between collision models can still cause validation failures.
+
+The backend exposes every native `IkOptions`, `PlanOptions`, `RrtOptions`,
+`ShortcutOptions`, `ToolPathOptions` and `JoinOptions` search field. The `PlanOptions.time_budget` field is represented by
+the request's planning time, with `default_planning_time` (5 seconds) as fallback.
+In RViz, select the group and `batchplan` planner under **Context > Planning
+Library**: **Planner Parameters** exposes the 50 search/sampling settings for
+editing. Edits apply to subsequent plans for that group, not in-flight plans.
+They are uploaded to the backend when the next MoveIt planning request starts.
+They are session-only; save persistent defaults in YAML. Device, CPU threads,
+sphere fitting and world geometry remain startup settings, not planner controls.
+
+| ROS parameter prefix | Settings |
+|---|---|
+| `ik.*` | `seeds`, `iterations`, `damping`, `rotation_weight`, `max_step`, `collision_step`, `position_tolerance`, `rotation_tolerance`, `rng_seed` |
+| `ik.collision.*` | `world`, `self_collision`, `margin`, `self_margin` |
+| `planning.*` | `seeds`, `control_points`, `samples_per_span`, `iterations`, `history`, `initial_step`, `acceleration_weight`, `velocity_weight`, `validate_substeps`, `rng_seed` |
+| `planning.collision.*` | `world`, `self_collision`, `margin`, `self_margin` |
+| `planning.rrt.*` | `range`, `resolution`, `max_iterations`, `rng_seed`, `clearance`, `clearance_ramp` |
+| `planning.shortcut.*` | `resolution`, `passes`, `min_change`, `straighten`, `clearance`, `clearance_ramp` |
+| `cartesian.*` | `step`, `rotation_step`, `precision`, `rotation_precision`, `resolution`, `iterations` |
+| `join.*` | `resolution` |
+
+Other controls: `solutions_per_pose` (4), `solution_distance` (0.05 in joint space),
+`trajectory_dt` (**0.02 seconds**, 20 ms), `cpu_threads` (0 = all cores) and `device`
+(`cpu`/`gpu`). `ik.seeds` defaults to 32; `planning.seeds` defaults to 0 and enables
+additional trajectory-optimization candidates, not additional RRT attempts.
+Spatial collision resolutions are joint-space distances, not sampling times.
+Pose requests can tighten the configured IK tolerances. Cartesian requests'
+positive `max_step` overrides `cartesian.step`.
+
+Use `ros2 param list /batchplan_planner` and `ros2 param get /batchplan_planner ik.seeds`
+to inspect startup defaults. These ROS parameters remain read-only; the live
+planner configurations use MoveIt's `/get_planner_params` and `/set_planner_params`
+interfaces instead. Invalid edits fail planning explicitly and are logged by the
+backend. Standalone clients can use `~/get_planner_params` and `~/set_planner_params`
+on the backend; an empty planner name selects `batchplan`. Unknown groups and
+planner names are rejected rather than using defaults. Valid groups inherit
+global settings when no group-specific override exists. To pass persistent
+settings through the standalone launch:
+
+```yaml
+# search.yaml
+/**:
+  ros__parameters:
+    trajectory_dt: 0.02
+    ik.seeds: 64
+    solutions_per_pose: 8
+    planning.rrt.max_iterations: 20000
+```
+
+```bash
+ros2 launch batchplan_ros planner.launch.py parameters_file:=/absolute/path/search.yaml
+```
+
+The file overrides launch defaults. Through the workcell MoveIt launch, put these
+settings (nested or dotted) in `batchplan.backend_parameters` in its pipeline YAML;
+`default_planning_time` is the backend's fallback for requests without a time budget.
+The MoveIt plugin uses the request time supplied by MoveIt.
+Finer trajectory sampling is not a substitute for MoveIt's `ValidateSolution`.
+The backend must be ready within 60 seconds when MoveIt loads the plugin so the
+plugin can discover the actual configured defaults. Rebuild and restart both
+packages together when updating this interface.
+
 ### Robot subtrees and URDF world geometry
 
 Set the string-array parameter `robot_link_roots`, for example:

@@ -6,12 +6,13 @@
 //! (`moveit_msgs/srv/GetCartesianPath`) moves the hand in straight lines through waypoints.
 
 use std::path::PathBuf;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
-use batchplan_ros::{DeviceKind, Planner, PlannerOptions};
+use batchplan_ros::{DeviceKind, Planner, PlannerOptions, SearchOptions};
 use rclrs::{
     ActionClient, ActionServer, Context, CreateBasicExecutor, GoalStatusCode, IntoPrimitiveOptions,
     Node, RclrsError, RclrsErrorFilter, RequestedGoal, Service, SpinOptions, log_error, log_info,
@@ -25,6 +26,8 @@ use ros_env::moveit_msgs::msg::{MotionSequenceResponse, MoveItErrorCodes, RobotT
 use ros_env::moveit_msgs::srv::{
     GetCartesianPath, GetCartesianPath_Request, GetPositionIK, GetPositionIK_Request,
     GetPositionIK_Response,
+    GetPlannerParams, GetPlannerParams_Request, GetPlannerParams_Response,
+    SetPlannerParams, SetPlannerParams_Request, SetPlannerParams_Response,
 };
 use ros_env::sensor_msgs::msg::JointState;
 use ros_env::std_msgs;
@@ -35,13 +38,15 @@ fn main() -> Result<()> {
     let mut executor = context.create_basic_executor();
     let node = executor.create_node("batchplan_planner")?;
 
-    let text = |name: &str| -> Result<String> {
-        Ok(node
+    let mut text_parameters = vec![];
+    let mut text = |name: &str| -> Result<String> {
+        let parameter = node
             .declare_parameter::<Arc<str>>(name)
             .default("".into())
-            .mandatory()?
-            .get()
-            .to_string())
+            .read_only()?;
+        let value = parameter.get().to_string();
+        text_parameters.push(parameter);
+        Ok(value)
     };
     let urdf = text("robot_description")?;
     let srdf = Some(text("robot_description_semantic")?).filter(|s| !s.is_empty());
@@ -95,6 +100,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("reading {limits_file}"))?;
         batchplan_ros::parse_joint_limits(&yaml)?
     };
+    let search_parameters = SearchOptions::from_node(&node)?;
     let options = PlannerOptions {
         package_dirs: package_dirs(),
         joint_limits,
@@ -115,6 +121,7 @@ fn main() -> Result<()> {
         }),
         trajectory_dt: dt as f32,
         sphere_budget,
+        search: search_parameters.options,
     };
 
     let latest: Arc<Mutex<Option<JointState>>> = Arc::new(Mutex::new(None));
@@ -208,6 +215,8 @@ struct Serving {
     _sequence_move_group: ActionServer<MoveGroupSequence>,
     _compute_ik: Service<GetPositionIK>,
     _compute_cartesian_path: Service<GetCartesianPath>,
+    _get_planner_params: Service<GetPlannerParams>,
+    _set_planner_params: Service<SetPlannerParams>,
 }
 
 fn serve(
@@ -217,6 +226,54 @@ fn serve(
     latest: Arc<Mutex<Option<JointState>>>,
 ) -> Result<Serving, RclrsError> {
     let current = move || latest.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let get_planner_params = {
+        let (planner, node) = (Arc::clone(&planner), node.clone());
+        node.clone().create_service::<GetPlannerParams, _>(
+            "~/get_planner_params",
+            move |request: GetPlannerParams_Request| {
+                match planner.planner_settings(&request.group, &request.planner_config) {
+                    Ok(settings) => {
+                        let values = settings.parameters();
+                        GetPlannerParams_Response {
+                            params: ros_env::moveit_msgs::msg::PlannerParams {
+                                keys: values.keys().cloned().collect(),
+                                values: values.values().cloned().collect(),
+                                descriptions: vec![String::new(); values.len()],
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        log_error!(node.logger(), "cannot read planner settings: {e}");
+                        GetPlannerParams_Response::default()
+                    }
+                }
+            },
+        )?
+    };
+    let set_planner_params = {
+        let (planner, node) = (Arc::clone(&planner), node.clone());
+        node.clone().create_service::<SetPlannerParams, _>(
+            "~/set_planner_params",
+            move |request: SetPlannerParams_Request| {
+                let update = || -> Result<()> {
+                    anyhow::ensure!(
+                        request.params.keys.len() == request.params.values.len(),
+                        "planner parameter keys and values have different lengths"
+                    );
+                    let values: BTreeMap<_, _> = request.params.keys.iter().cloned()
+                        .zip(request.params.values.iter().cloned()).collect();
+                    anyhow::ensure!(values.len() == request.params.keys.len(), "duplicate planner parameter keys");
+                    planner.set_planner_parameters(
+                        &request.group, &request.planner_config, &values, request.replace,
+                    )
+                };
+                if let Err(e) = update() {
+                    log_error!(node.logger(), "planner settings rejected: {e}");
+                }
+                SetPlannerParams_Response::default()
+            },
+        )?
+    };
     let move_group = {
         let (planner, current, node, controller) = (
             Arc::clone(&planner),
@@ -412,6 +469,8 @@ fn serve(
         _sequence_move_group: sequence_move_group,
         _compute_ik: compute_ik,
         _compute_cartesian_path: compute_cartesian_path,
+        _get_planner_params: get_planner_params,
+        _set_planner_params: set_planner_params,
     })
 }
 

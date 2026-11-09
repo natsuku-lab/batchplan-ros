@@ -33,6 +33,12 @@ def generate_launch_description():
             description="YAML list of roots whose strict descendants use robot spheres; [] selects all",
         )
     )
+    declared.append(
+        DeclareLaunchArgument(
+            "parameters_file", default_value="",
+            description="Optional ROS parameter YAML file for all backend/search settings",
+        )
+    )
     return LaunchDescription(
         declared
         + [OpaqueFunction(function=_planner_node, args=[parameters])]
@@ -43,4 +49,8 @@ def _planner_node(context, parameters):
     parameters = dict(parameters)
     if LaunchConfiguration("robot_link_roots").perform(context).strip() not in ("", "[]"):
         parameters["robot_link_roots"] = ParameterValue(LaunchConfiguration("robot_link_roots"))
-    return [Node(package="batchplan_ros", executable="batchplan_planner", output="screen", parameters=[parameters])]
+    parameter_sources = [parameters]
+    parameters_file = LaunchConfiguration("parameters_file", default="").perform(context)
+    if parameters_file:
+        parameter_sources.append(parameters_file)
+    return [Node(package="batchplan_ros", executable="batchplan_planner", output="screen", parameters=parameter_sources)]
