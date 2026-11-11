@@ -431,6 +431,7 @@ impl Planner {
                 paths: motions[c.clone()].iter().map(|m| m.path.clone()).collect(),
                 blends: radii[c.start..c.end - 1].to_vec(),
                 constraints: motions[c.start].constraints.clone(),
+                holding: None,
             })
             .collect();
         let joined = if sequences.is_empty() {
