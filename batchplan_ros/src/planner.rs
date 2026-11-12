@@ -602,6 +602,7 @@ impl Planner {
                 start: start.to_vec(),
                 hand,
                 waypoints: vec![pose],
+                hold: vec![],
                 holding: None,
             };
             let mut result =
@@ -924,6 +925,7 @@ impl Planner {
             start: start.clone(),
             hand,
             waypoints,
+            hold: vec![],
             holding: None,
         };
         let worlds = device.upload(&[World::default()]).map_err(crash)?;
