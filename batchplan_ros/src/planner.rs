@@ -777,6 +777,7 @@ impl Planner {
             hand: self.hand(link)?,
             linear: speed as f32,
             angular: f32::INFINITY,
+            near: None,
         }))
     }
 
@@ -1172,7 +1173,7 @@ fn timed(
         linear: cap.linear / speed,
         ..cap
     };
-    let mut sampled = Trajectory::with_hand_speed(robot, path, &raised)
+    let mut sampled = Trajectory::with_hand_speed(robot, path, &[raised])
         .and_then(|t| t.sample(1.0 / (speed * dt)))
         .map_err(crash)?;
     sampled.dt = dt;
