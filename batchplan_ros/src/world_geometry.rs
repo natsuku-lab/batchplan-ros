@@ -87,7 +87,9 @@ fn load_mesh(path: &Path, scale: DVec3) -> Result<Vec<TriMesh>> {
     let collada = match path.extension().and_then(|s| s.to_str()) {
         Some("dae" | "DAE") => true,
         Some("obj" | "OBJ" | "stl" | "STL") => false,
-        _ => bytes[..bytes.len().min(1024)].windows(8).any(|s| s == b"<COLLADA"),
+        _ => bytes[..bytes.len().min(1024)]
+            .windows(8)
+            .any(|s| s == b"<COLLADA"),
     };
     if collada {
         let doc = Document::parse(std::str::from_utf8(&bytes)?)
@@ -100,7 +102,9 @@ fn load_mesh(path: &Path, scale: DVec3) -> Result<Vec<TriMesh>> {
                 path.display()
             );
             if node.has_tag_name("instance_geometry") {
-                let url = node.attribute("url").context("Collada instance_geometry lacks url")?;
+                let url = node
+                    .attribute("url")
+                    .context("Collada instance_geometry lacks url")?;
                 ensure!(
                     instances.insert(url),
                     "repeated Collada geometry instance '{url}' is unsupported for world collisions; bake scene instances into unique meshes: {}",
@@ -136,8 +140,112 @@ fn load_mesh(path: &Path, scale: DVec3) -> Result<Vec<TriMesh>> {
         .with_context(|| format!("building solid world mesh {}", path.display()))
 }
 
-fn solid_parts(vertices: Vec<DVec3>, triangles: Vec<[u32; 3]>) -> Result<Vec<TriMesh>> {
+// Intersect each edge with the other triangle, allowing only their shared simplex.
+// Clipping also covers coplanar overlap, including adjacent faces folded onto each other.
+fn faces_cross(mesh: &TriMesh, a: u32, b: u32) -> bool {
+    let ia = mesh.indices()[a as usize];
+    let ib = mesh.indices()[b as usize];
+    let pa = ia.map(|i| mesh.vertices()[i as usize]);
+    let pb = ib.map(|i| mesh.vertices()[i as usize]);
+    let shared: Vec<_> = ia
+        .iter()
+        .filter(|i| ib.contains(i))
+        .map(|&i| mesh.vertices()[i as usize])
+        .collect();
+    let scale = pa
+        .iter()
+        .chain(&pb)
+        .map(|p| p.distance(pa[0]))
+        .fold(0.0_f64, f64::max);
+    let epsilon = scale * 1e-10;
+    let allowed = |p: DVec3| match shared.as_slice() {
+        [] => false,
+        [v] => p.distance(*v) <= epsilon,
+        [v, w] => {
+            let edge = *w - *v;
+            let t = ((p - *v).dot(edge) / edge.length_squared()).clamp(0.0, 1.0);
+            p.distance(*v + t * edge) <= epsilon
+        }
+        _ => false,
+    };
+    for (edges, face) in [(pa, pb), (pb, pa)] {
+        let normal = (face[1] - face[0]).cross(face[2] - face[0]).normalize();
+        for k in 0..3 {
+            let start = edges[k];
+            let delta = edges[(k + 1) % 3] - start;
+            let d0 = normal.dot(start - face[0]);
+            let slope = normal.dot(delta);
+            let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+            if slope.abs() > epsilon {
+                lo = -d0 / slope;
+                hi = lo;
+                if !(0.0..=1.0).contains(&lo) {
+                    continue;
+                }
+            } else if d0.abs() > epsilon {
+                continue;
+            }
+            for j in 0..3 {
+                let inward = normal.cross(face[(j + 1) % 3] - face[j]).normalize();
+                let distance = inward.dot(start - face[j]);
+                let rate = inward.dot(delta);
+                if rate.abs() <= epsilon {
+                    if distance < -epsilon {
+                        hi = -1.0;
+                        break;
+                    }
+                } else if rate > 0.0 {
+                    lo = lo.max(-distance / rate);
+                } else {
+                    hi = hi.min(-distance / rate);
+                }
+            }
+            if lo <= hi + 1e-12
+                && hi >= 0.0
+                && lo <= 1.0
+                && (!allowed(start + delta * lo.clamp(0.0, 1.0))
+                    || !allowed(start + delta * hi.clamp(0.0, 1.0)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn solid_parts(vertices: Vec<DVec3>, triangles: Vec<[u32; 3]>) -> Result<Vec<TriMesh>> {
     ensure!(!triangles.is_empty(), "mesh has no triangles");
+    ensure!(
+        vertices.iter().all(|v| v.is_finite()),
+        "mesh contains non-finite vertices"
+    );
+    ensure!(
+        triangles
+            .iter()
+            .flatten()
+            .all(|&i| (i as usize) < vertices.len()),
+        "mesh contains out-of-range vertex indices"
+    );
+    // Planning-scene meshes, like STL files, may repeat vertices per face.
+    // Weld exact positions before interpreting adjacency and shared intersections.
+    let mut positions = HashMap::new();
+    let mut welded = vec![];
+    let remap: Vec<u32> = vertices
+        .into_iter()
+        .map(|p| {
+            let key = p.to_array().map(|v| if v == 0.0 { 0 } else { v.to_bits() });
+            *positions.entry(key).or_insert_with(|| {
+                let index = welded.len() as u32;
+                welded.push(p);
+                index
+            })
+        })
+        .collect();
+    let vertices = welded;
+    let triangles: Vec<_> = triangles
+        .into_iter()
+        .map(|f| f.map(|i| remap[i as usize]))
+        .collect();
     for &[a, b, c] in &triangles {
         ensure!(
             a != b && b != c && a != c,
@@ -154,6 +262,15 @@ fn solid_parts(vertices: Vec<DVec3>, triangles: Vec<[u32; 3]>) -> Result<Vec<Tri
         );
     }
     let mut mesh = TriMesh::new(vertices, triangles)?;
+    let mut crossing = false;
+    mesh.bvh()
+        .traverse_bvtt_single_tree::<false>(&mut Default::default(), &mut |a, b| {
+            crossing = crossing || faces_cross(&mesh, a, b);
+        });
+    ensure!(
+        !crossing,
+        "world collision mesh contains self-intersections"
+    );
     mesh.set_flags(TriMeshFlags::HALF_EDGE_TOPOLOGY)
         .context("world collision meshes must be watertight and consistently oriented")?;
     let topology = mesh.topology().context("mesh topology was not computed")?;
@@ -177,8 +294,10 @@ fn solid_parts(vertices: Vec<DVec3>, triangles: Vec<[u32; 3]>) -> Result<Vec<Tri
         loop {
             visited[current] = true;
             let edge = &topology.half_edges[current];
-            let slot = mesh.indices()[edge.face as usize].iter()
-                .position(|&v| v == edge.vertex).expect("half-edge vertex belongs to its face");
+            let slot = mesh.indices()[edge.face as usize]
+                .iter()
+                .position(|&v| v == edge.vertex)
+                .expect("half-edge vertex belongs to its face");
             triangles[edge.face as usize][slot] = index;
             current = topology.half_edges[edge.twin as usize].next as usize;
             if current == first {
@@ -189,8 +308,10 @@ fn solid_parts(vertices: Vec<DVec3>, triangles: Vec<[u32; 3]>) -> Result<Vec<Tri
     let mut mesh = TriMesh::new(vertices, triangles)?;
     mesh.set_flags(TriMeshFlags::CONNECTED_COMPONENTS)?;
     let mut parts = vec![];
-    for (vertices, mut faces) in mesh.connected_components()
-        .context("mesh components were not computed")?.to_mesh_buffers(&mesh)
+    for (vertices, mut faces) in mesh
+        .connected_components()
+        .context("mesh components were not computed")?
+        .to_mesh_buffers(&mesh)
     {
         let volume: f64 = faces
             .iter()
@@ -224,7 +345,9 @@ fn solid_parts(vertices: Vec<DVec3>, triangles: Vec<[u32; 3]>) -> Result<Vec<Tri
 }
 
 fn shapes(
-    urdf: &str, robot_links: &HashSet<String>, directories: &[PathBuf],
+    urdf: &str,
+    robot_links: &HashSet<String>,
+    directories: &[PathBuf],
 ) -> Result<BTreeMap<String, Vec<Shape>>> {
     let doc = Document::parse(urdf)?;
     let mut links = BTreeMap::new();
@@ -423,4 +546,177 @@ pub(crate) fn world_model(
         links.push(crate::scene::WorldLink { name, obstacles });
     }
     Ok((links, markers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cube() -> (Vec<DVec3>, Vec<[u32; 3]>) {
+        let vertices = vec![
+            DVec3::new(-1., -1., -1.),
+            DVec3::new(1., -1., -1.),
+            DVec3::new(1., 1., -1.),
+            DVec3::new(-1., 1., -1.),
+            DVec3::new(-1., -1., 1.),
+            DVec3::new(1., -1., 1.),
+            DVec3::new(1., 1., 1.),
+            DVec3::new(-1., 1., 1.),
+        ];
+        let faces = vec![
+            [0, 2, 1],
+            [0, 3, 2],
+            [4, 5, 6],
+            [4, 6, 7],
+            [0, 1, 5],
+            [0, 5, 4],
+            [1, 2, 6],
+            [1, 6, 5],
+            [2, 3, 7],
+            [2, 7, 6],
+            [3, 0, 4],
+            [3, 4, 7],
+        ];
+        (vertices, faces)
+    }
+
+    #[test]
+    fn closed_mesh_rejects_corner_pushed_through_opposite_face() {
+        let (mut vertices, faces) = cube();
+        assert!(solid_parts(vertices.clone(), faces.clone()).is_ok());
+        vertices[6] = DVec3::new(0.2, 0.3, -2.);
+        assert!(
+            solid_parts(vertices, faces)
+                .unwrap_err()
+                .to_string()
+                .contains("self-intersections")
+        );
+    }
+
+    #[test]
+    fn mesh_rejects_open_and_degenerate_faces() {
+        let (vertices, mut faces) = cube();
+        faces.pop();
+        assert!(solid_parts(vertices.clone(), faces).is_err());
+        assert!(solid_parts(vertices, vec![[0, 0, 1]]).is_err());
+    }
+
+    #[test]
+    fn face_intersection_allows_shared_edges_but_rejects_coplanar_overlap() {
+        let mesh = TriMesh::new(
+            vec![
+                DVec3::ZERO,
+                DVec3::X,
+                DVec3::Y,
+                -DVec3::Y,
+                DVec3::new(0.2, 0.2, 0.),
+            ],
+            vec![[0, 1, 2], [1, 0, 3], [1, 0, 4]],
+        )
+        .unwrap();
+        assert!(!faces_cross(&mesh, 0, 1));
+        assert!(faces_cross(&mesh, 0, 2));
+    }
+
+    #[test]
+    fn overlapping_shells_are_rejected_and_disjoint_shells_are_accepted() {
+        let (vertices, faces) = cube();
+        for (offset, valid) in [(DVec3::splat(0.5), false), (DVec3::splat(3.), true)] {
+            let mut both = vertices.clone();
+            both.extend(vertices.iter().map(|p| *p + offset));
+            let mut triangles = faces.clone();
+            triangles.extend(faces.iter().map(|f| f.map(|i| i + 8)));
+            assert_eq!(solid_parts(both, triangles).is_ok(), valid);
+        }
+    }
+    #[test]
+    fn inward_shells_and_shells_touching_at_one_vertex_remain_valid() {
+        let (vertices, mut faces) = cube();
+        for face in &mut faces {
+            face.swap(1, 2);
+        }
+        assert!(solid_parts(vertices.clone(), faces.clone()).is_ok());
+        let mut both = vertices.clone();
+        both.extend(
+            vertices
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 0)
+                .map(|(_, p)| *p + DVec3::splat(2.)),
+        );
+        let mut triangles = faces.clone();
+        triangles.extend(
+            faces
+                .iter()
+                .map(|f| f.map(|i| if i == 0 { 6 } else { i + 7 })),
+        );
+        assert_eq!(solid_parts(both, triangles).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn nested_shells_and_invalid_indices_are_rejected() {
+        let (vertices, faces) = cube();
+        let mut both = vertices.clone();
+        both.extend(vertices.iter().map(|p| *p * 0.5));
+        let mut triangles = faces.clone();
+        triangles.extend(faces.iter().map(|f| f.map(|i| i + 8)));
+        assert!(
+            solid_parts(both, triangles)
+                .unwrap_err()
+                .to_string()
+                .contains("nested")
+        );
+        assert!(solid_parts(vertices, vec![[0, 1, 99]]).is_err());
+    }
+
+    #[test]
+    fn world_primitives_keep_their_poses_and_robot_geometry_is_excluded() {
+        let urdf = r#"<robot name="cell">
+          <link name="arm"><collision><geometry><sphere radius="1"/></geometry></collision></link>
+          <link name="wall"><collision><origin xyz="1 2 3" rpy="0 0 1.5707963267948966"/>
+            <geometry><box size="2 4 6"/></geometry></collision></link>
+        </robot>"#;
+        let robot = HashSet::from(["arm".to_string()]);
+        let (links, markers) =
+            world_model(urdf, Some(&robot), &[], &SdfOptions::default()).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].name, "wall");
+        match links[0].obstacles[0] {
+            Obstacle::Cuboid {
+                center,
+                rotation,
+                half_extents,
+            } => {
+                assert_eq!(center, batchplan::glam::Vec3::new(1., 2., 3.));
+                assert_eq!(half_extents, batchplan::glam::Vec3::new(1., 2., 3.));
+                assert!(
+                    (rotation * batchplan::glam::Vec3::X - batchplan::glam::Vec3::Y).length()
+                        < 1e-6
+                );
+            }
+            _ => panic!("expected a cuboid"),
+        }
+        assert!(!markers.is_empty());
+        assert!(
+            world_model(urdf, None, &[], &SdfOptions::default())
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        let invalid = urdf.replace("2 4 6", "0 4 6");
+        assert!(world_model(&invalid, Some(&robot), &[], &SdfOptions::default()).is_err());
+    }
+    #[test]
+    fn per_face_vertices_are_welded_before_validation() {
+        let (vertices, faces) = cube();
+        let duplicated: Vec<_> = faces
+            .iter()
+            .flatten()
+            .map(|&i| vertices[i as usize])
+            .collect();
+        let faces = (0..faces.len() as u32)
+            .map(|i| [3 * i, 3 * i + 1, 3 * i + 2])
+            .collect();
+        assert_eq!(solid_parts(duplicated, faces).unwrap().len(), 1);
+    }
 }

@@ -527,6 +527,16 @@ fn closed_meshes_are_obstacles_and_open_ones_are_refused() {
         length(&free)
     );
 
+    let mut crossed = mesh(triangles.clone());
+    crossed.meshes[0].vertices[7] = geometry::Point {
+        x: c[0],
+        y: c[1],
+        z: c[2] - 2.0 * h[2],
+    };
+    let invalid = blocked(vec![crossed]);
+    assert_eq!(invalid.error_code.val, Code::INVALID_OBJECT_NAME);
+    assert!(invalid.error_code.message.contains("self-intersections"));
+
     let open = blocked(vec![mesh(triangles[..10].to_vec())]);
     assert_eq!(
         open.error_code.val,

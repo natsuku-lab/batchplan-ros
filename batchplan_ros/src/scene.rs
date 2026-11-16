@@ -177,6 +177,14 @@ impl Grids {
             .map(|v| Vec3::new(v.x as f32, v.y as f32, v.z as f32))
             .collect();
         let triangles: Vec<[u32; 3]> = mesh.triangles.iter().map(|t| t.vertex_indices).collect();
+        crate::world_geometry::solid_parts(
+            mesh.vertices
+                .iter()
+                .map(|v| batchplan::glam::DVec3::new(v.x, v.y, v.z))
+                .collect(),
+            triangles.clone(),
+        )
+        .map_err(|e| Refusal::new(Code::INVALID_OBJECT_NAME, format!("mesh of '{id}': {e}")))?;
         let grid = SdfGrid::from_mesh(&vertices, &triangles, &self.options)
             .map(Arc::new)
             .map_err(|e| Refusal::new(Code::INVALID_OBJECT_NAME, format!("mesh of '{id}': {e}")))?;
