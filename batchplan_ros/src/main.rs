@@ -5,9 +5,9 @@
 //! (`moveit_msgs/srv/GetPositionIK`) solves IK; `~/compute_cartesian_path`
 //! (`moveit_msgs/srv/GetCartesianPath`) moves the hand in straight lines through waypoints.
 
-use std::path::PathBuf;
 use std::collections::BTreeMap;
 use std::future::{Future, pending};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -19,16 +19,17 @@ use rclrs::{
     GoalStatusCode, IntoPrimitiveOptions, Node, RclrsError, RclrsErrorFilter, RequestedGoal,
     RequestedGoalClient, Service, SpinOptions, log_error, log_info,
 };
-use ros_env::control_msgs::action::{FollowJointTrajectory, FollowJointTrajectory_Goal};
+use ros_env::control_msgs::action::{
+    FollowJointTrajectory, FollowJointTrajectory_Goal, FollowJointTrajectory_Result,
+};
 use ros_env::moveit_msgs::action::{
     MoveGroup, MoveGroup_Feedback, MoveGroup_Result, MoveGroupSequence, MoveGroupSequence_Feedback,
     MoveGroupSequence_Result,
 };
 use ros_env::moveit_msgs::msg::{MotionSequenceResponse, MoveItErrorCodes, RobotTrajectory};
 use ros_env::moveit_msgs::srv::{
-    GetCartesianPath, GetCartesianPath_Request, GetPositionIK, GetPositionIK_Request,
-    GetPositionIK_Response,
-    GetPlannerParams, GetPlannerParams_Request, GetPlannerParams_Response,
+    GetCartesianPath, GetCartesianPath_Request, GetPlannerParams, GetPlannerParams_Request,
+    GetPlannerParams_Response, GetPositionIK, GetPositionIK_Request, GetPositionIK_Response,
     SetPlannerParams, SetPlannerParams_Request, SetPlannerParams_Response,
 };
 use ros_env::sensor_msgs::msg::JointState;
@@ -79,7 +80,8 @@ fn main() -> Result<()> {
         .declare_parameter::<i64>("cpu_threads")
         .default(0)
         .read_only()?;
-    let threads = usize::try_from(threads_parameter.get()).context("cpu_threads must be nonnegative")?;
+    let threads =
+        usize::try_from(threads_parameter.get()).context("cpu_threads must be nonnegative")?;
     let dt_parameter = node
         .declare_parameter::<f64>("trajectory_dt")
         .default(0.02)
@@ -89,8 +91,8 @@ fn main() -> Result<()> {
         .declare_parameter::<i64>("sphere_budget")
         .default(64)
         .read_only()?;
-    let sphere_budget =
-        usize::try_from(budget_parameter.get()).context("sphere_budget must be a positive integer")?;
+    let sphere_budget = usize::try_from(budget_parameter.get())
+        .context("sphere_budget must be a positive integer")?;
     anyhow::ensure!(
         sphere_budget > 0,
         "sphere_budget must be a positive integer"
@@ -110,9 +112,7 @@ fn main() -> Result<()> {
         robot_link_roots: robot_link_roots.iter().map(|s| s.to_string()).collect(),
         world_sdf_voxel_size,
         device: match device.as_str() {
-            "" | "cpu" => DeviceKind::Cpu {
-                threads,
-            },
+            "" | "cpu" => DeviceKind::Cpu { threads },
             "gpu" => DeviceKind::Gpu,
             other => anyhow::bail!("device must be 'cpu' or 'gpu', not '{other}'"),
         },
@@ -232,22 +232,22 @@ fn serve(
         let (planner, node) = (Arc::clone(&planner), node.clone());
         node.clone().create_service::<GetPlannerParams, _>(
             "~/get_planner_params",
-            move |request: GetPlannerParams_Request| {
-                match planner.planner_settings(&request.group, &request.planner_config) {
-                    Ok(settings) => {
-                        let values = settings.parameters();
-                        GetPlannerParams_Response {
-                            params: ros_env::moveit_msgs::msg::PlannerParams {
-                                keys: values.keys().cloned().collect(),
-                                values: values.values().cloned().collect(),
-                                descriptions: vec![String::new(); values.len()],
-                            },
-                        }
+            move |request: GetPlannerParams_Request| match planner
+                .planner_settings(&request.group, &request.planner_config)
+            {
+                Ok(settings) => {
+                    let values = settings.parameters();
+                    GetPlannerParams_Response {
+                        params: ros_env::moveit_msgs::msg::PlannerParams {
+                            keys: values.keys().cloned().collect(),
+                            values: values.values().cloned().collect(),
+                            descriptions: vec![String::new(); values.len()],
+                        },
                     }
-                    Err(e) => {
-                        log_error!(node.logger(), "cannot read planner settings: {e}");
-                        GetPlannerParams_Response::default()
-                    }
+                }
+                Err(e) => {
+                    log_error!(node.logger(), "cannot read planner settings: {e}");
+                    GetPlannerParams_Response::default()
                 }
             },
         )?
@@ -262,11 +262,22 @@ fn serve(
                         request.params.keys.len() == request.params.values.len(),
                         "planner parameter keys and values have different lengths"
                     );
-                    let values: BTreeMap<_, _> = request.params.keys.iter().cloned()
-                        .zip(request.params.values.iter().cloned()).collect();
-                    anyhow::ensure!(values.len() == request.params.keys.len(), "duplicate planner parameter keys");
+                    let values: BTreeMap<_, _> = request
+                        .params
+                        .keys
+                        .iter()
+                        .cloned()
+                        .zip(request.params.values.iter().cloned())
+                        .collect();
+                    anyhow::ensure!(
+                        values.len() == request.params.keys.len(),
+                        "duplicate planner parameter keys"
+                    );
                     planner.set_planner_parameters(
-                        &request.group, &request.planner_config, &values, request.replace,
+                        &request.group,
+                        &request.planner_config,
+                        &values,
+                        request.replace,
                     )
                 };
                 if let Err(e) = update() {
@@ -307,9 +318,9 @@ fn serve(
                             current.as_ref(),
                         )
                     });
-                    let Some(answer) = cancellable(
-                        planned, goal.unless_cancel_requested(pending::<()>()),
-                    ).await else {
+                    let Some(answer) =
+                        cancellable(planned, goal.unless_cancel_requested(pending::<()>())).await
+                    else {
                         log_info!(node.logger(), "goal {}: planning cancelled", &id[..8]);
                         return goal.begin_cancelling().cancelled_with(MoveGroup_Result {
                             error_code: error(MoveItErrorCodes::PREEMPTED, "planning cancelled"),
@@ -343,7 +354,9 @@ fn serve(
                         match cancellable(
                             execution.run(controller.as_ref(), &result.planned_trajectory),
                             goal.unless_cancel_requested(pending::<()>()),
-                        ).await {
+                        )
+                        .await
+                        {
                             Some(Ok(())) => {
                                 result.executed_trajectory = result.planned_trajectory.clone()
                             }
@@ -416,16 +429,21 @@ fn serve(
                             current.as_ref(),
                         )
                     });
-                    let Some(response) = cancellable(
-                        planned, goal.unless_cancel_requested(pending::<()>()),
-                    ).await else {
+                    let Some(response) =
+                        cancellable(planned, goal.unless_cancel_requested(pending::<()>())).await
+                    else {
                         log_info!(node.logger(), "goal {}: planning cancelled", &id[..8]);
-                        return goal.begin_cancelling().cancelled_with(MoveGroupSequence_Result {
-                            response: MotionSequenceResponse {
-                                error_code: error(MoveItErrorCodes::PREEMPTED, "planning cancelled"),
-                                ..Default::default()
-                            },
-                        });
+                        return goal
+                            .begin_cancelling()
+                            .cancelled_with(MoveGroupSequence_Result {
+                                response: MotionSequenceResponse {
+                                    error_code: error(
+                                        MoveItErrorCodes::PREEMPTED,
+                                        "planning cancelled",
+                                    ),
+                                    ..Default::default()
+                                },
+                            });
                     };
                     let Some(mut response) = response else {
                         let error_code = error(
@@ -449,7 +467,9 @@ fn serve(
                             match cancellable(
                                 execution.run(controller.as_ref(), trajectory),
                                 goal.unless_cancel_requested(pending::<()>()),
-                            ).await {
+                            )
+                            .await
+                            {
                                 Some(Ok(())) => {}
                                 Some(Err(message)) => {
                                     response.error_code =
@@ -460,7 +480,9 @@ fn serve(
                                     let goal = goal.begin_cancelling();
                                     response.error_code = execution.cancel(&node).await;
                                     let result = MoveGroupSequence_Result { response };
-                                    return if result.response.error_code.val == MoveItErrorCodes::PREEMPTED {
+                                    return if result.response.error_code.val
+                                        == MoveItErrorCodes::PREEMPTED
+                                    {
                                         goal.cancelled_with(result)
                                     } else {
                                         goal.aborted_with(result)
@@ -544,6 +566,88 @@ async fn cancellable<T>(work: impl Future<Output = T>, cancellation: impl Future
     }
 }
 
+const CONTROLLER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+// The timer thread exits immediately when the operation completes or is cancelled.
+async fn bounded<T>(
+    work: impl Future<Output = T>,
+    limit: std::time::Duration,
+) -> Result<T, String> {
+    let (keep_timer, cancel_timer) = std::sync::mpsc::channel::<()>();
+    let (alarm, timer) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        if cancel_timer.recv_timeout(limit) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            let _ = alarm.send(());
+        }
+    });
+    let result = cancellable(work, timer)
+        .await
+        .ok_or_else(|| "controller wait timed out".into());
+    drop(keep_timer);
+    result
+}
+
+// A timed-out acceptance must still be observed: the server can start this goal later.
+fn observe_late<T: Send + 'static>(
+    requested: impl Future<Output = Option<T>> + Send + 'static,
+    stop: impl FnOnce(T) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        futures::executor::block_on(async move {
+            if let Some(active) = requested.await {
+                stop(active).await;
+            }
+        })
+    });
+}
+
+fn cancel_late(requested: RequestedGoalClient<FollowJointTrajectory>) {
+    observe_late(requested, |active| {
+        Box::pin(async move {
+            let mut execution = Execution {
+                pending: None,
+                active: Some(active),
+            };
+            if let Err(message) = execution.stop().await {
+                log_error!(
+                    "batchplan_planner",
+                    "cannot confirm late controller stop: {message}"
+                );
+            }
+        })
+    });
+}
+
+async fn confirm_stop(
+    acknowledgement: impl Future<Output = Result<(), String>>,
+    terminal: impl Future<Output = (GoalStatusCode, FollowJointTrajectory_Result)>,
+    limit: std::time::Duration,
+) -> Result<&'static str, String> {
+    bounded(acknowledgement, limit)
+        .await
+        .map_err(|e| format!("cancellation acknowledgement: {e}"))??;
+    let (status, result) = bounded(terminal, limit)
+        .await
+        .map_err(|e| format!("cancellation terminal result: {e}"))?;
+    match status {
+        GoalStatusCode::Cancelled => Ok("goal cancelled; controller stopped"),
+        GoalStatusCode::Succeeded if result.error_code == 0 => {
+            Ok("goal cancelled after the controller had already completed")
+        }
+        _ => Err(format!(
+            "the controller ended with {status:?}: {}",
+            result.error_string
+        )),
+    }
+}
+
+fn stop_code(result: Result<&'static str, String>) -> MoveItErrorCodes {
+    match result {
+        Ok(message) => error(MoveItErrorCodes::PREEMPTED, message),
+        Err(message) => error(MoveItErrorCodes::CONTROL_FAILED, &message),
+    }
+}
+
 #[derive(Default)]
 struct Execution {
     pending: Option<RequestedGoalClient<FollowJointTrajectory>>,
@@ -556,59 +660,101 @@ impl Execution {
         controller: Option<&ActionClient<FollowJointTrajectory>>,
         trajectory: &RobotTrajectory,
     ) -> Result<(), String> {
-        let controller = controller.ok_or("set controller_action to execute; the node only plans")?;
+        let controller =
+            controller.ok_or("set controller_action to execute; the node only plans")?;
         let goal = FollowJointTrajectory_Goal {
             trajectory: trajectory.joint_trajectory.clone(),
             ..Default::default()
         };
-        let requested = controller.try_request_goal(goal).map_err(|e| e.to_string())?;
-        self.active = self.pending.insert(requested).await;
+        let requested = controller
+            .try_request_goal(goal)
+            .map_err(|e| e.to_string())?;
+        self.active = match bounded(self.pending.insert(requested), CONTROLLER_WAIT).await {
+            Ok(active) => active,
+            Err(message) => {
+                cancel_late(self.pending.take().expect("pending acceptance"));
+                return Err(message);
+            }
+        };
         self.pending = None;
-        let accepted = self.active.as_mut().ok_or("the controller rejected the trajectory")?;
-        let (status, result) = (&mut accepted.result).await;
+        let accepted = self
+            .active
+            .as_mut()
+            .ok_or("the controller rejected the trajectory")?;
+        // Allow the requested trajectory duration plus a bounded controller grace period.
+        let duration = trajectory
+            .joint_trajectory
+            .points
+            .last()
+            .map(|p| p.time_from_start.sec.max(0) as u64)
+            .unwrap_or(0);
+        let limit = std::time::Duration::from_secs(duration.saturating_add(30));
+        let (status, result) = match bounded(&mut accepted.result, limit).await {
+            Ok(result) => result,
+            Err(message) => {
+                return Err(match self.stop().await {
+                    Ok(_) => message,
+                    Err(stop) => format!("{message}; cannot confirm controller stop: {stop}"),
+                });
+            }
+        };
         self.active = None;
         if status == GoalStatusCode::Succeeded && result.error_code == 0 {
             Ok(())
         } else {
-            Err(format!("the controller ended with {status:?}: {}", result.error_string))
+            Err(format!(
+                "the controller ended with {status:?}: {}",
+                result.error_string
+            ))
         }
     }
 
     async fn cancel(&mut self, node: &Node) -> MoveItErrorCodes {
-        match self.stop().await {
-            Ok(message) => {
-                log_info!(node.logger(), "{message}");
-                error(MoveItErrorCodes::PREEMPTED, message)
-            }
-            Err(message) => {
-                log_error!(node.logger(), "cannot confirm controller stop: {message}");
-                error(MoveItErrorCodes::CONTROL_FAILED, &message)
-            }
+        let code = stop_code(self.stop().await);
+        if code.val == MoveItErrorCodes::CONTROL_FAILED {
+            log_error!(
+                node.logger(),
+                "cannot confirm controller stop: {}",
+                code.message
+            );
+        } else {
+            log_info!(node.logger(), "{}", code.message);
         }
+        code
     }
 
     async fn stop(&mut self) -> Result<&'static str, String> {
         // Do not drop an in-flight request: it may still be accepted and start moving.
-        if let Some(requested) = self.pending.take() {
-            self.active = requested.await;
+        if let Some(mut requested) = self.pending.take() {
+            self.active = match bounded(&mut requested, CONTROLLER_WAIT).await {
+                Ok(active) => active,
+                Err(message) => {
+                    cancel_late(requested);
+                    return Err(message);
+                }
+            };
         }
         let Some(active) = self.active.take() else {
             return Ok("goal cancelled; no controller goal is active");
         };
-        let response = active.cancellation.try_cancel().map_err(|e| e.to_string())?.await;
-        // Some servers return Accept with an empty goals_canceling list when their callback rejects.
-        if response.code != CancelResponseCode::GoalTerminated
-            && (response.code != CancelResponseCode::Accept || response.stamp.is_none())
-        {
-            return Err(format!("controller did not accept cancellation: {:?}", response.code));
-        }
-        let (status, result) = active.result.await;
-        match status {
-            GoalStatusCode::Cancelled => Ok("goal cancelled; controller stopped"),
-            GoalStatusCode::Succeeded if result.error_code == 0 =>
-                Ok("goal cancelled after the controller had already completed"),
-            _ => Err(format!("the controller ended with {status:?}: {}", result.error_string)),
-        }
+        let acknowledgement = async {
+            let response = active
+                .cancellation
+                .try_cancel()
+                .map_err(|e| e.to_string())?
+                .await;
+            // Accept with an empty goals_canceling list does not confirm cancellation.
+            if response.code != CancelResponseCode::GoalTerminated
+                && (response.code != CancelResponseCode::Accept || response.stamp.is_none())
+            {
+                return Err(format!(
+                    "controller did not accept cancellation: {:?}",
+                    response.code
+                ));
+            }
+            Ok(())
+        };
+        confirm_stop(acknowledgement, active.result, CONTROLLER_WAIT).await
     }
 }
 
@@ -636,4 +782,116 @@ fn default_cache_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
     base.join("batchplan-ros")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use std::time::Duration;
+
+    #[test]
+    fn cancellation_wins_over_ready_work() {
+        assert_eq!(block_on(cancellable(async { 42 }, async {})), None);
+    }
+
+    #[test]
+    fn controller_waits_complete_or_time_out() {
+        assert_eq!(
+            block_on(bounded(async { 42 }, CONTROLLER_WAIT)).unwrap(),
+            42
+        );
+        assert!(block_on(bounded(pending::<()>(), Duration::from_millis(5))).is_err());
+    }
+
+    #[test]
+    fn timed_out_borrowed_acceptance_can_still_be_observed() {
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        assert!(block_on(bounded(&mut rx, Duration::from_millis(5))).is_err());
+        tx.send(42).unwrap();
+        assert_eq!(block_on(rx).unwrap(), 42);
+    }
+
+    #[test]
+    fn stopping_without_a_dispatched_goal_is_confirmed() {
+        assert!(block_on(Execution::default().stop()).is_ok());
+    }
+    #[test]
+    fn unconfirmed_stops_report_control_failed() {
+        let limit = Duration::from_millis(5);
+        let terminal = || async {
+            (
+                GoalStatusCode::Cancelled,
+                FollowJointTrajectory_Result::default(),
+            )
+        };
+        let missing_ack = block_on(confirm_stop(pending(), terminal(), limit));
+        assert!(
+            missing_ack
+                .as_ref()
+                .unwrap_err()
+                .contains("acknowledgement")
+        );
+        assert_eq!(stop_code(missing_ack).val, MoveItErrorCodes::CONTROL_FAILED);
+        let missing_result = block_on(confirm_stop(async { Ok(()) }, pending(), limit));
+        assert!(
+            missing_result
+                .as_ref()
+                .unwrap_err()
+                .contains("terminal result")
+        );
+        assert_eq!(
+            stop_code(missing_result).val,
+            MoveItErrorCodes::CONTROL_FAILED
+        );
+        let rejected = block_on(confirm_stop(
+            async { Err("rejected".into()) },
+            pending(),
+            limit,
+        ));
+        assert_eq!(stop_code(rejected).val, MoveItErrorCodes::CONTROL_FAILED);
+        for (status, code, expected) in [
+            (GoalStatusCode::Cancelled, 0, MoveItErrorCodes::PREEMPTED),
+            (GoalStatusCode::Succeeded, 0, MoveItErrorCodes::PREEMPTED),
+            (
+                GoalStatusCode::Succeeded,
+                -1,
+                MoveItErrorCodes::CONTROL_FAILED,
+            ),
+            (
+                GoalStatusCode::Aborted,
+                -1,
+                MoveItErrorCodes::CONTROL_FAILED,
+            ),
+        ] {
+            let result = block_on(confirm_stop(
+                async { Ok(()) },
+                async {
+                    (
+                        status,
+                        FollowJointTrajectory_Result {
+                            error_code: code,
+                            ..Default::default()
+                        },
+                    )
+                },
+                limit,
+            ));
+            assert_eq!(stop_code(result).val, expected);
+        }
+    }
+
+    #[test]
+    fn late_acceptance_is_cancelled_after_caller_times_out() {
+        let (accepted, mut acceptance) = futures::channel::oneshot::channel();
+        assert!(block_on(bounded(&mut acceptance, Duration::from_millis(5))).is_err());
+        let (stopped, observed) = std::sync::mpsc::channel();
+        observe_late(async { acceptance.await.unwrap() }, |goal| {
+            Box::pin(async move {
+                stopped.send(goal).unwrap();
+            })
+        });
+        accepted.send(Some(42)).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), 42);
+    }
 }
