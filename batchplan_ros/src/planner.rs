@@ -641,6 +641,7 @@ impl Planner {
                 paths: motions[c.clone()].iter().map(|m| m.path.clone()).collect(),
                 blends: radii[c.start..c.end - 1].to_vec(),
                 constraints: motions[c.start].constraints.clone(),
+                holding: None,
             })
             .collect();
         let joined = if sequences.is_empty() {
@@ -867,6 +868,8 @@ impl Planner {
                 start: start.to_vec(),
                 hand,
                 waypoints: vec![pose],
+                hold: vec![],
+                holding: None,
             };
             let mut result = batchplan::follow(s.device, s.worlds, &[path], &s.search.cartesian)
                 .map_err(crash)?;
@@ -911,10 +914,11 @@ impl Planner {
             .map(|goal| PlanProblem {
                 world: 0,
                 start: start.to_vec(),
-                goal: goal.clone(),
+                goal: batchplan::Goal::Joints(goal.clone()),
                 start_motion: None,
                 hold: hold.clone(),
                 constraints: constraints.clone(),
+                holding: None,
             })
             .collect();
 
@@ -925,7 +929,13 @@ impl Planner {
         let constrained = !constraints.is_empty();
         let mut problems = problems;
         if constrained {
-            problems.sort_by(|a, b| distance(&a.goal, start).total_cmp(&distance(&b.goal, start)));
+            let apart = |p: &PlanProblem| {
+                distance(
+                    p.goal.joints().expect("the goals are configurations"),
+                    start,
+                )
+            };
+            problems.sort_by(|a, b| apart(a).total_cmp(&apart(b)));
         }
         let mut touched = false;
         // A path that grazes the meshes is planned again keeping twice the clearance.
@@ -1034,6 +1044,7 @@ impl Planner {
             hand: self.hand(link)?,
             linear: speed as f32,
             angular: f32::INFINITY,
+            near: None,
         }))
     }
 
@@ -1183,6 +1194,8 @@ impl Planner {
             start: start.clone(),
             hand,
             waypoints,
+            hold: vec![],
+            holding: None,
         };
         let (world, _) = scene::world(
             &scene,
@@ -1259,6 +1272,7 @@ impl Planner {
             targets,
             seed: Some(seed.clone()),
             hold: outside(&self.robot, &group),
+            holding: None,
         };
         let result =
             solve_ik(&self.device, &worlds, &[problem], &settings.search.ik).map_err(crash)?;
@@ -1350,6 +1364,7 @@ fn candidates(
                     .collect(),
                 seed: Some(start.to_vec()),
                 hold: hold.clone(),
+                holding: None,
             })
             .collect();
         let ik = solve_ik(device, worlds, &problems, &options).map_err(crash)?;
@@ -1460,7 +1475,7 @@ fn timed(
         linear: cap.linear / speed,
         ..cap
     };
-    let mut sampled = Trajectory::with_hand_speed(robot, path, &raised)
+    let mut sampled = Trajectory::with_hand_speed(robot, path, &[raised])
         .and_then(|t| t.sample(1.0 / (speed * dt)))
         .map_err(crash)?;
     sampled.dt = dt;
