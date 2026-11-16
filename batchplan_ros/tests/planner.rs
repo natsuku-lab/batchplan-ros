@@ -1762,3 +1762,56 @@ fn sequences_are_refused_as_pilz_refuses_them() {
         response.error_code.message
     );
 }
+
+#[test]
+fn planner_settings_inherit_override_replace_and_reject_invalid_updates_atomically() {
+    use std::collections::BTreeMap;
+    let planner = panda(SRDF);
+    let update = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let defaults = planner.planner_settings("panda_arm", "batchplan").unwrap();
+    planner
+        .set_planner_parameters("", "batchplan", &update(&[("trajectory_dt", "0.1")]), false)
+        .unwrap();
+    let inherited = planner.planner_settings("panda_arm", "batchplan").unwrap();
+    assert_eq!(inherited.trajectory_dt, 0.1);
+    planner
+        .set_planner_parameters("panda_arm", "", &update(&[("ik.seeds", "12")]), false)
+        .unwrap();
+    let overridden = planner.planner_settings("panda_arm", "batchplan").unwrap();
+    assert_eq!(overridden.trajectory_dt, 0.1);
+    assert_eq!(overridden.search.ik.seeds, 12);
+    assert!(
+        planner
+            .set_planner_parameters(
+                "panda_arm",
+                "batchplan",
+                &update(&[("trajectory_dt", "0.2"), ("ik.seeds", "0")]),
+                false
+            )
+            .is_err()
+    );
+    assert_eq!(
+        planner
+            .planner_settings("panda_arm", "batchplan")
+            .unwrap()
+            .parameters(),
+        overridden.parameters()
+    );
+    planner
+        .set_planner_parameters("panda_arm", "batchplan", &BTreeMap::new(), true)
+        .unwrap();
+    assert_eq!(
+        planner
+            .planner_settings("panda_arm", "batchplan")
+            .unwrap()
+            .parameters(),
+        defaults.parameters()
+    );
+    assert!(planner.planner_settings("missing", "batchplan").is_err());
+    assert!(planner.planner_settings("panda_arm", "missing").is_err());
+}

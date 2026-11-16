@@ -152,3 +152,66 @@ fn without(text: &str, mut ranges: Vec<Range<usize>>) -> String {
     out.push_str(&text[start..]);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CELL: &str = r#"<robot name="cell">
+      <link name="base"><collision><geometry><box size="1 1 1"/></geometry></collision>
+        <visual><geometry><box size="1 1 1"/></geometry></visual></link>
+      <link name="spacer"/>
+      <link name="arm"><collision><geometry><sphere radius="0.1"/></geometry></collision></link>
+      <link name="tool"><collision><geometry><sphere radius="0.1"/></geometry></collision></link>
+      <link name="wall"><collision><geometry><box size="1 1 1"/></geometry></collision></link>
+      <joint name="mount" type="fixed"><parent link="base"/><child link="spacer"/></joint>
+      <joint name="axis" type="revolute"><parent link="spacer"/><child link="arm"/></joint>
+      <joint name="tip" type="fixed"><parent link="arm"/><child link="tool"/></joint>
+      <joint name="fixture" type="fixed"><parent link="base"/><child link="wall"/></joint>
+    </robot>"#;
+
+    #[test]
+    fn selection_keeps_kinematics_and_removes_world_collision_and_visual_fallback() {
+        let partition = Partition::new(CELL, &["spacer".into()]).unwrap();
+        assert_eq!(
+            partition.robot_links.unwrap(),
+            HashSet::from(["arm".into(), "tool".into()])
+        );
+        let doc = Document::parse(&partition.robot_urdf).unwrap();
+        assert_eq!(
+            doc.descendants()
+                .filter(|n| n.has_tag_name("joint"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            doc.descendants()
+                .filter(|n| n.has_tag_name("collision"))
+                .count(),
+            2
+        );
+        assert!(!doc.descendants().any(|n| n.has_tag_name("visual")));
+        assert!(
+            partition
+                .exemptions
+                .contains(&("arm".into(), "base".into()))
+        );
+        assert!(
+            !partition
+                .exemptions
+                .contains(&("arm".into(), "wall".into()))
+        );
+    }
+
+    #[test]
+    fn roots_are_strict_and_world_joints_must_be_fixed() {
+        let all = Partition::new(CELL, &[]).unwrap();
+        assert_eq!(all.robot_urdf, CELL);
+        assert!(all.robot_links.is_none());
+        assert!(Partition::new(CELL, &["missing".into()]).is_err());
+        assert!(Partition::new(CELL, &["tool".into()]).is_err());
+        assert!(Partition::new(CELL, &["arm".into()]).is_err());
+        let selected = Partition::new(CELL, &["base".into(), "spacer".into()]).unwrap();
+        assert!(!selected.robot_links.unwrap().contains("base"));
+    }
+}
