@@ -348,12 +348,14 @@ public:
         const auto planner = every_group ? name : name.substr(bracket + 1, name.size() - bracket - 2);
         for (const auto& group : every_group ? groups_ : std::vector<std::string>{ name.substr(0, bracket) })
         {
-          auto& settings = held[group + "[" + planner + "]"];
+          const auto entry = group + "[" + planner + "]";
+          const auto kept = held.find(entry);
+          const auto before = kept == held.end() ? Parameters() : kept->second.config;
           // A group's configuration is whole, over the defaults; one for every group adds to each.
-          auto wanted = every_group && !settings.config.empty() ? settings.config : defaults_;
+          auto wanted = every_group && !before.empty() ? before : defaults_;
           for (const auto& [key, value] : asked.config)
             wanted[key] = value;
-          if (wanted == settings.config)
+          if (wanted == before)
             continue;
           const auto stored = client_->set(group, planner, wanted, Clock::now() + std::chrono::seconds(5));
           if (!stored)
@@ -362,11 +364,12 @@ public:
                          group.c_str());
             continue;
           }
-          if (*stored == settings.config)
+          if (*stored == before)
             RCLCPP_WARN(logger_,
                         "batchplan_planner kept the settings of '%s' for '%s'; its log names a value it refused",
                         planner.c_str(), group.c_str());
-          settings.name = group + "[" + planner + "]";
+          auto& settings = held[entry];
+          settings.name = entry;
           settings.group = group;
           settings.config = *stored;
         }

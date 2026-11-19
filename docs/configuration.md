@@ -22,7 +22,7 @@ All links, joints and frames are kept. Only collision ownership changes:
 - **Robot links** are checked as fitted spheres, and each trajectory once more against their meshes.
 - **Other links** become world obstacles in their link's frame: boxes, spheres, cylinders, and `<capsule radius="..." length="..."/>`, where `length` is the distance between the caps' centers. A mesh becomes a distance grid, so it must be a closed surface.
 
-These obstacles are part of every request, alongside the request's planning scene, including IK and Cartesian-path requests that carry no scene. A scene object cannot take a world link's name. A robot link may touch a world obstacle it touches in every configuration, as the first moving link rests on a base that is part of the world (batchplan finds these at startup by sampling); SRDF `disable_collisions` pairs that name a world link apply too, and a request's allowed collision matrix overrides both.
+These obstacles are part of every request, alongside the request's planning scene, including IK and Cartesian-path requests that carry no scene. A scene object cannot take a world link's name. A robot link may touch a world obstacle it touches in every configuration, as the first moving link rests on a base that is part of the world (batchplan finds these at startup by sampling); SRDF `disable_collisions` pairs that name a world link apply too, and a request's allowed collision matrix overrides both. MoveIt's planning scene carries a matrix that names every link, so through MoveIt the SRDF's pairs decide, as they do for MoveIt's own checks.
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -76,7 +76,7 @@ ros2 launch batchplan_ros planner.launch.py parameters_file:=/absolute/path/sear
 
 `~/get_planner_params` and `~/set_planner_params` (`moveit_msgs/srv/GetPlannerParams`, `SetPlannerParams`) read and change the settings of a group and planner (`batchplan`, or `LIN` for straight-line moves; an empty planner name means `batchplan`). An update without a group applies to every group that has no settings of its own. An update is applied whole or, if any value is refused, not at all; the service has no status, so read the settings back, or see the node's log. A request plans with the settings its group has when it starts. Settings last until the node stops.
 
-Through MoveIt the same settings are move_group's `/get_planner_params` and `/set_planner_params`, and **Planner Parameters** in RViz once the `batchplan` planner is selected under **Context → Planning Library**. The plugin sends each change to the node as it is made and shows what the node then holds. An update without a group reaches every group. If the node is not running when move_group loads the plugin (it waits 60 s), MoveIt shows no parameters and plans use the node's own settings.
+Through MoveIt the same settings are move_group's `/get_planner_params` and `/set_planner_params`, and **Planner Parameters** in RViz once the `batchplan` planner is selected under **Context → Planning Library**. The plugin sends each change to the node as it is made and shows what the node then holds. An update without a group is added to every group's settings; `replace` applies to a group's update only. If the node is not running when move_group loads the plugin (it waits 60 s), MoveIt shows no parameters and plans use the node's own settings.
 
 ### Planning time and attempts
 

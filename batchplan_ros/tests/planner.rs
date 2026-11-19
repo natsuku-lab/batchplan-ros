@@ -63,20 +63,30 @@ fn panda(srdf: &str) -> Planner {
 /// The wall of `obstacles_in_the_scene_are_avoided`: in front of the robot, between two reaches.
 const WALL: ([f64; 3], [f64; 3]) = ([0.55, 0.0, 0.3], [0.1, 0.3, 0.6]);
 
-/// The Panda in a workcell URDF, beside the wall. Its base link and the wall are fixed links
-/// outside `robot_link_roots`, so world obstacles: the base's mesh, which the first moving link
-/// rests on, and the wall's box.
+/// The Panda in a workcell URDF, mounted off the cell's origin and turned, beside the wall. Its
+/// base link, a floor of two boxes and the wall are fixed links outside `robot_link_roots`, so
+/// world obstacles; the first moving link rests on the base's mesh. The wall hangs from `mount`,
+/// which is where the base is, so it stands in the base's frame where `WALL` says.
 static CELL: LazyLock<Planner> = LazyLock::new(|| {
     let ([x, y, z], [dx, dy, dz]) = WALL;
+    let at = r#"<origin xyz="0.2 -0.1 0" rpy="0 0 0.5"/>"#;
     let fixtures = format!(
         r#"<link name="cell"/>
+        <link name="floor">
+          <collision><origin xyz="0 0 -0.6"/><geometry><box size="2 2 0.1"/></geometry></collision>
+          <collision><origin xyz="0 -1.5 0"/><geometry><box size="0.1 0.1 0.1"/></geometry></collision>
+        </link>
+        <link name="mount"/>
         <link name="wall"><collision><geometry><box size="{dx} {dy} {dz}"/></geometry></collision></link>
-        <joint name="cell_arm" type="fixed"><parent link="cell"/><child link="panda_link0"/></joint>
-        <joint name="cell_wall" type="fixed"><parent link="cell"/><child link="wall"/>
+        <joint name="cell_floor" type="fixed"><parent link="cell"/><child link="floor"/></joint>
+        <joint name="cell_arm" type="fixed"><parent link="cell"/><child link="panda_link0"/>{at}</joint>
+        <joint name="cell_mount" type="fixed"><parent link="cell"/><child link="mount"/>{at}</joint>
+        <joint name="mount_wall" type="fixed"><parent link="mount"/><child link="wall"/>
           <origin xyz="{x} {y} {z}"/></joint>
-        </robot>"#
+        <link name="panda_link0">"#
     );
-    let urdf = panda_urdf().replace("</robot>", &fixtures);
+    // Ahead of the robot's links, so that the base is not the first world obstacle.
+    let urdf = panda_urdf().replacen(r#"<link name="panda_link0">"#, &fixtures, 1);
     let srdf = SRDF.replace(r#"child_link="panda_link0""#, r#"child_link="cell""#);
     let options = PlannerOptions {
         robot_link_roots: vec!["panda_link0".into()],
@@ -1856,10 +1866,14 @@ fn a_workcells_fixed_links_are_obstacles_to_plans_ik_and_cartesian_paths() {
     let start = [-1.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.785];
     let goal = [1.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.785];
     let meshes = MeshModel::try_new(CELL.robot()).unwrap();
-    let wall = World::new(vec![Obstacle::cuboid(
-        Vec3::from_array(center.map(|v| v as f32)),
-        Vec3::from_array(size.map(|v| 0.5 * v as f32)),
-    )]);
+    // The wall where the cell's URDF puts it.
+    let at = CELL.robot().link_pose(&full(&start), "wall").unwrap();
+    assert!((at.position - Vec3::from_array(center.map(|v| v as f32))).length() > 0.1);
+    let wall = World::new(vec![Obstacle::Cuboid {
+        center: at.position,
+        rotation: at.rotation,
+        half_extents: Vec3::from_array(size.map(|v| 0.5 * v as f32)),
+    }]);
     let clear = |q: &[f32]| {
         meshes
             .clearance(std::slice::from_ref(&wall), &[0], q)
@@ -1875,6 +1889,16 @@ fn a_workcells_fixed_links_are_obstacles_to_plans_ik_and_cartesian_paths() {
         let q = waypoint(&answer, k, &full(&start));
         assert!(clear(&q) > 0.0, "waypoint {k} touches the wall");
     }
+    // A request's allowed collision matrix has the last word on what rests on what.
+    let mut apart = scene(vec![]);
+    apart.allowed_collision_matrix = allowing("panda_link0", &["panda_link1"], false);
+    let refused = CELL.plan(&asked, &apart, Some(&current(&start)));
+    assert_eq!(
+        refused.error_code.val,
+        Code::START_STATE_IN_COLLISION,
+        "{}",
+        refused.error_code.message
+    );
     // The scene's objects add to the URDF's, and cannot take a link's name to replace it.
     let renamed = scene(vec![cuboid("wall", "world", [0.0, 0.0, 2.0], [0.1; 3])]);
     let refused = CELL.plan(&asked, &renamed, Some(&current(&start)));
@@ -1888,10 +1912,12 @@ fn a_workcells_fixed_links_are_obstacles_to_plans_ik_and_cartesian_paths() {
         ik_link_name: "panda_link8".into(),
         ..Default::default()
     };
+    // The arm's base is the planning frame without the cell, and a link's frame within it.
     ik.pose_stamped.header.frame_id = "world".into();
     ik.pose_stamped.pose = pose_msg(inside);
     let (_, without) = PLANNER.ik(&ik, Some(&current(&READY)));
     assert_eq!(without.val, Code::SUCCESS, "{}", without.message);
+    ik.pose_stamped.header.frame_id = "panda_link0".into();
     let (_, with) = CELL.ik(&ik, Some(&current(&READY)));
     assert_eq!(with.val, Code::NO_IK_SOLUTION, "{}", with.message);
     ik.pose_stamped.pose = pose_msg(Pose::new(Vec3::new(0.3, 0.3, 0.4), down));
@@ -1910,6 +1936,7 @@ fn a_workcells_fixed_links_are_obstacles_to_plans_ik_and_cartesian_paths() {
     line.header.frame_id = "world".into();
     let free = PLANNER.cartesian_path(&line, Some(&current(&READY)));
     assert_eq!(free.fraction, 1.0, "{}", free.error_code.message);
+    line.header.frame_id = "panda_link0".into();
     let stopped = CELL.cartesian_path(&line, Some(&current(&READY)));
     assert!(
         stopped.fraction > 0.0 && stopped.fraction < 1.0,

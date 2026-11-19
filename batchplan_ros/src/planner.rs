@@ -5,7 +5,7 @@ use std::fmt;
 use std::hash::Hasher;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -163,6 +163,8 @@ pub struct Planner {
     grids: Grids,
     defaults: PlannerSettings,
     configurations: RwLock<HashMap<(String, String), PlannerSettings>>,
+    /// Held by an update from reading the settings it starts from until it has stored its own.
+    updating: Mutex<()>,
     world_links: Vec<scene::WorldLink>,
     world_markers: Vec<ros_env::visualization_msgs::msg::Marker>,
 }
@@ -289,6 +291,7 @@ impl Planner {
                 trajectory_dt: o.trajectory_dt,
             },
             configurations: RwLock::new(HashMap::new()),
+            updating: Mutex::new(()),
             world_links,
             world_markers,
         };
@@ -354,6 +357,8 @@ impl Planner {
         replace: bool,
     ) -> Result<()> {
         let planner = self.configuration_name(group, planner)?;
+        // One update at a time, so none is lost; requests go on reading meanwhile.
+        let _updating = self.updating.lock().unwrap_or_else(|e| e.into_inner());
         let previous = if replace {
             self.defaults.clone()
         } else {
