@@ -345,7 +345,9 @@ public:
         const auto bracket = name.find('[');
         if ((bracket == std::string::npos) != every_group)
           continue;
-        const auto planner = every_group ? name : name.substr(bracket + 1, name.size() - bracket - 2);
+        // An empty planner name is batchplan's, as the node reads it.
+        const auto named = every_group ? name : name.substr(bracket + 1, name.size() - bracket - 2);
+        const std::string planner = named.empty() ? "batchplan" : named;
         for (const auto& group : every_group ? groups_ : std::vector<std::string>{ name.substr(0, bracket) })
         {
           const auto entry = group + "[" + planner + "]";

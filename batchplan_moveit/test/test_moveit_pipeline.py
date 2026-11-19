@@ -174,8 +174,8 @@ def test_planner_parameters_set_through_moveit_change_batchplans_plans(ros):
         params = call(node, get, request).params
         return dict(zip(params.keys, params.values))
 
-    def set_parameters(group, values, replace=False):
-        request = SetPlannerParams.Request(pipeline_id="batchplan", planner_config="batchplan", group=group, replace=replace)
+    def set_parameters(group, values, replace=False, planner="batchplan"):
+        request = SetPlannerParams.Request(pipeline_id="batchplan", planner_config=planner, group=group, replace=replace)
         request.params.keys, request.params.values = list(values), list(values.values())
         call(node, change, request)
 
@@ -198,6 +198,11 @@ def test_planner_parameters_set_through_moveit_change_batchplans_plans(ros):
     assert shown("hand")["trajectory_dt"] == "0.05"
     assert (shown("panda_arm")["trajectory_dt"], shown("panda_arm")["ik.seeds"]) == ("0.05", "32")
     assert spacing() == pytest.approx(0.05, abs=1e-6)
+
+    # A planner left unnamed is batchplan.
+    set_parameters("", {"solutions_per_pose": "6"}, planner="")
+    assert (shown("panda_arm")["solutions_per_pose"], shown("panda_arm")["ik.seeds"]) == ("6", "32")
+    assert shown("hand")["trajectory_dt"] == "0.05"
 
     set_parameters("panda_arm", {"ik.seeds": "0"})
     assert shown("panda_arm")["ik.seeds"] == "32"
