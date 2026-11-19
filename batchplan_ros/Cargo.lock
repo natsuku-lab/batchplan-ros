@@ -276,8 +276,10 @@ name = "batchplan_ros"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-std",
  "batchplan",
  "futures",
+ "mesh-loader",
  "rclrs",
  "ros-env",
  "roxmltree 0.21.1",

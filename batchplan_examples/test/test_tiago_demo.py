@@ -63,12 +63,22 @@ def ros():
 
 
 def run(ros, client, goal):
+    """The goal's result. A goal whose answer got lost on the way is sent once more, as in
+    test_panda_demo's `run`."""
     node = ros[0]
-    sent = client.send_goal_async(goal)
-    rclpy.spin_until_future_complete(node, sent, timeout_sec=30)
-    result = sent.result().get_result_async()
-    rclpy.spin_until_future_complete(node, result, timeout_sec=120)
-    return result.result().result
+    for last in (False, True):
+        sent = client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(node, sent, timeout_sec=30)
+        if sent.result() is None:
+            assert not last, "the goal request got no answer, twice"
+            continue
+        result = sent.result().get_result_async()
+        rclpy.spin_until_future_complete(node, result, timeout_sec=120)
+        answer = result.result().result
+        # A controller's own result has a number for its error code, and no message.
+        message = getattr(answer.error_code, "message", "")
+        if "did not answer the goal request" not in message or last:
+            return answer
 
 
 def transform(robot: yourdfpy.URDF, joints: dict, link: str) -> np.ndarray:

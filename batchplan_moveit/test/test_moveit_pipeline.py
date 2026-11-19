@@ -12,7 +12,7 @@ import pytest
 import rclpy
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes, PlanningScene
-from moveit_msgs.srv import ApplyPlanningScene, GetMotionPlan, QueryPlannerInterfaces
+from moveit_msgs.srv import ApplyPlanningScene, GetMotionPlan, GetPlannerParams, QueryPlannerInterfaces, SetPlannerParams
 from rclpy.action import ActionClient
 from sensor_msgs.msg import JointState
 
@@ -150,3 +150,65 @@ def test_orientation_path_constraints_reach_batchplan(ros):
     # message.
     assert response.error_code.val != MoveItErrorCodes.SUCCESS
     assert "every goal breaks the path constraints" in response.error_code.message, response.error_code.message
+
+
+def test_a_request_that_allows_no_planning_time_gets_the_nodes_default(ros):
+    node, planning, _ = ros
+    request = plan_request(joint_goal(BEYOND_WALL))
+    request.motion_plan_request.allowed_planning_time = 0.0
+    response = call(node, planning, request).motion_plan_response
+    assert response.error_code.val == MoveItErrorCodes.SUCCESS, response.error_code.message
+
+
+def test_planner_parameters_set_through_moveit_change_batchplans_plans(ros):
+    """MoveIt's planner parameters are batchplan's settings: a group's change its plans, one set
+    for every group reaches each without undoing its own, and a value batchplan refuses changes
+    nothing."""
+    node, planning, _ = ros
+    get = node.create_client(GetPlannerParams, "/get_planner_params")
+    change = node.create_client(SetPlannerParams, "/set_planner_params")
+    assert get.wait_for_service(timeout_sec=10.0) and change.wait_for_service(timeout_sec=10.0)
+
+    def shown(group):
+        request = GetPlannerParams.Request(pipeline_id="batchplan", planner_config="batchplan", group=group)
+        params = call(node, get, request).params
+        return dict(zip(params.keys, params.values))
+
+    def set_parameters(group, values, replace=False, planner="batchplan"):
+        request = SetPlannerParams.Request(pipeline_id="batchplan", planner_config=planner, group=group, replace=replace)
+        request.params.keys, request.params.values = list(values), list(values.values())
+        call(node, change, request)
+
+    def spacing():
+        response = call(node, planning, plan_request(joint_goal(BEYOND_WALL))).motion_plan_response
+        assert response.error_code.val == MoveItErrorCodes.SUCCESS, response.error_code.message
+        first, second = response.trajectory.joint_trajectory.points[:2]
+        seconds = lambda p: p.time_from_start.sec + 1e-9 * p.time_from_start.nanosec
+        return seconds(second) - seconds(first)
+
+    assert shown("panda_arm")["trajectory_dt"] == "0.02"
+    assert spacing() == pytest.approx(0.02, abs=1e-6)
+
+    set_parameters("panda_arm", {"trajectory_dt": "0.1", "ik.seeds": "32"})
+    assert shown("panda_arm")["trajectory_dt"] == "0.1"
+    assert shown("hand")["trajectory_dt"] == "0.02"
+    assert spacing() == pytest.approx(0.1, abs=1e-6)
+
+    set_parameters("", {"trajectory_dt": "0.05"})
+    assert shown("hand")["trajectory_dt"] == "0.05"
+    assert (shown("panda_arm")["trajectory_dt"], shown("panda_arm")["ik.seeds"]) == ("0.05", "32")
+    assert spacing() == pytest.approx(0.05, abs=1e-6)
+
+    # A planner left unnamed is batchplan.
+    set_parameters("", {"solutions_per_pose": "6"}, planner="")
+    assert (shown("panda_arm")["solutions_per_pose"], shown("panda_arm")["ik.seeds"]) == ("6", "32")
+    assert shown("hand")["trajectory_dt"] == "0.05"
+
+    set_parameters("panda_arm", {"ik.seeds": "0"})
+    assert shown("panda_arm")["ik.seeds"] == "32"
+    assert spacing() == pytest.approx(0.05, abs=1e-6)
+
+    for group in ("panda_arm", "hand", "panda_arm_hand"):
+        set_parameters(group, {}, replace=True)
+    assert shown("panda_arm")["trajectory_dt"] == "0.02"
+    assert spacing() == pytest.approx(0.02, abs=1e-6)

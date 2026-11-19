@@ -63,6 +63,7 @@ struct Group {
 
 #[derive(Default)]
 pub struct Srdf {
+    disabled_collisions: Vec<(String, String)>,
     groups: BTreeMap<String, Group>,
     /// End effectors' parent links: the frames pose goals usually name.
     end_effector_links: Vec<String>,
@@ -81,6 +82,9 @@ impl Srdf {
         let mut srdf = Srdf::default();
         for n in doc.root_element().children().filter(Node::is_element) {
             match n.tag_name().name() {
+                "disable_collisions" => srdf
+                    .disabled_collisions
+                    .push((attr(n, "link1")?, attr(n, "link2")?)),
                 "group" => {
                     let mut group = Group::default();
                     for c in n.children().filter(Node::is_element) {
@@ -108,6 +112,10 @@ impl Srdf {
 
     pub fn has_group(&self, name: &str) -> bool {
         self.groups.contains_key(name)
+    }
+
+    pub fn disabled_collisions(&self) -> &[(String, String)] {
+        &self.disabled_collisions
     }
 
     /// The joints `group` moves, as MoveIt resolves them: a chain's joints from its tip up to its

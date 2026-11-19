@@ -68,6 +68,15 @@ pixi run ros2 launch batchplan_ros planner.launch.py robot_description_semantic:
 
 In an existing ROS 2 Lyrical or Jazzy workspace, with Rust 1.90 or later, `colcon-cargo`, `colcon-ros-cargo` and `cargo-ament-build` installed: `colcon build --packages-select batchplan_ros`.
 
+## Configuration
+
+- **Workcells:** `robot_link_roots` keeps fixed tables and fixtures out of the robot's sphere fit and plans around them as world geometry.
+- **Search settings:** IK, planning and sampling settings are ROS parameters at startup and MoveIt planner parameters while running.
+- **Cancellation:** cancelling an action stops planning or the controller's goal; every wait on the controller is bounded, and a stop it does not confirm is `CONTROL_FAILED`.
+- **Visualization:** `~/collision_spheres` publishes the collision model as RViz markers.
+
+See [configuration](docs/configuration.md) for details.
+
 ## Development
 
 Early-stage software. CI covers the node and browser demo on Linux and macOS, and the MoveIt plugin on Linux, for Lyrical and Jazzy.
