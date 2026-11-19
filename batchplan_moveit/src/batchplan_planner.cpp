@@ -3,16 +3,15 @@
 
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
-#include <cstdlib>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <moveit/planning_interface/planning_interface.hpp>
 #include <moveit/planning_scene/planning_scene.hpp>
@@ -34,6 +33,8 @@ using GetPlannerParams = moveit_msgs::srv::GetPlannerParams;
 using SetPlannerParams = moveit_msgs::srv::SetPlannerParams;
 using Clock = std::chrono::steady_clock;
 
+// One request's cancellation: whether it was asked for, and the goal to cancel once the node has
+// accepted it.
 struct Cancellation
 {
   std::atomic_bool requested{ false };
@@ -66,29 +67,10 @@ public:
     spinner_.join();
   }
 
-  // The shared deadline includes waiting for another context and applying its settings.
-  MoveGroup::Result plan(const MoveGroup::Goal& goal, const Parameters& parameters,
-                        Clock::time_point deadline, const std::shared_ptr<Cancellation>& cancellation)
+  // The planner's answer by `deadline`, or an error code saying why there is none.
+  MoveGroup::Result plan(const MoveGroup::Goal& goal, Clock::time_point deadline,
+                         const std::shared_ptr<Cancellation>& cancellation)
   {
-    // Applying a configuration and planning with it must not interleave with another context.
-    std::unique_lock<std::timed_mutex> planning_lock(planning_mutex_, std::defer_lock);
-    while (!cancellation->requested)
-    {
-      if (planning_lock.try_lock_until(std::min(deadline, Clock::now() + std::chrono::milliseconds(10))))
-        break;
-      if (Clock::now() >= deadline)
-        return failure(MoveItErrorCodes::TIMED_OUT, "planning client is busy");
-    }
-    if (cancellation->requested)
-      return failure(MoveItErrorCodes::PREEMPTED, "planning cancelled");
-    const auto configure_error = configure(goal.request, parameters, deadline);
-    if (cancellation->requested)
-      return failure(MoveItErrorCodes::PREEMPTED, "planning cancelled");
-    if (!configure_error.empty())
-      return failure(Clock::now() >= deadline ? MoveItErrorCodes::TIMED_OUT :
-                                               MoveItErrorCodes::INVALID_MOTION_PLAN, configure_error);
-    if (Clock::now() >= deadline)
-      return failure(MoveItErrorCodes::TIMED_OUT, "planning time exhausted while applying settings");
     if (!client_->wait_for_action_server(std::max(Clock::duration::zero(), deadline - Clock::now())))
       return failure(MoveItErrorCodes::COMMUNICATION_FAILURE, "batchplan_planner is not running");
     auto configured = goal;
@@ -167,16 +149,17 @@ public:
     return values;
   }
 
-private:
-  std::string configure(const moveit_msgs::msg::MotionPlanRequest& motion, const Parameters& values,
-                        Clock::time_point deadline)
+  // Replaces a group's settings for a planner with the node's defaults and `values`. Returns the
+  // settings the node then holds, which are the ones before if it refused a value (the service
+  // has no status to say so), or nothing if it did not answer by `deadline`.
+  std::optional<Parameters> set(const std::string& group, const std::string& planner, const Parameters& values,
+                                Clock::time_point deadline)
   {
-    if (Clock::now() >= deadline ||
-        !set_params_->wait_for_service(std::max(Clock::duration::zero(), deadline - Clock::now())))
-      return "batchplan parameter service is not available";
+    if (!set_params_->wait_for_service(std::max(Clock::duration::zero(), deadline - Clock::now())))
+      return std::nullopt;
     auto request = std::make_shared<SetPlannerParams::Request>();
-    request->group = motion.group_name;
-    request->planner_config = motion.planner_id.empty() ? "batchplan" : motion.planner_id;
+    request->group = group;
+    request->planner_config = planner;
     request->replace = true;
     for (const auto& [key, value] : values)
     {
@@ -187,51 +170,12 @@ private:
     if (pending.wait_until(deadline) != std::future_status::ready)
     {
       set_params_->remove_pending_request(pending);
-      return "batchplan parameter update timed out";
+      return std::nullopt;
     }
-    pending.get();
-    // SetPlannerParams has no status field. Read back the validated values, never assume success.
-    const auto actual = parameters(request->group, request->planner_config, deadline);
-    if (!actual)
-      return "cannot verify batchplan parameter update";
-    for (const auto& [key, value] : values)
-    {
-      const auto found = actual->find(key);
-      if (found == actual->end() || !equivalent(key, value, found->second))
-        return "batchplan rejected parameter " + key + "=" + value + "; see backend log";
-    }
-    return {};
+    return parameters(group, planner, deadline);
   }
 
-  static bool equivalent(const std::string& key, const std::string& requested, const std::string& actual)
-  {
-    if (requested == actual)
-      return true;
-    const bool integer = key == "solutions_per_pose" || key == "planning.control_points" ||
-                         key == "planning.samples_per_span" || key == "planning.history" ||
-                         key == "planning.validate_substeps" || key == "planning.shortcut.passes" ||
-                         key.find(".seeds") != std::string::npos ||
-                         key.find(".iterations") != std::string::npos ||
-                         key.find(".max_iterations") != std::string::npos ||
-                         key.find(".rng_seed") != std::string::npos;
-    if (integer)
-    {
-      std::uint64_t a, b;
-      const auto pa = std::from_chars(requested.data(), requested.data() + requested.size(), a);
-      const auto pb = std::from_chars(actual.data(), actual.data() + actual.size(), b);
-      return pa.ec == std::errc() && pa.ptr == requested.data() + requested.size() &&
-             pb.ec == std::errc() && pb.ptr == actual.data() + actual.size() && a == b;
-    }
-    char *end_requested, *end_actual;
-    const auto a = std::strtold(requested.c_str(), &end_requested);
-    const auto b = std::strtold(actual.c_str(), &end_actual);
-    return end_requested != requested.c_str() && *end_requested == '\0' &&
-           end_actual != actual.c_str() && *end_actual == '\0' &&
-           std::isfinite(a) && std::isfinite(b) &&
-           (key == "default_planning_time" ? static_cast<double>(a) == static_cast<double>(b) :
-                                            static_cast<float>(a) == static_cast<float>(b));
-  }
-
+private:
   static MoveGroup::Result failure(int code, const std::string& message)
   {
     MoveGroup::Result result;
@@ -247,16 +191,18 @@ private:
   rclcpp::Client<SetPlannerParams>::SharedPtr set_params_;
   rclcpp::executors::SingleThreadedExecutor executor_;
   std::thread spinner_;
-  std::timed_mutex planning_mutex_;
 };
 
 class BatchplanPlanningContext : public planning_interface::PlanningContext
 {
 public:
+  // `default_planning_time` is the node's, for requests that allow none.
   BatchplanPlanningContext(const std::string& group, moveit::core::RobotModelConstPtr model,
-                           std::shared_ptr<Client> client, Parameters parameters)
-    : planning_interface::PlanningContext("batchplan", group), model_(std::move(model)), client_(std::move(client)),
-      parameters_(std::move(parameters))
+                           std::shared_ptr<Client> client, double default_planning_time)
+    : planning_interface::PlanningContext("batchplan", group)
+    , model_(std::move(model))
+    , client_(std::move(client))
+    , default_planning_time_(default_planning_time)
   {
   }
 
@@ -281,24 +227,23 @@ public:
     getPlanningScene()->getPlanningSceneMsg(goal.planning_options.planning_scene_diff);
     goal.planning_options.plan_only = true;
 
-    const double seconds = request.allowed_planning_time;
+    const double seconds = request.allowed_planning_time > 0.0 ? request.allowed_planning_time : default_planning_time_;
     res.planner_id = "batchplan";
     moveit::core::robotStateToRobotStateMsg(start, res.start_state);
     res.error_code.val = MoveItErrorCodes::PREEMPTED;
     res.error_code.source = "batchplan_moveit";
     res.error_code.message = "planning cancelled";
-    if (!std::isfinite(seconds) || seconds <= 0.0 ||
+    if (!std::isfinite(seconds) ||
         seconds > std::chrono::duration<double>(Clock::duration::max() - begun.time_since_epoch()).count() - 1.0)
     {
       res.error_code.val = MoveItErrorCodes::INVALID_MOTION_PLAN;
-      res.error_code.message = "planning time must be finite, positive and representable";
+      res.error_code.message = "the planning time must be finite and representable";
       return;
     }
     const auto deadline = begun + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
     if (!cancellation->requested)
     {
-      // The backend owns native search attempts; MoveIt's response adapter owns final validation.
-      const auto result = client_->plan(goal, parameters_, deadline, cancellation);
+      const auto result = client_->plan(goal, deadline, cancellation);
       res.error_code = result.error_code;
       if (result.error_code.val == MoveItErrorCodes::SUCCESS)
       {
@@ -347,7 +292,7 @@ public:
 private:
   moveit::core::RobotModelConstPtr model_;
   std::shared_ptr<Client> client_;
-  Parameters parameters_;
+  double default_planning_time_;
   std::mutex cancellation_mutex_;
   std::shared_ptr<Cancellation> cancellation_ = std::make_shared<Cancellation>();
 };
@@ -363,24 +308,12 @@ public:
     if (!node->has_parameter(parameter))
       node->declare_parameter<std::string>(parameter, "/batchplan_planner/move_group");
     client_ = std::make_shared<Client>(node->get_parameter(parameter).as_string());
-    const auto defaults = client_->parameters("", "batchplan", Clock::now() + std::chrono::seconds(60));
-    if (!defaults)
-    {
-      RCLCPP_ERROR(node->get_logger(), "Cannot obtain BatchPlan settings; backend must provide ~/get_planner_params");
-      return false;
-    }
-    planning_interface::PlannerConfigurationSettings settings;
-    settings.config = *defaults;
-    defaults_ = *defaults;
-    // MoveIt's query service inserts globals first without overwriting them with group values.
-    for (const auto& group : model->getJointModelGroupNames())
-    {
-      settings.group = group;
-      settings.name = group;
-      config_settings_[settings.name] = settings;
-      settings.name = group + "[batchplan]";
-      config_settings_[settings.name] = settings;
-    }
+    logger_ = node->get_logger();
+    groups_ = model->getJointModelGroupNames();
+    // The node offers its services once it has loaded the robot, which can take a while the first
+    // time. Without its settings MoveIt has none to show or edit; plans use the node's own.
+    if (!load(std::chrono::seconds(60)))
+      RCLCPP_WARN(logger_, "batchplan_planner gave no settings within 60 s; its planner parameters are not shown");
     return true;
   }
 
@@ -394,42 +327,62 @@ public:
     algorithms = { "batchplan" };
   }
 
+  // MoveIt's SetPlannerParams hands over every configuration with one changed: a group's, named
+  // "group[planner]", or one for every group, named "planner". Each changed one goes to the node,
+  // and what the node then holds is what MoveIt shows. One for every group is applied to each
+  // group's and not kept, since MoveIt would show it over the groups' own values.
   void setPlannerConfigurations(const planning_interface::PlannerConfigurationMap& configurations) override
   {
-    auto merged = config_settings_;
-    for (const auto& [name, settings] : configurations)
+    if (defaults_.empty())
+      load(std::chrono::seconds(5));
+    auto held = config_settings_;
+    for (const auto& [name, asked] : configurations)
     {
-      auto normalized = settings;
-      normalized.config = defaults_;
-      for (const auto& [key, value] : settings.config)
-        normalized.config[key] = value;
-      merged[name] = std::move(normalized);
+      const auto bracket = name.find('[');
+      const bool every_group = bracket == std::string::npos;
+      const auto planner = every_group ? name : name.substr(bracket + 1, name.size() - bracket - 2);
+      for (const auto& group : every_group ? groups_ : std::vector<std::string>{ name.substr(0, bracket) })
+      {
+        auto& settings = held[group + "[" + planner + "]"];
+        // A group's configuration is whole, over the defaults; one for every group adds to each.
+        auto wanted = every_group && !settings.config.empty() ? settings.config : defaults_;
+        for (const auto& [key, value] : asked.config)
+          wanted[key] = value;
+        if (wanted == settings.config)
+          continue;
+        const auto stored = client_->set(group, planner, wanted, Clock::now() + std::chrono::seconds(5));
+        if (!stored)
+        {
+          RCLCPP_ERROR(logger_, "batchplan_planner did not take the settings of '%s' for '%s'", planner.c_str(),
+                       group.c_str());
+          continue;
+        }
+        if (*stored == settings.config)
+          RCLCPP_WARN(logger_, "batchplan_planner kept the settings of '%s' for '%s'; its log names a value it refused",
+                      planner.c_str(), group.c_str());
+        settings.name = group + "[" + planner + "]";
+        settings.group = group;
+        settings.config = *stored;
+      }
     }
-    planning_interface::PlannerManager::setPlannerConfigurations(merged);
+    planning_interface::PlannerManager::setPlannerConfigurations(held);
   }
 
   planning_interface::PlanningContextPtr
   getPlanningContext(const planning_scene::PlanningSceneConstPtr& scene, const planning_interface::MotionPlanRequest& req,
                      moveit_msgs::msg::MoveItErrorCodes& error_code) const override
   {
-    if (!req.planner_id.empty() && req.planner_id != "batchplan" && req.planner_id != "LIN")
+    // The node refuses groups and planners it does not know. Its own time for requests that
+    // allow none is 5 s unless its settings say otherwise.
+    double default_planning_time = 5.0;
+    const auto settings = config_settings_.find(req.group_name + "[batchplan]");
+    if (settings != config_settings_.end())
     {
-      error_code.val = MoveItErrorCodes::INVALID_MOTION_PLAN;
-      error_code.message = "unknown planner '" + req.planner_id + "'";
-      return {};
+      const auto time = settings->second.config.find("default_planning_time");
+      if (time != settings->second.config.end())
+        default_planning_time = std::stod(time->second);
     }
-    const auto key = req.group_name + "[" + (req.planner_id.empty() ? "batchplan" : req.planner_id) + "]";
-    auto config = config_settings_.find(key);
-    if (config == config_settings_.end())
-      config = config_settings_.find(req.group_name);
-    if (config == config_settings_.end())
-    {
-      error_code.val = MoveItErrorCodes::INVALID_GROUP_NAME;
-      return {};
-    }
-    auto parameters = config->second.config;
-    auto context = std::make_shared<BatchplanPlanningContext>(
-        req.group_name, model_, client_, std::move(parameters));
+    auto context = std::make_shared<BatchplanPlanningContext>(req.group_name, model_, client_, default_planning_time);
     context->setPlanningScene(scene);
     context->setMotionPlanRequest(req);
     error_code.val = MoveItErrorCodes::SUCCESS;
@@ -447,8 +400,27 @@ public:
   }
 
 private:
+  // The node's default settings as each group's configuration, if the node answers within `wait`.
+  bool load(Clock::duration wait)
+  {
+    const auto defaults = client_->parameters("", "batchplan", Clock::now() + wait);
+    if (!defaults)
+      return false;
+    defaults_ = *defaults;
+    for (const auto& group : groups_)
+    {
+      auto& settings = config_settings_[group + "[batchplan]"];
+      settings.name = group + "[batchplan]";
+      settings.group = group;
+      settings.config = defaults_;
+    }
+    return true;
+  }
+
   moveit::core::RobotModelConstPtr model_;
   std::shared_ptr<Client> client_;
+  rclcpp::Logger logger_ = rclcpp::get_logger("batchplan_moveit");
+  std::vector<std::string> groups_;
   Parameters defaults_;
 };
 }  // namespace batchplan_moveit

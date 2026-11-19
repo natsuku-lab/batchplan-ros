@@ -16,7 +16,7 @@ ARGUMENTS = {
     "device": ("cpu", str, "'cpu' or 'gpu'"),
     "controller_action": ("", str, "FollowJointTrajectory action used to execute plans"),
     "sphere_budget": ("64", int, "Collision spheres shared by selected robot links"),
-    "world_sdf_voxel_size": ("0.01", float, "Maximum URDF world mesh SDF grid spacing in meters"),
+    "world_sdf_voxel_size": ("0.01", float, "Grid spacing of URDF world meshes' distance grids, in meters"),
     "trajectory_dt": ("0.02", float, "Returned trajectory sample interval in seconds"),
 }
 

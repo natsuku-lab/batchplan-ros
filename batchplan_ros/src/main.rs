@@ -5,23 +5,22 @@
 //! (`moveit_msgs/srv/GetPositionIK`) solves IK; `~/compute_cartesian_path`
 //! (`moveit_msgs/srv/GetCartesianPath`) moves the hand in straight lines through waypoints.
 
+mod execution;
+
 use std::collections::BTreeMap;
-use std::future::{Future, pending};
+use std::future::pending;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use batchplan_ros::{DeviceKind, Planner, PlannerOptions, SearchOptions};
+use batchplan_ros::{DeviceKind, Kind, Planner, PlannerOptions, PlannerSettings, SearchOptions};
 use rclrs::{
-    ActionClient, ActionServer, CancelResponseCode, Context, CreateBasicExecutor, GoalClient,
-    GoalStatusCode, IntoPrimitiveOptions, Node, RclrsError, RclrsErrorFilter, RequestedGoal,
-    RequestedGoalClient, Service, SpinOptions, log_error, log_info,
+    ActionClient, ActionServer, Context, CreateBasicExecutor, IntoPrimitiveOptions, Node,
+    RclrsError, RclrsErrorFilter, RequestedGoal, Service, SpinOptions, log_error, log_info,
 };
-use ros_env::control_msgs::action::{
-    FollowJointTrajectory, FollowJointTrajectory_Goal, FollowJointTrajectory_Result,
-};
+use ros_env::control_msgs::action::FollowJointTrajectory;
 use ros_env::moveit_msgs::action::{
     MoveGroup, MoveGroup_Feedback, MoveGroup_Result, MoveGroupSequence, MoveGroupSequence_Feedback,
     MoveGroupSequence_Result,
@@ -36,12 +35,15 @@ use ros_env::sensor_msgs::msg::JointState;
 use ros_env::std_msgs;
 use ros_env::visualization_msgs::msg::MarkerArray;
 
+use crate::execution::{Outcome, Waits, execute};
+
 fn main() -> Result<()> {
     let context = Context::default_from_env()?;
     let mut executor = context.create_basic_executor();
     let node = executor.create_node("batchplan_planner")?;
 
     let mut text_parameters = vec![];
+    let mut duration_parameters = vec![];
     let mut text = |name: &str| -> Result<String> {
         let parameter = node
             .declare_parameter::<Arc<str>>(name)
@@ -72,31 +74,32 @@ fn main() -> Result<()> {
         .default(0.01)
         .read_only()?;
     let world_sdf_voxel_size = voxel_parameter.get() as f32;
-    anyhow::ensure!(
-        world_sdf_voxel_size.is_finite() && world_sdf_voxel_size > 0.0,
-        "world_sdf_voxel_size must be finite and positive"
-    );
     let threads_parameter = node
         .declare_parameter::<i64>("cpu_threads")
         .default(0)
         .read_only()?;
     let threads =
         usize::try_from(threads_parameter.get()).context("cpu_threads must be nonnegative")?;
-    let dt_parameter = node
-        .declare_parameter::<f64>("trajectory_dt")
-        .default(0.02)
-        .read_only()?;
-    let dt = dt_parameter.get();
     let budget_parameter = node
         .declare_parameter::<i64>("sphere_budget")
-        .default(64)
+        .default(PlannerOptions::default().sphere_budget as i64)
         .read_only()?;
-    let sphere_budget = usize::try_from(budget_parameter.get())
-        .context("sphere_budget must be a positive integer")?;
-    anyhow::ensure!(
-        sphere_budget > 0,
-        "sphere_budget must be a positive integer"
-    );
+    let sphere_budget =
+        usize::try_from(budget_parameter.get()).context("sphere_budget must be nonnegative")?;
+    let mut seconds = |name: &str, default: f64| -> Result<Duration> {
+        let parameter = node
+            .declare_parameter::<f64>(name)
+            .default(default)
+            .read_only()?;
+        let value = Duration::try_from_secs_f64(parameter.get())
+            .with_context(|| format!("{name} must be a duration in seconds"))?;
+        duration_parameters.push(parameter);
+        Ok(value)
+    };
+    let waits = Waits {
+        response: seconds("controller_response_timeout", 5.0)?,
+        margin: seconds("controller_result_margin", 30.0)?,
+    };
     let joint_limits = if limits_file.is_empty() {
         Default::default()
     } else {
@@ -104,7 +107,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("reading {limits_file}"))?;
         batchplan_ros::parse_joint_limits(&yaml)?
     };
-    let search_parameters = SearchOptions::from_node(&node)?;
+    let (settings, _settings_parameters) = declare_settings(&node)?;
     let options = PlannerOptions {
         package_dirs: package_dirs(),
         joint_limits,
@@ -121,9 +124,9 @@ fn main() -> Result<()> {
         } else {
             PathBuf::from(cache_dir)
         }),
-        trajectory_dt: dt as f32,
+        trajectory_dt: settings.trajectory_dt,
         sphere_budget,
-        search: search_parameters.options,
+        search: settings.search,
     };
 
     let latest: Arc<Mutex<Option<JointState>>> = Arc::new(Mutex::new(None));
@@ -160,28 +163,24 @@ fn main() -> Result<()> {
             let collision_spheres = collision_spheres.clone();
             std::thread::spawn(move || {
                 let begun = Instant::now();
-                let planner = match Planner::try_new_with_scene(
-                    &urdf,
-                    srdf.as_deref(),
-                    &options,
-                    |model, world| {
-                        collision_spheres
-                            .publish(batchplan_ros::collision_scene_markers(model, world))?;
-                        Ok(())
-                    },
-                ) {
+                let planner = match Planner::try_new(&urdf, srdf.as_deref(), &options) {
                     Ok(p) => Arc::new(p),
                     Err(e) => {
                         return log_error!(node.logger(), "cannot plan for this robot: {e:#}");
                     }
                 };
-                match serve(&node, Arc::clone(&planner), controller, latest) {
+                if let Err(e) = collision_spheres.publish(planner.collision_markers()) {
+                    log_error!(node.logger(), "cannot publish the collision model: {e}");
+                }
+                match serve(&node, Arc::clone(&planner), controller, waits, latest) {
                     Ok(served) => {
                         let _ = serving.set(served);
+                        let model = planner.robot().collision_model();
                         log_info!(
                             node.logger(),
-                            "planning {} joints on {}, ready in {:.1} s",
+                            "planning {} joints with {} spheres on {}, ready in {:.1} s",
                             planner.robot().dof(),
+                            model.spheres.values().map(Vec::len).sum::<usize>(),
                             planner.device_name(),
                             begun.elapsed().as_secs_f64()
                         );
@@ -211,6 +210,34 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// The search settings as read-only ROS parameters named as [`PlannerSettings::parameters`] names
+/// them, each defaulting to batchplan's value, with the parameters to keep declared.
+fn declare_settings(node: &Node) -> Result<(PlannerSettings, Vec<Box<dyn std::any::Any>>)> {
+    let defaults = PlannerSettings {
+        search: SearchOptions::default(),
+        trajectory_dt: PlannerOptions::default().trajectory_dt,
+    };
+    let mut values = defaults.parameters();
+    let mut declared: Vec<Box<dyn std::any::Any>> = vec![];
+    for (name, kind) in PlannerSettings::kinds() {
+        let value = values.get_mut(name).context("a setting without a value")?;
+        macro_rules! declare {
+            ($type:ty) => {{
+                let default = value.parse::<$type>().with_context(|| name.to_string())?;
+                let parameter = node.declare_parameter(name).default(default).read_only()?;
+                *value = parameter.get().to_string();
+                declared.push(Box::new(parameter));
+            }};
+        }
+        match kind {
+            Kind::Float => declare!(f64),
+            Kind::Integer => declare!(i64),
+            Kind::Boolean => declare!(bool),
+        }
+    }
+    Ok((defaults.with_parameters(&values)?, declared))
+}
+
 /// The node's interfaces, kept alive while it runs.
 struct Serving {
     _move_group: ActionServer<MoveGroup>,
@@ -225,6 +252,7 @@ fn serve(
     node: &Node,
     planner: Arc<Planner>,
     controller: Option<ActionClient<FollowJointTrajectory>>,
+    waits: Waits,
     latest: Arc<Mutex<Option<JointState>>>,
 ) -> Result<Serving, RclrsError> {
     let current = move || latest.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -318,9 +346,7 @@ fn serve(
                             current.as_ref(),
                         )
                     });
-                    let Some(answer) =
-                        cancellable(planned, goal.unless_cancel_requested(pending::<()>())).await
-                    else {
+                    let Ok(answer) = goal.unless_cancel_requested(planned).await else {
                         log_info!(node.logger(), "goal {}: planning cancelled", &id[..8]);
                         return goal.begin_cancelling().cancelled_with(MoveGroup_Result {
                             error_code: error(MoveItErrorCodes::PREEMPTED, "planning cancelled"),
@@ -350,23 +376,25 @@ fn serve(
                         goal.publish_feedback(MoveGroup_Feedback {
                             state: "MONITOR".into(),
                         });
-                        let mut execution = Execution::default();
-                        match cancellable(
-                            execution.run(controller.as_ref(), &result.planned_trajectory),
+                        match execute(
+                            &node,
+                            controller.as_ref(),
+                            &result.planned_trajectory,
+                            waits,
                             goal.unless_cancel_requested(pending::<()>()),
                         )
                         .await
                         {
-                            Some(Ok(())) => {
+                            Outcome::Done => {
                                 result.executed_trajectory = result.planned_trajectory.clone()
                             }
-                            Some(Err(message)) => {
+                            Outcome::Failed(message) => {
                                 result.error_code =
                                     error(MoveItErrorCodes::CONTROL_FAILED, &message)
                             }
-                            None => {
+                            Outcome::Cancelled(stopped) => {
                                 let goal = goal.begin_cancelling();
-                                result.error_code = execution.cancel(&node).await;
+                                result.error_code = cancelled(&node, &id, stopped);
                                 return if result.error_code.val == MoveItErrorCodes::PREEMPTED {
                                     goal.cancelled_with(result)
                                 } else {
@@ -429,9 +457,7 @@ fn serve(
                             current.as_ref(),
                         )
                     });
-                    let Some(response) =
-                        cancellable(planned, goal.unless_cancel_requested(pending::<()>())).await
-                    else {
+                    let Ok(response) = goal.unless_cancel_requested(planned).await else {
                         log_info!(node.logger(), "goal {}: planning cancelled", &id[..8]);
                         return goal
                             .begin_cancelling()
@@ -463,22 +489,24 @@ fn serve(
                             state: "MONITOR".into(),
                         });
                         for trajectory in &response.planned_trajectories {
-                            let mut execution = Execution::default();
-                            match cancellable(
-                                execution.run(controller.as_ref(), trajectory),
+                            match execute(
+                                &node,
+                                controller.as_ref(),
+                                trajectory,
+                                waits,
                                 goal.unless_cancel_requested(pending::<()>()),
                             )
                             .await
                             {
-                                Some(Ok(())) => {}
-                                Some(Err(message)) => {
+                                Outcome::Done => {}
+                                Outcome::Failed(message) => {
                                     response.error_code =
                                         error(MoveItErrorCodes::CONTROL_FAILED, &message);
                                     break;
                                 }
-                                None => {
+                                Outcome::Cancelled(stopped) => {
                                     let goal = goal.begin_cancelling();
-                                    response.error_code = execution.cancel(&node).await;
+                                    response.error_code = cancelled(&node, &id, stopped);
                                     let result = MoveGroupSequence_Result { response };
                                     return if result.response.error_code.val
                                         == MoveItErrorCodes::PREEMPTED
@@ -558,203 +586,20 @@ async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
     rx.await.ok()
 }
 
-// Poll cancellation first so already-ready work cannot dispatch a trajectory after cancellation.
-async fn cancellable<T>(work: impl Future<Output = T>, cancellation: impl Future) -> Option<T> {
-    match futures::future::select(Box::pin(cancellation), Box::pin(work)).await {
-        futures::future::Either::Left(_) => None,
-        futures::future::Either::Right((result, _)) => Some(result),
-    }
-}
-
-const CONTROLLER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
-// The timer thread exits immediately when the operation completes or is cancelled.
-async fn bounded<T>(
-    work: impl Future<Output = T>,
-    limit: std::time::Duration,
-) -> Result<T, String> {
-    let (keep_timer, cancel_timer) = std::sync::mpsc::channel::<()>();
-    let (alarm, timer) = futures::channel::oneshot::channel();
-    std::thread::spawn(move || {
-        if cancel_timer.recv_timeout(limit) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-            let _ = alarm.send(());
+/// A cancelled execution as the action's error code, logged: `PREEMPTED` once the controller
+/// confirmed that it stopped, `CONTROL_FAILED` when it did not.
+fn cancelled(node: &Node, id: &str, stopped: Result<&'static str, String>) -> MoveItErrorCodes {
+    match stopped {
+        Ok(message) => {
+            log_info!(node.logger(), "goal {}: {message}", &id[..8]);
+            error(MoveItErrorCodes::PREEMPTED, message)
         }
-    });
-    let result = cancellable(work, timer)
-        .await
-        .ok_or_else(|| "controller wait timed out".into());
-    drop(keep_timer);
-    result
-}
-
-// A timed-out acceptance must still be observed: the server can start this goal later.
-fn observe_late<T: Send + 'static>(
-    requested: impl Future<Output = Option<T>> + Send + 'static,
-    stop: impl FnOnce(T) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
-) {
-    std::thread::spawn(move || {
-        futures::executor::block_on(async move {
-            if let Some(active) = requested.await {
-                stop(active).await;
-            }
-        })
-    });
-}
-
-fn cancel_late(requested: RequestedGoalClient<FollowJointTrajectory>) {
-    observe_late(requested, |active| {
-        Box::pin(async move {
-            let mut execution = Execution {
-                pending: None,
-                active: Some(active),
-            };
-            if let Err(message) = execution.stop().await {
-                log_error!(
-                    "batchplan_planner",
-                    "cannot confirm late controller stop: {message}"
-                );
-            }
-        })
-    });
-}
-
-async fn confirm_stop(
-    acknowledgement: impl Future<Output = Result<(), String>>,
-    terminal: impl Future<Output = (GoalStatusCode, FollowJointTrajectory_Result)>,
-    limit: std::time::Duration,
-) -> Result<&'static str, String> {
-    bounded(acknowledgement, limit)
-        .await
-        .map_err(|e| format!("cancellation acknowledgement: {e}"))??;
-    let (status, result) = bounded(terminal, limit)
-        .await
-        .map_err(|e| format!("cancellation terminal result: {e}"))?;
-    match status {
-        GoalStatusCode::Cancelled => Ok("goal cancelled; controller stopped"),
-        GoalStatusCode::Succeeded if result.error_code == 0 => {
-            Ok("goal cancelled after the controller had already completed")
+        Err(message) => {
+            let message =
+                format!("goal cancelled; cannot confirm that the controller stopped: {message}");
+            log_error!(node.logger(), "goal {}: {message}", &id[..8]);
+            error(MoveItErrorCodes::CONTROL_FAILED, &message)
         }
-        _ => Err(format!(
-            "the controller ended with {status:?}: {}",
-            result.error_string
-        )),
-    }
-}
-
-fn stop_code(result: Result<&'static str, String>) -> MoveItErrorCodes {
-    match result {
-        Ok(message) => error(MoveItErrorCodes::PREEMPTED, message),
-        Err(message) => error(MoveItErrorCodes::CONTROL_FAILED, &message),
-    }
-}
-
-#[derive(Default)]
-struct Execution {
-    pending: Option<RequestedGoalClient<FollowJointTrajectory>>,
-    active: Option<GoalClient<FollowJointTrajectory>>,
-}
-
-impl Execution {
-    async fn run(
-        &mut self,
-        controller: Option<&ActionClient<FollowJointTrajectory>>,
-        trajectory: &RobotTrajectory,
-    ) -> Result<(), String> {
-        let controller =
-            controller.ok_or("set controller_action to execute; the node only plans")?;
-        let goal = FollowJointTrajectory_Goal {
-            trajectory: trajectory.joint_trajectory.clone(),
-            ..Default::default()
-        };
-        let requested = controller
-            .try_request_goal(goal)
-            .map_err(|e| e.to_string())?;
-        self.active = match bounded(self.pending.insert(requested), CONTROLLER_WAIT).await {
-            Ok(active) => active,
-            Err(message) => {
-                cancel_late(self.pending.take().expect("pending acceptance"));
-                return Err(message);
-            }
-        };
-        self.pending = None;
-        let accepted = self
-            .active
-            .as_mut()
-            .ok_or("the controller rejected the trajectory")?;
-        // Allow the requested trajectory duration plus a bounded controller grace period.
-        let duration = trajectory
-            .joint_trajectory
-            .points
-            .last()
-            .map(|p| p.time_from_start.sec.max(0) as u64)
-            .unwrap_or(0);
-        let limit = std::time::Duration::from_secs(duration.saturating_add(30));
-        let (status, result) = match bounded(&mut accepted.result, limit).await {
-            Ok(result) => result,
-            Err(message) => {
-                return Err(match self.stop().await {
-                    Ok(_) => message,
-                    Err(stop) => format!("{message}; cannot confirm controller stop: {stop}"),
-                });
-            }
-        };
-        self.active = None;
-        if status == GoalStatusCode::Succeeded && result.error_code == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "the controller ended with {status:?}: {}",
-                result.error_string
-            ))
-        }
-    }
-
-    async fn cancel(&mut self, node: &Node) -> MoveItErrorCodes {
-        let code = stop_code(self.stop().await);
-        if code.val == MoveItErrorCodes::CONTROL_FAILED {
-            log_error!(
-                node.logger(),
-                "cannot confirm controller stop: {}",
-                code.message
-            );
-        } else {
-            log_info!(node.logger(), "{}", code.message);
-        }
-        code
-    }
-
-    async fn stop(&mut self) -> Result<&'static str, String> {
-        // Do not drop an in-flight request: it may still be accepted and start moving.
-        if let Some(mut requested) = self.pending.take() {
-            self.active = match bounded(&mut requested, CONTROLLER_WAIT).await {
-                Ok(active) => active,
-                Err(message) => {
-                    cancel_late(requested);
-                    return Err(message);
-                }
-            };
-        }
-        let Some(active) = self.active.take() else {
-            return Ok("goal cancelled; no controller goal is active");
-        };
-        let acknowledgement = async {
-            let response = active
-                .cancellation
-                .try_cancel()
-                .map_err(|e| e.to_string())?
-                .await;
-            // Accept with an empty goals_canceling list does not confirm cancellation.
-            if response.code != CancelResponseCode::GoalTerminated
-                && (response.code != CancelResponseCode::Accept || response.stamp.is_none())
-            {
-                return Err(format!(
-                    "controller did not accept cancellation: {:?}",
-                    response.code
-                ));
-            }
-            Ok(())
-        };
-        confirm_stop(acknowledgement, active.result, CONTROLLER_WAIT).await
     }
 }
 
@@ -782,116 +627,4 @@ fn default_cache_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
     base.join("batchplan-ros")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::executor::block_on;
-    use std::time::Duration;
-
-    #[test]
-    fn cancellation_wins_over_ready_work() {
-        assert_eq!(block_on(cancellable(async { 42 }, async {})), None);
-    }
-
-    #[test]
-    fn controller_waits_complete_or_time_out() {
-        assert_eq!(
-            block_on(bounded(async { 42 }, CONTROLLER_WAIT)).unwrap(),
-            42
-        );
-        assert!(block_on(bounded(pending::<()>(), Duration::from_millis(5))).is_err());
-    }
-
-    #[test]
-    fn timed_out_borrowed_acceptance_can_still_be_observed() {
-        let (tx, mut rx) = futures::channel::oneshot::channel();
-        assert!(block_on(bounded(&mut rx, Duration::from_millis(5))).is_err());
-        tx.send(42).unwrap();
-        assert_eq!(block_on(rx).unwrap(), 42);
-    }
-
-    #[test]
-    fn stopping_without_a_dispatched_goal_is_confirmed() {
-        assert!(block_on(Execution::default().stop()).is_ok());
-    }
-    #[test]
-    fn unconfirmed_stops_report_control_failed() {
-        let limit = Duration::from_millis(5);
-        let terminal = || async {
-            (
-                GoalStatusCode::Cancelled,
-                FollowJointTrajectory_Result::default(),
-            )
-        };
-        let missing_ack = block_on(confirm_stop(pending(), terminal(), limit));
-        assert!(
-            missing_ack
-                .as_ref()
-                .unwrap_err()
-                .contains("acknowledgement")
-        );
-        assert_eq!(stop_code(missing_ack).val, MoveItErrorCodes::CONTROL_FAILED);
-        let missing_result = block_on(confirm_stop(async { Ok(()) }, pending(), limit));
-        assert!(
-            missing_result
-                .as_ref()
-                .unwrap_err()
-                .contains("terminal result")
-        );
-        assert_eq!(
-            stop_code(missing_result).val,
-            MoveItErrorCodes::CONTROL_FAILED
-        );
-        let rejected = block_on(confirm_stop(
-            async { Err("rejected".into()) },
-            pending(),
-            limit,
-        ));
-        assert_eq!(stop_code(rejected).val, MoveItErrorCodes::CONTROL_FAILED);
-        for (status, code, expected) in [
-            (GoalStatusCode::Cancelled, 0, MoveItErrorCodes::PREEMPTED),
-            (GoalStatusCode::Succeeded, 0, MoveItErrorCodes::PREEMPTED),
-            (
-                GoalStatusCode::Succeeded,
-                -1,
-                MoveItErrorCodes::CONTROL_FAILED,
-            ),
-            (
-                GoalStatusCode::Aborted,
-                -1,
-                MoveItErrorCodes::CONTROL_FAILED,
-            ),
-        ] {
-            let result = block_on(confirm_stop(
-                async { Ok(()) },
-                async {
-                    (
-                        status,
-                        FollowJointTrajectory_Result {
-                            error_code: code,
-                            ..Default::default()
-                        },
-                    )
-                },
-                limit,
-            ));
-            assert_eq!(stop_code(result).val, expected);
-        }
-    }
-
-    #[test]
-    fn late_acceptance_is_cancelled_after_caller_times_out() {
-        let (accepted, mut acceptance) = futures::channel::oneshot::channel();
-        assert!(block_on(bounded(&mut acceptance, Duration::from_millis(5))).is_err());
-        let (stopped, observed) = std::sync::mpsc::channel();
-        observe_late(async { acceptance.await.unwrap() }, |goal| {
-            Box::pin(async move {
-                stopped.send(goal).unwrap();
-            })
-        });
-        accepted.send(Some(42)).unwrap();
-        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), 42);
-    }
 }

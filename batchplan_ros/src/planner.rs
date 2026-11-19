@@ -63,7 +63,7 @@ pub struct PlannerOptions {
     pub cache_dir: Option<PathBuf>,
     /// Roots whose strict descendants own robot collision geometry; empty selects all links.
     pub robot_link_roots: Vec<String>,
-    /// Maximum grid spacing in meters for URDF world meshes.
+    /// Grid spacing of the distance grids of the URDF's world meshes (meters).
     pub world_sdf_voxel_size: f32,
     /// Spheres shared by the selected robot links.
     pub sphere_budget: usize,
@@ -161,21 +161,11 @@ pub struct Planner {
     virtual_joints: Vec<(String, String)>,
     hands: Vec<String>,
     grids: Grids,
-    dt: f32,
-    search: SearchOptions,
+    defaults: PlannerSettings,
     configurations: RwLock<HashMap<(String, String), PlannerSettings>>,
     world_links: Vec<scene::WorldLink>,
     world_markers: Vec<ros_env::visualization_msgs::msg::Marker>,
     world_exemptions: Vec<(String, String)>,
-}
-
-fn check_sphere_budget(model: &CollisionModel, budget: usize) -> Result<usize> {
-    let count: usize = model.spheres.values().map(Vec::len).sum();
-    anyhow::ensure!(
-        count <= budget,
-        "URDF collision model uses {count} spheres, exceeding sphere_budget={budget}; increase the budget"
-    );
-    Ok(count)
 }
 
 impl fmt::Debug for Planner {
@@ -191,49 +181,10 @@ impl Planner {
     /// Loads the robot from its URDF and SRDF text: the SRDF's disabled collision pairs and end
     /// effectors, collision spheres fitted once and kept in `o.cache_dir`, and the limits given.
     pub fn try_new(urdf: &str, srdf: Option<&str>, o: &PlannerOptions) -> Result<Self> {
-        Self::try_new_with_scene(urdf, srdf, o, |_, _| Ok(()))
-    }
-
-    /// Reports robot spheres and URDF world markers before planning-data allocation.
-    /// Reporting failures are logged without preventing planning.
-    pub fn try_new_with_scene(
-        urdf: &str,
-        srdf: Option<&str>,
-        o: &PlannerOptions,
-        mut report: impl FnMut(
-            &CollisionModel,
-            &[ros_env::visualization_msgs::msg::Marker],
-        ) -> Result<()>,
-    ) -> Result<Self> {
-        o.search.validate()?;
-        anyhow::ensure!(
-            o.trajectory_dt.is_finite() && o.trajectory_dt > 0.0,
-            "trajectory_dt must be finite and positive"
-        );
         let tree = Tree::parse(urdf)?;
-        anyhow::ensure!(
-            o.sphere_budget > 0,
-            "sphere_budget must be a positive integer"
-        );
         let parsed = srdf.map(Srdf::parse).transpose()?.unwrap_or_default();
         let partition = workcell::Partition::new(urdf, &o.robot_link_roots)?;
         let robot_urdf = partition.robot_urdf.as_str();
-        let doc = roxmltree::Document::parse(robot_urdf)?;
-        let minimum = doc
-            .root_element()
-            .children()
-            .filter(|n| n.has_tag_name("link"))
-            .filter(|n| {
-                n.children()
-                    .any(|c| c.has_tag_name("collision") || c.has_tag_name("visual"))
-            })
-            .count();
-        anyhow::ensure!(
-            o.sphere_budget >= minimum,
-            "sphere_budget={} is below the minimum of {} geometry-bearing robot links",
-            o.sphere_budget,
-            minimum
-        );
         let (world_links, world_markers) = world_geometry::world_model(
             urdf,
             partition.robot_links.as_ref(),
@@ -284,26 +235,11 @@ impl Planner {
             dir.join(format!("{:016x}.json", hash.finish()))
         });
         if let Some(path) = cached.as_ref().filter(|p| p.exists()) {
-            let model = CollisionModel::load(path)?;
-            check_sphere_budget(&model, o.sphere_budget)?;
-            options.collision_model = Some(model);
+            options.collision_model = Some(CollisionModel::load(path)?);
             // The cached model already holds the SRDF's pairs.
             options.srdf = None;
         }
         let robot = Robot::from_urdf(robot_urdf, &options)?;
-        let count = check_sphere_budget(robot.collision_model(), o.sphere_budget)?;
-        rclrs::log_info!(
-            "batchplan_planner",
-            "budgeted collision model: {} robot spheres (maximum {})",
-            count,
-            o.sphere_budget
-        );
-        if let Err(e) = report(robot.collision_model(), &world_markers) {
-            rclrs::log_error!(
-                "batchplan_planner",
-                "cannot publish collision visualization: {e:#}"
-            );
-        }
         if let Some(path) = cached.filter(|_| options.collision_model.is_none()) {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)
@@ -316,13 +252,19 @@ impl Planner {
             DeviceKind::Cpu { threads } => Device::cpu_threads(&robot, threads)?,
             DeviceKind::Gpu => Device::gpu(&robot)?,
         };
+        // batchplan checks obstacles when a world is uploaded: a workcell it refuses is refused
+        // here, not at the first request.
+        let obstacles = world_links.iter().flat_map(|l| l.obstacles.iter().cloned());
+        device
+            .upload(&[World::new(obstacles.collect())])
+            .context("the URDF's world geometry")?;
         let meshes = MeshModel::try_new(&robot)?;
         let root = tree
             .root()
             .context("the URDF has no root link")?
             .to_string();
         let virtual_joints = parsed.virtual_joints().to_vec();
-        Ok(Self {
+        let planner = Self {
             robot,
             device,
             meshes,
@@ -332,13 +274,30 @@ impl Planner {
             virtual_joints,
             hands,
             grids: Grids::new(SdfOptions::default()),
-            dt: o.trajectory_dt,
-            search: o.search.clone(),
+            defaults: PlannerSettings {
+                search: o.search.clone(),
+                trajectory_dt: o.trajectory_dt,
+            },
             configurations: RwLock::new(HashMap::new()),
             world_links,
             world_markers,
             world_exemptions,
-        })
+        };
+        planner.accepts(&planner.defaults)?;
+        Ok(planner)
+    }
+
+    /// Refuses settings the node or batchplan cannot plan with. batchplan checks its options
+    /// when a solver is called, so each solver is called with nothing to solve.
+    fn accepts(&self, settings: &PlannerSettings) -> Result<()> {
+        settings.check()?;
+        let search = &settings.search;
+        let worlds = self.device.upload(&[World::default()])?;
+        solve_ik(&self.device, &worlds, &[], &search.ik)?;
+        batchplan::plan(&self.device, &worlds, &[], &search.planning)?;
+        batchplan::follow(&self.device, &worlds, &[], &search.cartesian)?;
+        batchplan::join(&self.device, &worlds, &[], &search.join)?;
+        Ok(())
     }
 
     /// The robot it plans for.
@@ -347,17 +306,11 @@ impl Planner {
         &self.robot
     }
 
-    /// Full link-local collision model for a frame-locked RViz MarkerArray display.
+    /// The collision model it plans with, for RViz: the robot's spheres and the URDF's world
+    /// geometry, each in its link's frame and locked to it.
     #[must_use]
     pub fn collision_markers(&self) -> ros_env::visualization_msgs::msg::MarkerArray {
         crate::visualization::scene(self.robot.collision_model(), &self.world_markers)
-    }
-
-    /// Native URDF world obstacles, grouped by link and expressed in that link's frame.
-    pub fn urdf_world_links(&self) -> impl Iterator<Item = (&str, &[batchplan::Obstacle])> {
-        self.world_links
-            .iter()
-            .map(|l| (l.name.as_str(), l.obstacles.as_slice()))
     }
 
     /// What runs the batches: the GPU adapter, or the CPU's thread count.
@@ -377,13 +330,11 @@ impl Planner {
             .get(&(group.into(), planner.into()))
             .or_else(|| configs.get(&(String::new(), planner.into())))
             .cloned()
-            .unwrap_or_else(|| PlannerSettings {
-                search: self.search.clone(),
-                trajectory_dt: self.dt,
-            }))
+            .unwrap_or_else(|| self.defaults.clone()))
     }
 
-    /// Standard MoveIt configuration updates are validated atomically.
+    /// Applies a MoveIt configuration update whole, or not at all when the node or batchplan
+    /// refuses a value.
     pub fn set_planner_parameters(
         &self,
         group: &str,
@@ -397,19 +348,16 @@ impl Planner {
             .write()
             .map_err(|_| anyhow::anyhow!("planner configuration lock poisoned"))?;
         let key = (group.into(), planner.into());
-        let defaults = PlannerSettings {
-            search: self.search.clone(),
-            trajectory_dt: self.dt,
-        };
         let previous = if replace {
-            &defaults
+            &self.defaults
         } else {
             configs
                 .get(&key)
                 .or_else(|| configs.get(&(String::new(), planner.into())))
-                .unwrap_or(&defaults)
+                .unwrap_or(&self.defaults)
         };
         let settings = previous.with_parameters(values)?;
+        self.accepts(&settings)?;
         configs.insert(key, settings);
         Ok(())
     }

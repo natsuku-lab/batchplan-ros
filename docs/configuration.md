@@ -1,92 +1,69 @@
 # Configuring the planner node
 
-How `batchplan_planner` divides a workcell URDF between robot and world collision geometry, which search settings it exposes, and how it cancels requests.
+How `batchplan_planner` divides a workcell URDF between robot and world collision geometry, which search settings it exposes, and how it executes and cancels trajectories.
 
-- [Sphere budget](#sphere-budget)
-- [Robot subtrees and URDF world geometry](#robot-subtrees-and-urdf-world-geometry)
+- [Workcells](#workcells)
 - [Collision visualization](#collision-visualization)
 - [Search settings](#search-settings)
-- [Cancellation](#cancellation)
+- [Execution and cancellation](#execution-and-cancellation)
 
-## Sphere budget
+## Workcells
 
-The positive integer `sphere_budget` parameter (also an argument to `planner.launch.py`, default `64`) controls the collision-sphere fit for the selected robot links. With no `robot_link_roots`, the whole URDF is fitted, including fixed tables and fixtures.
-
-Large robot models need a larger budget: coarse spheres extend beyond the actual collision geometry and can reject goals that MoveIt accepts. Increasing the budget refines that approximation without disabling collisions or changing the trajectory's final mesh checks.
-
-The budget is a hard maximum, not a target sphere count: the fitter may use coarser, more inflated spheres to meet it, and models that cannot fit it, including cached models, are rejected rather than exceeding it. Sphere fits are cached separately for each budget; restart the planner after changing it.
-
-## Robot subtrees and URDF world geometry
-
-A workcell URDF can hold both a moving robot and fixed equipment. Set `robot_link_roots` to keep the fixed equipment out of the robot's sphere fit and plan around it as world geometry:
-
-```yaml
-robot_link_roots: [ur/base_link]
-world_sdf_voxel_size: 0.01
-```
+A workcell URDF can hold both a moving robot and fixed equipment such as tables and fixtures. By default the whole URDF is the robot: every link shares the collision-sphere fit, and large fixed objects take spheres from the arm. Set `robot_link_roots` to keep the fixed equipment out of the fit and plan around it as world geometry:
 
 ```bash
 ros2 launch batchplan_ros planner.launch.py 'robot_link_roots:=[ur/base_link]'
 ```
 
-Only the **strict descendants** of these links own robot collision geometry; the named roots themselves are not included unless they descend from another selected root. Multiple roots select the union of their descendants. An empty list retains the all-robot behavior. Unknown roots, empty descendant selections, and non-fixed joints outside the selected subtrees fail explicitly: URDF world links must be rigidly attached to the workcell root.
+Only the **strict descendants** of these links are the robot; the named roots themselves are not, unless they descend from another root. Several roots select the union of their descendants. Every other link must be fixed to the URDF's root, and each IK frame must be a robot link; otherwise the node refuses the description at startup.
 
-All kinematic links, joints and frame transforms are retained. Only collision ownership changes:
+All links, joints and frames are kept. Only collision ownership changes:
 
-- **Robot links** use spheres and final mesh checks.
-- **Other links** use native oriented boxes, spheres and cylinders. The world loader also accepts `<capsule radius="..." length="..."/>`, where length is the central segment's length. Each collision origin's translation and rotation are composed with its link's transform, including separate origins for multiple collision elements.
-- **World meshes** use conservative SDFs directly, not sphere or primitive fitting.
+- **Robot links** are checked as fitted spheres, and each trajectory once more against their meshes.
+- **Other links** become world obstacles in their link's frame: boxes, spheres, cylinders, and `<capsule radius="..." length="..."/>`, where `length` is the distance between the caps' centers. A mesh becomes a distance grid, so it must be a closed surface.
 
-URDF world obstacles are retained alongside the request's planning scene, including for IK and Cartesian services that carry no scene. SRDF and adjacent/rigid-link exemptions survive the robot/world split; explicit request ACM entries override them. Request objects cannot reuse URDF world-link ids to replace or remove them. Robot caches are keyed by the collision-filtered URDF, so an all-robot cache cannot be reused for a different collision partition.
+These obstacles are part of every request, alongside the request's planning scene, including IK and Cartesian-path requests that carry no scene. A scene object cannot take a world link's name. A robot link may touch the world link it is mounted on and any world link fixed to the same body; SRDF `disable_collisions` pairs that name a world link apply too, and a request's allowed collision matrix overrides both.
 
-### World mesh requirements
+| Parameter | Default | Meaning |
+|---|---|---|
+| `robot_link_roots` | `[]` | Links whose strict descendants are the robot; empty for the whole URDF. |
+| `sphere_budget` | `64` | Collision spheres for the robot links. Large robots need more: coarse spheres reach past the geometry and can refuse goals MoveIt accepts. Fits are cached per budget. |
+| `world_sdf_voxel_size` | `0.01` | Grid spacing of a world mesh's distance grid, in meters. |
 
-- Meshes must be watertight, consistently oriented, non-self-intersecting solids; nested shells and cavities are rejected. Disconnected shells, including shells touching only at a vertex, are split and oriented independently.
-- Repeated Collada `instance_geometry` references and `instance_node` elements are rejected, because the importer does not preserve their instances. Bake those instances into unique mesh geometry first; single-instance Collada remains supported.
-- Mesh files larger than 64 MiB are rejected before loading.
-- `world_sdf_voxel_size` is the maximum grid spacing in meters. Grids above 67,108,864 points, or exceeding the SDF builder's numeric limits, are rejected before allocating grid data; resolution is never coarsened to make a grid fit. These are fixed resource limits, not estimates of available system memory.
+batchplan decides which values, shapes and meshes it can plan with, and the node reports its refusal at startup.
 
 ## Collision visualization
 
-`~/collision_spheres` publishes the whole URDF collision model as `visualization_msgs/msg/MarkerArray`, with reliable transient-local QoS. Add an RViz MarkerArray display with matching durability.
-
-- Robot spheres are cyan; native world shapes are orange. World SDF markers show their source triangle surfaces, not a meshed SDF inflation halo.
-- Markers use link-local coordinates and are frame-locked, so they follow the robot's TF. Equal-radius spheres are batched for rendering.
-- The markers represent the URDF model (including fixed fixtures), not world objects from individual planning requests. They are visualization only, not duplicate MoveIt obstacles.
-- Publication failures are logged but do not prevent planner initialization.
+`~/collision_spheres` publishes the collision model as a `visualization_msgs/msg/MarkerArray` with transient-local QoS: add an RViz MarkerArray display with matching durability. Robot spheres are cyan and world obstacles orange, each in its link's frame and frame-locked, so they follow TF. A world mesh is drawn as its triangles. The markers show the URDF's model, not the objects of individual planning scenes.
 
 ## Search settings
 
-The node exposes every native `IkOptions`, `PlanOptions`, `RrtOptions`, `ShortcutOptions`, `ToolPathOptions` and `JoinOptions` search field. `PlanOptions.time_budget` is represented by the request's planning time, with `default_planning_time` (5 seconds) as fallback.
+The node exposes batchplan's IK, planning, RRT, shortcut, Cartesian and join options, and a few of its own:
 
-| ROS parameter prefix | Settings |
+| Prefix | Settings |
 |---|---|
 | `ik.*` | `seeds`, `iterations`, `damping`, `rotation_weight`, `max_step`, `collision_step`, `position_tolerance`, `rotation_tolerance`, `rng_seed` |
-| `ik.collision.*` | `world`, `self_collision`, `margin`, `self_margin` |
+| `ik.collision.*`, `planning.collision.*` | `world`, `self_collision`, `margin`, `self_margin` |
 | `planning.*` | `seeds`, `control_points`, `samples_per_span`, `iterations`, `history`, `initial_step`, `acceleration_weight`, `velocity_weight`, `validate_substeps`, `rng_seed` |
-| `planning.collision.*` | `world`, `self_collision`, `margin`, `self_margin` |
 | `planning.rrt.*` | `range`, `resolution`, `max_iterations`, `rng_seed`, `clearance`, `clearance_ramp` |
 | `planning.shortcut.*` | `resolution`, `passes`, `min_change`, `straighten`, `clearance`, `clearance_ramp` |
 | `cartesian.*` | `step`, `rotation_step`, `precision`, `rotation_precision`, `resolution`, `iterations` |
 | `join.*` | `resolution` |
+| the node's own | `solutions_per_pose` (4 IK solutions planned to per pose goal), `solution_distance` (0.05, how far apart in joint space they must be), `default_planning_time` (5 s, for requests that allow none), `trajectory_dt` (0.02 s between waypoints) |
 
-Other controls: `solutions_per_pose` (4), `solution_distance` (0.05 in joint space), `trajectory_dt` (0.02 seconds), `cpu_threads` (0 = all cores) and `device` (`cpu`/`gpu`).
+Defaults are batchplan's; see its [planning guide](https://github.com/natsuku-lab/batchplan/blob/main/docs/planning.md) for what each option does. A pose goal's tolerances can tighten `ik.position_tolerance` and `ik.rotation_tolerance`, and a Cartesian request's positive `max_step` replaces `cartesian.step`.
 
-- `ik.seeds` defaults to 32. `planning.seeds` defaults to 0 and enables additional trajectory-optimization candidates, not additional RRT attempts.
-- Spatial collision resolutions are joint-space distances, not sampling times.
-- Pose requests can tighten the configured IK tolerances. A Cartesian request's positive `max_step` overrides `cartesian.step`.
-- Finer trajectory sampling is not a substitute for MoveIt's `ValidateSolution`.
+The node checks its own four settings and asks batchplan about the rest, at startup and at every update, so a value batchplan refuses is refused with batchplan's message.
 
-### Startup defaults
+### At startup
 
-Startup defaults are read-only ROS parameters. Inspect them with `ros2 param list /batchplan_planner` and `ros2 param get /batchplan_planner ik.seeds`. To set persistent defaults, pass a parameter file, which overrides the launch defaults:
+Each setting is a read-only ROS parameter of the same name (`ros2 param get /batchplan_planner ik.seeds`). Set them in a parameter file:
 
 ```yaml
 # search.yaml
 /**:
   ros__parameters:
-    trajectory_dt: 0.02
-    ik.seeds: 64
+    ik.seeds: 128
     solutions_per_pose: 8
     planning.rrt.max_iterations: 20000
 ```
@@ -95,29 +72,31 @@ Startup defaults are read-only ROS parameters. Inspect them with `ros2 param lis
 ros2 launch batchplan_ros planner.launch.py parameters_file:=/absolute/path/search.yaml
 ```
 
-Device, CPU threads, sphere fitting and world geometry are startup settings only.
+### While running
 
-### Editing while running
+`~/get_planner_params` and `~/set_planner_params` (`moveit_msgs/srv/GetPlannerParams`, `SetPlannerParams`) read and change the settings of a group and planner (`batchplan`, or `LIN` for straight-line moves; an empty planner name means `batchplan`). An update without a group applies to every group that has no settings of its own. An update is applied whole or, if any value is refused, not at all; the service has no status, so read the settings back, or see the node's log. A request plans with the settings its group has when it starts. Settings last until the node stops.
 
-Live planner configurations use `~/get_planner_params` and `~/set_planner_params` on the node (MoveIt's `/get_planner_params` and `/set_planner_params` through the plugin); an empty planner name selects `batchplan`. Unknown groups and planner names are rejected rather than using defaults. Valid groups inherit global settings when no group-specific override exists. Invalid edits fail planning explicitly and are logged by the node.
-
-In RViz, select the group and the `batchplan` planner under **Context → Planning Library**: **Planner Parameters** exposes the 50 search and sampling settings for editing. Edits are uploaded to the node when the next MoveIt planning request starts, so they apply to subsequent plans for that group, not in-flight plans. They are session-only; save persistent defaults in YAML.
-
-The node must be ready within 60 seconds when MoveIt loads the plugin, so the plugin can discover the configured defaults. Rebuild and restart both packages together when updating this interface.
+Through MoveIt the same settings are move_group's `/get_planner_params` and `/set_planner_params`, and **Planner Parameters** in RViz once the `batchplan` planner is selected under **Context → Planning Library**. The plugin sends each change to the node as it is made and shows what the node then holds. An update without a group reaches every group. If the node is not running when move_group loads the plugin (it waits 60 s), MoveIt shows no parameters and plans use the node's own settings.
 
 ### Planning time and attempts
 
-MoveIt's `allowed_planning_time` and `num_planning_attempts` are supported, as are its velocity/acceleration scaling and Cartesian speed caps.
+A request's `allowed_planning_time` is shared by its `num_planning_attempts`. An attempt that finds no IK solution or no path is followed by another with different IK, optimization and RRT seeds, until one succeeds or the time is up. A `LIN` request follows one straight line, so it is attempted once.
 
-- Attempts share one overall time budget and stop at the first valid result. Each retry changes the IK, optimization and RRT seeds; zero attempts means one.
-- `LIN` follows a fixed Cartesian line rather than retrying alternate paths.
-- MoveIt's `ValidateSolution` response adapter performs final validation with the actual planning scene. The plugin does not repeat this scan inside the search time budget or rerun successful native searches on adapter rejection. Differences between collision models can still cause validation failures.
+## Execution and cancellation
 
-## Cancellation
+A goal that is not plan-only is executed through the `controller_action` `FollowJointTrajectory` server. The node bounds every wait on the controller:
 
-Both standalone actions accept cancellation during planning and execution.
+| Parameter | Default | The controller's time |
+|---|---|---|
+| `controller_response_timeout` | `5.0` s | For its action server to appear, to answer a goal request, to answer a cancel request, and to report the end of a cancelled goal. |
+| `controller_result_margin` | `30.0` s | For a trajectory's result, past the trajectory's own duration. |
 
-- **Planning:** canceled planning results are discarded without sending a controller goal. Native planning already in progress may finish in its worker thread.
-- **Execution:** cancellation is forwarded to the specific controller goal, including a goal whose acceptance is still pending. The action remains canceling until the controller confirms a terminal result.
-- **Unconfirmed stops:** a refused cancellation, or one the controller does not confirm in time, is reported as `CONTROL_FAILED`, not as a successful stop.
-- **MoveIt:** contexts cancel only their own requests; canceling a queued context does not affect the active context or submit another goal.
+Cancelling `~/move_group` or `~/sequence_move_group`:
+
+- **While planning:** the plan is dropped and no trajectory is sent.
+- **While executing:** the node cancels the controller's goal, including one the controller has not yet accepted, and waits for the controller to report its end. The result is `PREEMPTED` once it has.
+- **A stop that cannot be confirmed** is `CONTROL_FAILED`, never `PREEMPTED`: the controller refused or did not answer the cancel, or did not report the goal's end in time.
+
+Without a cancel, a controller that does not appear, does not answer the goal request, or gives no result in time fails the goal with `CONTROL_FAILED`. The node then cancels the controller's goal, also when the controller accepts it only after the node has given up, and the message says whether the controller confirmed that it stopped.
+
+Through MoveIt, a planning context cancels only its own request.

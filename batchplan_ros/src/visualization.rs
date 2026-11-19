@@ -1,18 +1,16 @@
-//! RViz markers for the collision spheres actually used by the planner.
+//! RViz markers for the collision model the planner checks: the robot's spheres and the URDF's
+//! world obstacles, each in its link's frame and locked to it.
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
 use batchplan::glam::Vec3;
 use batchplan::{CollisionModel, Obstacle};
-use parry3d_f64::shape::TriMesh;
 use ros_env::geometry_msgs::msg::{Point, Quaternion, Vector3};
 use ros_env::std_msgs::msg::{ColorRGBA, Header};
 use ros_env::visualization_msgs::msg::{Marker, MarkerArray};
 
 /// All spheres grouped by link and radius, following the robot's TF frames.
-#[must_use]
-pub fn spheres(model: &CollisionModel) -> MarkerArray {
+fn spheres(model: &CollisionModel) -> MarkerArray {
     let mut markers = vec![Marker {
         action: Marker::DELETEALL,
         ..Default::default()
@@ -61,19 +59,21 @@ pub fn spheres(model: &CollisionModel) -> MarkerArray {
 }
 
 /// Robot spheres and URDF world shapes, in their respective link frames.
-#[must_use]
-pub fn scene(model: &CollisionModel, world: &[Marker]) -> MarkerArray {
+pub(crate) fn scene(model: &CollisionModel, world: &[Marker]) -> MarkerArray {
     let mut result = spheres(model);
     result.markers.extend_from_slice(world);
     result
 }
 
+/// A world obstacle's markers, numbered from `id`: one, or a capsule's cylinder and two caps. A
+/// distance grid is drawn as the `mesh` it came from; any other obstacle without a marker shape
+/// has none.
 pub(crate) fn obstacle(
     link: &str,
     id: i32,
     obstacle: &Obstacle,
-    mesh: Option<&TriMesh>,
-) -> Result<Vec<Marker>> {
+    mesh: Option<(&[Vec3], &[[u32; 3]])>,
+) -> Vec<Marker> {
     let at = obstacle.pose();
     let mut marker = Marker {
         header: Header {
@@ -149,32 +149,32 @@ pub(crate) fn obstacle(
                 };
                 markers.push(cap);
             }
-            return Ok(markers);
+            return markers;
         }
-        Obstacle::Sdf { .. } => {
-            let mesh = mesh.ok_or_else(|| anyhow::anyhow!("SDF marker lacks source mesh"))?;
+        _ => {
+            let Some((vertices, triangles)) = mesh else {
+                return vec![];
+            };
             marker.type_ = Marker::TRIANGLE_LIST;
-            marker.points = mesh
-                .indices()
+            marker.points = triangles
                 .iter()
                 .flatten()
                 .map(|&i| {
-                    let p = mesh.vertices()[i as usize];
+                    let p = vertices[i as usize];
                     Point {
-                        x: p.x,
-                        y: p.y,
-                        z: p.z,
+                        x: p.x.into(),
+                        y: p.y.into(),
+                        z: p.z.into(),
                     }
                 })
                 .collect();
             Vec3::ONE
         }
-        other => bail!("unsupported world visualization: {other:?}"),
     };
     marker.scale = Vector3 {
         x: scale.x.into(),
         y: scale.y.into(),
         z: scale.z.into(),
     };
-    Ok(vec![marker])
+    vec![marker]
 }

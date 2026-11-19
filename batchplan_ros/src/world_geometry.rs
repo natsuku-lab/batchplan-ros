@@ -1,356 +1,35 @@
-//! URDF collision geometry retained as native world obstacles.
+//! A workcell URDF's fixed equipment as world obstacles: the collision geometry of the links
+//! outside the robot, each obstacle in its link's frame. batchplan says which shapes and meshes
+//! it can check against, when a mesh becomes a distance grid and when a world is uploaded.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
-use batchplan::glam::{DQuat, DVec3, EulerRot};
+use batchplan::glam::{EulerRot, Quat, Vec3};
 use batchplan::{Obstacle, SdfGrid, SdfOptions};
 use mesh_loader::Loader;
-use parry3d_f64::query::PointQuery;
-use parry3d_f64::shape::{TriMesh, TriMeshFlags};
+use ros_env::visualization_msgs::msg::Marker;
 use roxmltree::{Document, Node};
 
-const MAX_MESH_FILE_BYTES: u64 = 64 * 1024 * 1024;
+use crate::scene::WorldLink;
+use crate::visualization;
 
-enum Geometry {
-    Box(DVec3),
-    Sphere(f64),
-    Cylinder { radius: f64, half: f64 },
-    Capsule { radius: f64, half: f64 },
-    Mesh(Vec<TriMesh>),
-}
-
-struct Shape {
-    geometry: Geometry,
-    translation: DVec3,
-    rotation: DQuat,
-}
-
-fn vector(text: Option<&str>, default: DVec3) -> Result<DVec3> {
-    let Some(text) = text else { return Ok(default) };
-    let values = text
-        .split_whitespace()
-        .map(str::parse::<f64>)
-        .collect::<Result<Vec<_>, _>>()?;
-    ensure!(
-        values.len() == 3 && values.iter().all(|v| v.is_finite()),
-        "invalid geometry vector '{text}'"
-    );
-    Ok(DVec3::new(values[0], values[1], values[2]))
-}
-
-fn positive(node: Node, name: &str) -> Result<f64> {
-    let value = node
-        .attribute(name)
-        .with_context(|| format!("geometry lacks {name}"))?
-        .parse::<f64>()?;
-    ensure!(
-        value.is_finite() && value > 0.0,
-        "geometry {name} must be finite and positive"
-    );
-    Ok(value)
-}
-
-fn mesh_path(filename: &str, directories: &[PathBuf]) -> Result<PathBuf> {
-    if let Some(rest) = filename.strip_prefix("package://") {
-        let (package, file) = rest.split_once('/').context("invalid package mesh URI")?;
-        for directory in directories {
-            for path in [directory.join(package).join(file), directory.join(file)] {
-                if path.is_file()
-                    && (directory.file_name().is_some_and(|n| n == package)
-                        || path.starts_with(directory.join(package)))
-                {
-                    return Ok(path);
-                }
-            }
-        }
-        bail!("cannot resolve mesh '{filename}'");
-    }
-    let path = PathBuf::from(filename.strip_prefix("file://").unwrap_or(filename));
-    ensure!(
-        path.is_absolute() && path.is_file(),
-        "mesh path must resolve to an existing absolute file: {filename}"
-    );
-    Ok(path)
-}
-
-fn load_mesh(path: &Path, scale: DVec3) -> Result<Vec<TriMesh>> {
-    ensure!(
-        std::fs::metadata(path)?.len() <= MAX_MESH_FILE_BYTES,
-        "world collision mesh exceeds the 64 MiB file limit: {}",
-        path.display()
-    );
-    let bytes = std::fs::read(path)?;
-    // Match mesh-loader's extension/content detection, including extensionless Collada files.
-    let collada = match path.extension().and_then(|s| s.to_str()) {
-        Some("dae" | "DAE") => true,
-        Some("obj" | "OBJ" | "stl" | "STL") => false,
-        _ => bytes[..bytes.len().min(1024)]
-            .windows(8)
-            .any(|s| s == b"<COLLADA"),
-    };
-    if collada {
-        let doc = Document::parse(std::str::from_utf8(&bytes)?)
-            .with_context(|| format!("reading Collada scene {}", path.display()))?;
-        let mut instances = HashSet::new();
-        for node in doc.descendants().filter(Node::is_element) {
-            ensure!(
-                !node.has_tag_name("instance_node"),
-                "Collada instance_node is unsupported for world collisions; bake scene instances into unique meshes: {}",
-                path.display()
-            );
-            if node.has_tag_name("instance_geometry") {
-                let url = node
-                    .attribute("url")
-                    .context("Collada instance_geometry lacks url")?;
-                ensure!(
-                    instances.insert(url),
-                    "repeated Collada geometry instance '{url}' is unsupported for world collisions; bake scene instances into unique meshes: {}",
-                    path.display()
-                );
-            }
-        }
-    }
-    let scene = Loader::default()
-        .load_from_slice(&bytes, path)
-        .with_context(|| format!("loading {}", path.display()))?;
-    let mut vertices = vec![];
-    let mut triangles = vec![];
-    let mut indices = HashMap::new();
-    for mesh in scene.meshes {
-        let mut remap = vec![];
-        for v in mesh.vertices {
-            let p = DVec3::new(f64::from(v[0]), f64::from(v[1]), f64::from(v[2])) * scale;
-            ensure!(p.is_finite(), "mesh contains non-finite vertices");
-            let key = p.to_array().map(|v| if v == 0.0 { 0 } else { v.to_bits() });
-            let index = *indices.entry(key).or_insert_with(|| {
-                let index = vertices.len() as u32;
-                vertices.push(p);
-                index
-            });
-            remap.push(index);
-        }
-        for face in mesh.faces {
-            triangles.push(face.map(|i| remap[i as usize]));
-        }
-    }
-    solid_parts(vertices, triangles)
-        .with_context(|| format!("building solid world mesh {}", path.display()))
-}
-
-// Intersect each edge with the other triangle, allowing only their shared simplex.
-// Clipping also covers coplanar overlap, including adjacent faces folded onto each other.
-fn faces_cross(mesh: &TriMesh, a: u32, b: u32) -> bool {
-    let ia = mesh.indices()[a as usize];
-    let ib = mesh.indices()[b as usize];
-    let pa = ia.map(|i| mesh.vertices()[i as usize]);
-    let pb = ib.map(|i| mesh.vertices()[i as usize]);
-    let shared: Vec<_> = ia
-        .iter()
-        .filter(|i| ib.contains(i))
-        .map(|&i| mesh.vertices()[i as usize])
-        .collect();
-    let scale = pa
-        .iter()
-        .chain(&pb)
-        .map(|p| p.distance(pa[0]))
-        .fold(0.0_f64, f64::max);
-    let epsilon = scale * 1e-10;
-    let allowed = |p: DVec3| match shared.as_slice() {
-        [] => false,
-        [v] => p.distance(*v) <= epsilon,
-        [v, w] => {
-            let edge = *w - *v;
-            let t = ((p - *v).dot(edge) / edge.length_squared()).clamp(0.0, 1.0);
-            p.distance(*v + t * edge) <= epsilon
-        }
-        _ => false,
-    };
-    for (edges, face) in [(pa, pb), (pb, pa)] {
-        let normal = (face[1] - face[0]).cross(face[2] - face[0]).normalize();
-        for k in 0..3 {
-            let start = edges[k];
-            let delta = edges[(k + 1) % 3] - start;
-            let d0 = normal.dot(start - face[0]);
-            let slope = normal.dot(delta);
-            let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
-            if slope.abs() > epsilon {
-                lo = -d0 / slope;
-                hi = lo;
-                if !(0.0..=1.0).contains(&lo) {
-                    continue;
-                }
-            } else if d0.abs() > epsilon {
-                continue;
-            }
-            for j in 0..3 {
-                let inward = normal.cross(face[(j + 1) % 3] - face[j]).normalize();
-                let distance = inward.dot(start - face[j]);
-                let rate = inward.dot(delta);
-                if rate.abs() <= epsilon {
-                    if distance < -epsilon {
-                        hi = -1.0;
-                        break;
-                    }
-                } else if rate > 0.0 {
-                    lo = lo.max(-distance / rate);
-                } else {
-                    hi = hi.min(-distance / rate);
-                }
-            }
-            if lo <= hi + 1e-12
-                && hi >= 0.0
-                && lo <= 1.0
-                && (!allowed(start + delta * lo.clamp(0.0, 1.0))
-                    || !allowed(start + delta * hi.clamp(0.0, 1.0)))
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-pub(crate) fn solid_parts(vertices: Vec<DVec3>, triangles: Vec<[u32; 3]>) -> Result<Vec<TriMesh>> {
-    ensure!(!triangles.is_empty(), "mesh has no triangles");
-    ensure!(
-        vertices.iter().all(|v| v.is_finite()),
-        "mesh contains non-finite vertices"
-    );
-    ensure!(
-        triangles
-            .iter()
-            .flatten()
-            .all(|&i| (i as usize) < vertices.len()),
-        "mesh contains out-of-range vertex indices"
-    );
-    // Planning-scene meshes, like STL files, may repeat vertices per face.
-    // Weld exact positions before interpreting adjacency and shared intersections.
-    let mut positions = HashMap::new();
-    let mut welded = vec![];
-    let remap: Vec<u32> = vertices
-        .into_iter()
-        .map(|p| {
-            let key = p.to_array().map(|v| if v == 0.0 { 0 } else { v.to_bits() });
-            *positions.entry(key).or_insert_with(|| {
-                let index = welded.len() as u32;
-                welded.push(p);
-                index
-            })
-        })
-        .collect();
-    let vertices = welded;
-    let triangles: Vec<_> = triangles
-        .into_iter()
-        .map(|f| f.map(|i| remap[i as usize]))
-        .collect();
-    for &[a, b, c] in &triangles {
-        ensure!(
-            a != b && b != c && a != c,
-            "mesh contains degenerate triangles"
-        );
-        let (pa, pb, pc) = (
-            vertices[a as usize],
-            vertices[b as usize],
-            vertices[c as usize],
-        );
-        ensure!(
-            (pb - pa).cross(pc - pa).length_squared() > 0.0,
-            "mesh contains zero-area triangles"
-        );
-    }
-    let mut mesh = TriMesh::new(vertices, triangles)?;
-    let mut crossing = false;
-    mesh.bvh()
-        .traverse_bvtt_single_tree::<false>(&mut Default::default(), &mut |a, b| {
-            crossing = crossing || faces_cross(&mesh, a, b);
-        });
-    ensure!(
-        !crossing,
-        "world collision mesh contains self-intersections"
-    );
-    mesh.set_flags(TriMeshFlags::HALF_EDGE_TOPOLOGY)
-        .context("world collision meshes must be watertight and consistently oriented")?;
-    let topology = mesh.topology().context("mesh topology was not computed")?;
-    ensure!(
-        topology.half_edges.iter().all(|edge| edge.twin != u32::MAX),
-        "world collision meshes must be watertight and consistently oriented"
-    );
-
-    // Split vertex fans so shells touching only at a corner stay separate under
-    // Parry's vertex-based connectivity and can have their winding corrected independently.
-    let mut vertices = vec![];
-    let mut triangles = mesh.indices().to_vec();
-    let mut visited = vec![false; topology.half_edges.len()];
-    for first in 0..topology.half_edges.len() {
-        if visited[first] {
-            continue;
-        }
-        let index = vertices.len() as u32;
-        vertices.push(mesh.vertices()[topology.half_edges[first].vertex as usize]);
-        let mut current = first;
-        loop {
-            visited[current] = true;
-            let edge = &topology.half_edges[current];
-            let slot = mesh.indices()[edge.face as usize]
-                .iter()
-                .position(|&v| v == edge.vertex)
-                .expect("half-edge vertex belongs to its face");
-            triangles[edge.face as usize][slot] = index;
-            current = topology.half_edges[edge.twin as usize].next as usize;
-            if current == first {
-                break;
-            }
-        }
-    }
-    let mut mesh = TriMesh::new(vertices, triangles)?;
-    mesh.set_flags(TriMeshFlags::CONNECTED_COMPONENTS)?;
-    let mut parts = vec![];
-    for (vertices, mut faces) in mesh
-        .connected_components()
-        .context("mesh components were not computed")?
-        .to_mesh_buffers(&mesh)
-    {
-        let volume: f64 = faces
-            .iter()
-            .map(|&[a, b, c]| {
-                vertices[a as usize].dot(vertices[b as usize].cross(vertices[c as usize]))
-            })
-            .sum();
-        ensure!(volume.abs() > 0.0, "mesh component has no enclosed volume");
-        if volume < 0.0 {
-            for face in &mut faces {
-                face.swap(1, 2);
-            }
-        }
-        let mut part = TriMesh::new(vertices, faces)?;
-        part.set_flags(TriMeshFlags::ORIENTED)?;
-        parts.push(part);
-    }
-    for (i, part) in parts.iter().enumerate() {
-        for (j, other) in parts.iter().enumerate() {
-            ensure!(
-                i == j
-                    || !part
-                        .vertices()
-                        .iter()
-                        .all(|&p| other.project_local_point(p, false).is_inside),
-                "nested mesh shells require a cavity-aware solid representation"
-            );
-        }
-    }
-    Ok(parts)
-}
-
-fn shapes(
+/// The obstacles of every link outside `robot_links`, and their markers for RViz. Without
+/// `robot_links` the whole URDF is the robot and there are none. Meshes become distance grids
+/// laid out by `sdf`; `directories` hold the packages `package://` paths name.
+pub(crate) fn world_model(
     urdf: &str,
-    robot_links: &HashSet<String>,
+    robot_links: Option<&HashSet<String>>,
     directories: &[PathBuf],
-) -> Result<BTreeMap<String, Vec<Shape>>> {
+    sdf: &SdfOptions,
+) -> Result<(Vec<WorldLink>, Vec<Marker>)> {
+    let (mut links, mut markers) = (vec![], vec![]);
+    let Some(robot_links) = robot_links else {
+        return Ok((links, markers));
+    };
     let doc = Document::parse(urdf)?;
-    let mut links = BTreeMap::new();
     for link in doc
         .root_element()
         .children()
@@ -360,314 +39,149 @@ fn shapes(
         if robot_links.contains(name) {
             continue;
         }
-        let mut geometry = vec![];
-        for collision in link.children().filter(|n| n.has_tag_name("collision")) {
-            let origin = collision.children().find(|n| n.has_tag_name("origin"));
-            let translation = vector(origin.and_then(|n| n.attribute("xyz")), DVec3::ZERO)?;
-            let rpy = vector(origin.and_then(|n| n.attribute("rpy")), DVec3::ZERO)?;
-            let rotation = DQuat::from_euler(EulerRot::ZYX, rpy.z, rpy.y, rpy.x);
-            let node = collision
-                .children()
-                .find(|n| n.has_tag_name("geometry"))
-                .and_then(|n| n.children().find(Node::is_element))
-                .context("collision lacks geometry")?;
-            let shape = match node.tag_name().name() {
-                "box" => {
-                    let size = vector(node.attribute("size"), DVec3::ZERO)?;
-                    ensure!(
-                        size.cmpgt(DVec3::ZERO).all(),
-                        "box dimensions must be positive"
-                    );
-                    let half = size * 0.5;
-                    Shape {
-                        geometry: Geometry::Box(half),
-                        translation,
-                        rotation,
-                    }
-                }
-                "sphere" => {
-                    let radius = positive(node, "radius")?;
-                    Shape {
-                        geometry: Geometry::Sphere(radius),
-                        translation,
-                        rotation,
-                    }
-                }
-                "cylinder" => {
-                    let radius = positive(node, "radius")?;
-                    let half = positive(node, "length")? * 0.5;
-                    Shape {
-                        geometry: Geometry::Cylinder { radius, half },
-                        translation,
-                        rotation,
-                    }
-                }
-                "capsule" => {
-                    let radius = positive(node, "radius")?;
-                    let half = positive(node, "length")? * 0.5;
-                    Shape {
-                        geometry: Geometry::Capsule { radius, half },
-                        translation,
-                        rotation,
-                    }
-                }
-                "mesh" => {
-                    let path = mesh_path(
-                        node.attribute("filename").context("mesh lacks filename")?,
-                        directories,
-                    )?;
-                    let scale = vector(node.attribute("scale"), DVec3::ONE)?;
-                    ensure!(
-                        scale.abs().cmpgt(DVec3::ZERO).all(),
-                        "mesh scale must be nonzero"
-                    );
-                    let mesh = load_mesh(&path, scale)?;
-                    Shape {
-                        geometry: Geometry::Mesh(mesh),
-                        translation,
-                        rotation,
-                    }
-                }
-                other => bail!("unsupported world collision geometry: {other}"),
-            };
-            geometry.push(shape);
-        }
-        if !geometry.is_empty() {
-            links.insert(name.to_string(), geometry);
-        }
-    }
-    Ok(links)
-}
-
-pub(crate) fn world_model(
-    urdf: &str,
-    robot_links: Option<&HashSet<String>>,
-    directories: &[PathBuf],
-    sdf: &SdfOptions,
-) -> Result<(
-    Vec<crate::scene::WorldLink>,
-    Vec<ros_env::visualization_msgs::msg::Marker>,
-)> {
-    let mut links = vec![];
-    let mut markers = vec![];
-    let Some(robot_links) = robot_links else {
-        return Ok((links, markers));
-    };
-    ensure!(
-        sdf.voxel.is_finite() && sdf.voxel > 0.0,
-        "world_sdf_voxel_size must be finite and positive"
-    );
-    let sdf = *sdf;
-    for (name, shapes) in shapes(urdf, robot_links, directories)? {
         let mut obstacles = vec![];
-        let mut id = 0;
-        for shape in shapes {
-            let center = shape.translation.as_vec3();
-            let rotation = shape.rotation.as_quat();
-            ensure!(
-                center.is_finite() && rotation.is_finite(),
-                "world geometry pose exceeds f32 range"
-            );
-            let convert = |value: f64| -> Result<f32> {
-                let value = value as f32;
-                ensure!(
-                    value.is_finite() && value > 0.0,
-                    "world geometry dimension exceeds f32 range"
-                );
-                Ok(value)
-            };
-            let obstacle = match &shape.geometry {
-                Geometry::Box(half) => {
-                    let half_extents = half.as_vec3();
-                    ensure!(
-                        half_extents.is_finite()
-                            && half_extents.cmpgt(batchplan::glam::Vec3::ZERO).all(),
-                        "world box dimensions exceed f32 range"
-                    );
-                    Obstacle::Cuboid {
-                        center,
-                        rotation,
-                        half_extents,
-                    }
-                }
-                Geometry::Sphere(radius) => Obstacle::Sphere {
-                    center,
-                    radius: convert(*radius)?,
-                },
-                Geometry::Cylinder { radius, half } => Obstacle::Cylinder {
-                    center,
-                    rotation,
-                    radius: convert(*radius)?,
-                    half_height: convert(*half)?,
-                },
-                Geometry::Capsule { radius, half } => Obstacle::Capsule {
-                    center,
-                    rotation,
-                    radius: convert(*radius)?,
-                    half_length: convert(*half)?,
-                },
-                Geometry::Mesh(parts) => {
-                    for part in parts {
-                        let vertices: Vec<_> =
-                            part.vertices().iter().map(|v| v.as_vec3()).collect();
-                        let grid = SdfGrid::from_mesh(&vertices, part.indices(), &sdf)
-                            .with_context(|| format!("building world SDF for '{name}'"))?;
-                        let obstacle = Obstacle::Sdf {
-                            grid: Arc::new(grid),
-                            center,
-                            rotation,
-                        };
-                        let additions =
-                            crate::visualization::obstacle(&name, id, &obstacle, Some(part))?;
-                        id += additions.len() as i32;
-                        markers.extend(additions);
-                        obstacles.push(obstacle);
-                    }
-                    rclrs::log_info!(
-                        "batchplan_planner",
-                        "world SDF for '{}' uses {} m voxels",
-                        name,
-                        sdf.voxel
-                    );
-                    continue;
-                }
-            };
-            let additions = crate::visualization::obstacle(&name, id, &obstacle, None)?;
-            id += additions.len() as i32;
-            markers.extend(additions);
+        for collision in link.children().filter(|n| n.has_tag_name("collision")) {
+            let (obstacle, mesh) = obstacle(collision, directories, sdf)
+                .with_context(|| format!("world link '{name}'"))?;
+            let mesh = mesh.as_ref().map(|(v, t)| (v.as_slice(), t.as_slice()));
+            markers.extend(visualization::obstacle(
+                name,
+                markers.len() as i32,
+                &obstacle,
+                mesh,
+            ));
             obstacles.push(obstacle);
         }
-        rclrs::log_info!(
-            "batchplan_planner",
-            "URDF world link '{}' uses {} native obstacles",
-            name,
-            obstacles.len()
-        );
-        links.push(crate::scene::WorldLink { name, obstacles });
+        if !obstacles.is_empty() {
+            links.push(WorldLink {
+                name: name.to_string(),
+                obstacles,
+            });
+        }
     }
     Ok((links, markers))
+}
+
+type Mesh = (Vec<Vec3>, Vec<[u32; 3]>);
+
+/// One `<collision>` as an obstacle in its link's frame, with the mesh a distance grid came from.
+fn obstacle(
+    collision: Node,
+    directories: &[PathBuf],
+    sdf: &SdfOptions,
+) -> Result<(Obstacle, Option<Mesh>)> {
+    let origin = collision.children().find(|n| n.has_tag_name("origin"));
+    let center = vector(origin.and_then(|n| n.attribute("xyz")), Vec3::ZERO)?;
+    let rpy = vector(origin.and_then(|n| n.attribute("rpy")), Vec3::ZERO)?;
+    let rotation = Quat::from_euler(EulerRot::ZYX, rpy.z, rpy.y, rpy.x);
+    let shape = collision
+        .children()
+        .find(|n| n.has_tag_name("geometry"))
+        .and_then(|n| n.children().find(Node::is_element))
+        .context("a collision lacks geometry")?;
+    let number = |name: &str| -> Result<f32> {
+        let text = shape
+            .attribute(name)
+            .with_context(|| format!("a {} lacks {name}", shape.tag_name().name()))?;
+        Ok(text.parse()?)
+    };
+    Ok(match shape.tag_name().name() {
+        "box" => {
+            let half_extents = vector(shape.attribute("size"), Vec3::ZERO)? * 0.5;
+            let cuboid = Obstacle::Cuboid {
+                center,
+                rotation,
+                half_extents,
+            };
+            (cuboid, None)
+        }
+        "sphere" => {
+            let radius = number("radius")?;
+            (Obstacle::Sphere { center, radius }, None)
+        }
+        "cylinder" => {
+            let cylinder = Obstacle::Cylinder {
+                center,
+                rotation,
+                radius: number("radius")?,
+                half_height: number("length")? * 0.5,
+            };
+            (cylinder, None)
+        }
+        // `length` is the length of the segment between the caps' centers.
+        "capsule" => {
+            let capsule = Obstacle::Capsule {
+                center,
+                rotation,
+                radius: number("radius")?,
+                half_length: number("length")? * 0.5,
+            };
+            (capsule, None)
+        }
+        "mesh" => {
+            let filename = shape
+                .attribute("filename")
+                .context("a mesh lacks filename")?;
+            let path = mesh_path(filename, directories)?;
+            let scale = vector(shape.attribute("scale"), Vec3::ONE)?;
+            let (vertices, triangles) = load_mesh(&path, scale)?;
+            let grid = SdfGrid::from_mesh(&vertices, &triangles, sdf)
+                .with_context(|| format!("mesh {}", path.display()))?;
+            let grid = Obstacle::Sdf {
+                grid: Arc::new(grid),
+                center,
+                rotation,
+            };
+            (grid, Some((vertices, triangles)))
+        }
+        other => bail!("unsupported collision geometry: {other}"),
+    })
+}
+
+fn vector(text: Option<&str>, default: Vec3) -> Result<Vec3> {
+    let Some(text) = text else { return Ok(default) };
+    let values = text
+        .split_whitespace()
+        .map(str::parse::<f32>)
+        .collect::<Result<Vec<_>, _>>()?;
+    ensure!(values.len() == 3, "'{text}' is not three numbers");
+    Ok(Vec3::from_slice(&values))
+}
+
+/// A mesh file's path: `package://name/rest` under `directories`, or an absolute path.
+fn mesh_path(filename: &str, directories: &[PathBuf]) -> Result<PathBuf> {
+    let Some(rest) = filename.strip_prefix("package://") else {
+        let path = PathBuf::from(filename.strip_prefix("file://").unwrap_or(filename));
+        ensure!(
+            path.is_absolute(),
+            "mesh path {filename} is relative, and the URDF is given as text"
+        );
+        return Ok(path);
+    };
+    directories
+        .iter()
+        .map(|d| d.join(rest))
+        .find(|p| p.is_file())
+        .with_context(|| format!("cannot find mesh {filename}"))
+}
+
+/// Every mesh of a file as one, scaled.
+fn load_mesh(path: &Path, scale: Vec3) -> Result<Mesh> {
+    let scene = Loader::default()
+        .load(path)
+        .with_context(|| format!("loading mesh {}", path.display()))?;
+    let (mut vertices, mut triangles) = (vec![], vec![]);
+    for mesh in scene.meshes {
+        let first = vertices.len() as u32;
+        vertices.extend(mesh.vertices.iter().map(|&v| Vec3::from(v) * scale));
+        triangles.extend(mesh.faces.iter().map(|f| f.map(|i| i + first)));
+    }
+    Ok((vertices, triangles))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn cube() -> (Vec<DVec3>, Vec<[u32; 3]>) {
-        let vertices = vec![
-            DVec3::new(-1., -1., -1.),
-            DVec3::new(1., -1., -1.),
-            DVec3::new(1., 1., -1.),
-            DVec3::new(-1., 1., -1.),
-            DVec3::new(-1., -1., 1.),
-            DVec3::new(1., -1., 1.),
-            DVec3::new(1., 1., 1.),
-            DVec3::new(-1., 1., 1.),
-        ];
-        let faces = vec![
-            [0, 2, 1],
-            [0, 3, 2],
-            [4, 5, 6],
-            [4, 6, 7],
-            [0, 1, 5],
-            [0, 5, 4],
-            [1, 2, 6],
-            [1, 6, 5],
-            [2, 3, 7],
-            [2, 7, 6],
-            [3, 0, 4],
-            [3, 4, 7],
-        ];
-        (vertices, faces)
-    }
-
-    #[test]
-    fn closed_mesh_rejects_corner_pushed_through_opposite_face() {
-        let (mut vertices, faces) = cube();
-        assert!(solid_parts(vertices.clone(), faces.clone()).is_ok());
-        vertices[6] = DVec3::new(0.2, 0.3, -2.);
-        assert!(
-            solid_parts(vertices, faces)
-                .unwrap_err()
-                .to_string()
-                .contains("self-intersections")
-        );
-    }
-
-    #[test]
-    fn mesh_rejects_open_and_degenerate_faces() {
-        let (vertices, mut faces) = cube();
-        faces.pop();
-        assert!(solid_parts(vertices.clone(), faces).is_err());
-        assert!(solid_parts(vertices, vec![[0, 0, 1]]).is_err());
-    }
-
-    #[test]
-    fn face_intersection_allows_shared_edges_but_rejects_coplanar_overlap() {
-        let mesh = TriMesh::new(
-            vec![
-                DVec3::ZERO,
-                DVec3::X,
-                DVec3::Y,
-                -DVec3::Y,
-                DVec3::new(0.2, 0.2, 0.),
-            ],
-            vec![[0, 1, 2], [1, 0, 3], [1, 0, 4]],
-        )
-        .unwrap();
-        assert!(!faces_cross(&mesh, 0, 1));
-        assert!(faces_cross(&mesh, 0, 2));
-    }
-
-    #[test]
-    fn overlapping_shells_are_rejected_and_disjoint_shells_are_accepted() {
-        let (vertices, faces) = cube();
-        for (offset, valid) in [(DVec3::splat(0.5), false), (DVec3::splat(3.), true)] {
-            let mut both = vertices.clone();
-            both.extend(vertices.iter().map(|p| *p + offset));
-            let mut triangles = faces.clone();
-            triangles.extend(faces.iter().map(|f| f.map(|i| i + 8)));
-            assert_eq!(solid_parts(both, triangles).is_ok(), valid);
-        }
-    }
-    #[test]
-    fn inward_shells_and_shells_touching_at_one_vertex_remain_valid() {
-        let (vertices, mut faces) = cube();
-        for face in &mut faces {
-            face.swap(1, 2);
-        }
-        assert!(solid_parts(vertices.clone(), faces.clone()).is_ok());
-        let mut both = vertices.clone();
-        both.extend(
-            vertices
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != 0)
-                .map(|(_, p)| *p + DVec3::splat(2.)),
-        );
-        let mut triangles = faces.clone();
-        triangles.extend(
-            faces
-                .iter()
-                .map(|f| f.map(|i| if i == 0 { 6 } else { i + 7 })),
-        );
-        assert_eq!(solid_parts(both, triangles).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn nested_shells_and_invalid_indices_are_rejected() {
-        let (vertices, faces) = cube();
-        let mut both = vertices.clone();
-        both.extend(vertices.iter().map(|p| *p * 0.5));
-        let mut triangles = faces.clone();
-        triangles.extend(faces.iter().map(|f| f.map(|i| i + 8)));
-        assert!(
-            solid_parts(both, triangles)
-                .unwrap_err()
-                .to_string()
-                .contains("nested")
-        );
-        assert!(solid_parts(vertices, vec![[0, 1, 99]]).is_err());
-    }
 
     #[test]
     fn world_primitives_keep_their_poses_and_robot_geometry_is_excluded() {
@@ -703,20 +217,48 @@ mod tests {
                 .0
                 .is_empty()
         );
-        let invalid = urdf.replace("2 4 6", "0 4 6");
-        assert!(world_model(&invalid, Some(&robot), &[], &SdfOptions::default()).is_err());
     }
+
     #[test]
-    fn per_face_vertices_are_welded_before_validation() {
-        let (vertices, faces) = cube();
-        let duplicated: Vec<_> = faces
-            .iter()
-            .flatten()
-            .map(|&i| vertices[i as usize])
-            .collect();
-        let faces = (0..faces.len() as u32)
-            .map(|i| [3 * i, 3 * i + 1, 3 * i + 2])
-            .collect();
-        assert_eq!(solid_parts(duplicated, faces).unwrap().len(), 1);
+    fn a_mesh_becomes_a_distance_grid_and_one_batchplan_refuses_is_refused() {
+        let dir = std::env::temp_dir().join(format!("batchplan-ros-mesh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let facets = |triangles: &[[[f32; 3]; 3]]| {
+            let facet = |t: &[[f32; 3]; 3]| {
+                let [a, b, c] = t.map(|v| format!("vertex {} {} {}\n", v[0], v[1], v[2]));
+                format!("facet normal 0 0 0\nouter loop\n{a}{b}{c}endloop\nendfacet\n")
+            };
+            let facets: String = triangles.iter().map(facet).collect();
+            format!("solid mesh\n{facets}endsolid mesh\n")
+        };
+        let (a, b, c, d) = ([0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]);
+        let closed = [[a, c, b], [a, b, d], [b, c, d], [c, a, d]];
+        let urdf = |file: &str| {
+            format!(
+                r#"<robot name="cell"><link name="arm"/><link name="fixture"><collision>
+                <geometry><mesh filename="{}" scale="0.5 0.5 0.5"/></geometry>
+                </collision></link></robot>"#,
+                dir.join(file).display()
+            )
+        };
+        let robot = HashSet::from(["arm".to_string()]);
+        let model =
+            |file: &str| world_model(&urdf(file), Some(&robot), &[], &SdfOptions::default());
+
+        std::fs::write(dir.join("closed.stl"), facets(&closed)).unwrap();
+        let (links, markers) = model("closed.stl").unwrap();
+        let Obstacle::Sdf { grid, .. } = &links[0].obstacles[0] else {
+            panic!("expected a distance grid");
+        };
+        // The unit tetrahedron at half its size, as scaled.
+        let size = grid.dims().map(|d| (d - 1) as f32 * grid.voxel());
+        assert!(size.into_iter().all(|s| s < 1.0), "{size:?}");
+        assert_eq!(markers[0].points.len(), 12);
+
+        std::fs::write(dir.join("open.stl"), facets(&closed[..3])).unwrap();
+        let refused = format!("{:#}", model("open.stl").err().unwrap());
+        assert!(refused.contains("world link 'fixture'"), "{refused}");
+        assert!(refused.contains("not closed"), "{refused}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

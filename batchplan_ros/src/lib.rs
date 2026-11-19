@@ -21,8 +21,7 @@ mod world_geometry;
 
 pub use limits::parse as parse_joint_limits;
 pub use planner::{Answer, DeviceKind, Planner, PlannerOptions};
-pub use search::{PlannerSettings, SearchOptions, SearchParameters};
-pub use visualization::{scene as collision_scene_markers, spheres as collision_sphere_markers};
+pub use search::{Kind, PlannerSettings, SearchOptions};
 
 /// Why a request was refused, as a MoveIt error code and a message.
 pub(crate) struct Refusal {

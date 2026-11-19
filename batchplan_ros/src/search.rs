@@ -1,8 +1,7 @@
 //! Search settings shared by motion planning, IK and Cartesian paths.
 
 use anyhow::{Result, ensure};
-use batchplan::{CollisionWeights, IkOptions, JoinOptions, PlanOptions, ToolPathOptions};
-use rclrs::ReadOnlyParameter;
+use batchplan::{IkOptions, JoinOptions, PlanOptions, ToolPathOptions};
 use std::collections::BTreeMap;
 
 macro_rules! search_fields {
@@ -125,8 +124,43 @@ pub struct PlannerSettings {
     pub trajectory_dt: f32,
 }
 
+/// The ROS parameter type that carries a setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A `double`.
+    Float,
+    /// An `integer`.
+    Integer,
+    /// A `bool`.
+    Boolean,
+}
+
 impl PlannerSettings {
-    /// The editable fields shown by MoveIt's planner-parameter interfaces.
+    /// Every setting's name, as in [`Self::parameters`], and the ROS parameter type for it.
+    #[must_use]
+    pub fn kinds() -> Vec<(&'static str, Kind)> {
+        let mut kinds = vec![];
+        macro_rules! float {
+            ($name:literal, $value:expr) => {
+                kinds.push(($name, Kind::Float));
+            };
+        }
+        macro_rules! integer {
+            ($name:literal, $value:expr) => {
+                kinds.push(($name, Kind::Integer));
+            };
+        }
+        macro_rules! boolean {
+            ($name:literal, $value:expr) => {
+                kinds.push(($name, Kind::Boolean));
+            };
+        }
+        search_fields!(float, integer, boolean, options);
+        float!("trajectory_dt", trajectory_dt);
+        kinds
+    }
+
+    /// Every setting as text, by name: what MoveIt's planner-parameter services carry.
     #[must_use]
     pub fn parameters(&self) -> BTreeMap<String, String> {
         let mut values = BTreeMap::new();
@@ -141,7 +175,8 @@ impl PlannerSettings {
         values
     }
 
-    /// Applies a complete update to a copy; failures never change the active configuration.
+    /// A copy with `values` applied, or the first one that names no setting or does not parse.
+    /// Whether the values can be planned with is the planner's to say, which asks batchplan.
     pub fn with_parameters(&self, values: &BTreeMap<String, String>) -> Result<Self> {
         let mut result = self.clone();
         let options = &mut result.search;
@@ -162,23 +197,32 @@ impl PlannerSettings {
             "unknown planner parameters: {:?}",
             remaining.keys()
         );
-        result.search.validate()?;
-        ensure!(
-            result.trajectory_dt.is_finite() && result.trajectory_dt > 0.0,
-            "trajectory_dt must be finite and positive"
-        );
         Ok(result)
     }
-}
 
-/// Keeps declared ROS settings visible and read-only for the node's lifetime.
-#[derive(Debug)]
-pub struct SearchParameters {
-    /// Validated values copied into a planner at startup.
-    pub options: SearchOptions,
-    floats: Vec<ReadOnlyParameter<f64>>,
-    integers: Vec<ReadOnlyParameter<i64>>,
-    booleans: Vec<ReadOnlyParameter<bool>>,
+    /// Refuses values of the node's own settings that it cannot plan with. batchplan's options
+    /// are batchplan's to check.
+    pub(crate) fn check(&self) -> Result<()> {
+        let search = &self.search;
+        ensure!(
+            self.trajectory_dt.is_finite() && self.trajectory_dt > 0.0,
+            "trajectory_dt must be finite and positive"
+        );
+        ensure!(
+            search.solutions_per_pose > 0,
+            "solutions_per_pose must be positive"
+        );
+        ensure!(
+            search.solution_distance.is_finite() && search.solution_distance >= 0.0,
+            "solution_distance must be finite and not negative"
+        );
+        ensure!(
+            search.default_planning_time > 0.0
+                && std::time::Duration::try_from_secs_f64(search.default_planning_time).is_ok(),
+            "default_planning_time must be positive and representable as a duration"
+        );
+        Ok(())
+    }
 }
 
 /// Configurable BatchPlan searches; request time and attempts remain MoveIt controls.
@@ -215,112 +259,6 @@ impl Default for SearchOptions {
 }
 
 impl SearchOptions {
-    /// Rejects invalid settings before loading robot geometry or accepting requests.
-    pub fn validate(&self) -> Result<()> {
-        let positive = |name: &str, value: f32| -> Result<()> {
-            ensure!(
-                value.is_finite() && value > 0.0,
-                "{name} must be finite and positive"
-            );
-            Ok(())
-        };
-        let nonnegative = |name: &str, value: f32| -> Result<()> {
-            ensure!(
-                value.is_finite() && value >= 0.0,
-                "{name} must be finite and nonnegative"
-            );
-            Ok(())
-        };
-        let resolution = |name: &str, value: f32| -> Result<()> {
-            ensure!(
-                value.is_finite() && value >= 1e-4,
-                "{name} must be finite and at least 0.0001"
-            );
-            Ok(())
-        };
-        let weights = |name: &str, value: CollisionWeights| -> Result<()> {
-            nonnegative(&format!("{name}.world"), value.world)?;
-            nonnegative(&format!("{name}.self_collision"), value.self_collision)?;
-            nonnegative(&format!("{name}.margin"), value.margin)?;
-            nonnegative(&format!("{name}.self_margin"), value.self_margin)
-        };
-        ensure!(
-            self.solutions_per_pose > 0,
-            "solutions_per_pose must be positive"
-        );
-        nonnegative("solution_distance", self.solution_distance)?;
-        ensure!(
-            self.default_planning_time > 0.0
-                && std::time::Duration::try_from_secs_f64(self.default_planning_time).is_ok(),
-            "default_planning_time must be positive and representable as a duration"
-        );
-        let ik = &self.ik;
-        ensure!(ik.seeds > 0, "ik.seeds must be positive");
-        ensure!(ik.iterations > 0, "ik.iterations must be positive");
-        nonnegative("ik.damping", ik.damping)?;
-        positive("ik.rotation_weight", ik.rotation_weight)?;
-        positive("ik.max_step", ik.max_step)?;
-        nonnegative("ik.collision_step", ik.collision_step)?;
-        positive("ik.position_tolerance", ik.position_tolerance)?;
-        positive("ik.rotation_tolerance", ik.rotation_tolerance)?;
-        weights("ik.collision", ik.collision)?;
-        let p = &self.planning;
-        ensure!(
-            p.control_points >= 7,
-            "planning.control_points must be at least 7"
-        );
-        ensure!(
-            p.samples_per_span > 0,
-            "planning.samples_per_span must be positive"
-        );
-        ensure!(
-            p.validate_substeps > 0,
-            "planning.validate_substeps must be positive"
-        );
-        ensure!(
-            (1..=8).contains(&p.history),
-            "planning.history must be between 1 and 8"
-        );
-        positive("planning.initial_step", p.initial_step)?;
-        nonnegative("planning.acceleration_weight", p.acceleration_weight)?;
-        nonnegative("planning.velocity_weight", p.velocity_weight)?;
-        weights("planning.collision", p.collision)?;
-        ensure!(
-            p.time_budget.is_none(),
-            "use default_planning_time or the request's allowed_planning_time"
-        );
-        positive("planning.rrt.range", p.rrt.range)?;
-        resolution("planning.rrt.resolution", p.rrt.resolution)?;
-        nonnegative("planning.rrt.clearance", p.rrt.clearance)?;
-        positive("planning.rrt.clearance_ramp", p.rrt.clearance_ramp)?;
-        resolution("planning.shortcut.resolution", p.shortcut.resolution)?;
-        // Infinity is the native way to disable smoothing and straightening.
-        ensure!(
-            p.shortcut.min_change > 0.0,
-            "planning.shortcut.min_change must be positive"
-        );
-        nonnegative("planning.shortcut.clearance", p.shortcut.clearance)?;
-        positive(
-            "planning.shortcut.clearance_ramp",
-            p.shortcut.clearance_ramp,
-        )?;
-        let c = &self.cartesian;
-        ensure!(
-            c.step.is_finite() && c.step >= 1e-5,
-            "cartesian.step must be finite and at least 0.00001"
-        );
-        ensure!(
-            c.rotation_step.is_finite() && c.rotation_step >= 1e-5,
-            "cartesian.rotation_step must be finite and at least 0.00001"
-        );
-        positive("cartesian.precision", c.precision)?;
-        positive("cartesian.rotation_precision", c.rotation_precision)?;
-        resolution("cartesian.resolution", c.resolution)?;
-        ensure!(c.iterations > 0, "cartesian.iterations must be positive");
-        resolution("join.resolution", self.join.resolution)?;
-        Ok(())
-    }
-
     /// Diversifies retries without changing the configured first attempt.
     #[must_use]
     pub fn for_attempt(&self, attempt: u64) -> Self {
@@ -331,53 +269,6 @@ impl SearchOptions {
         options.planning.rrt.rng_seed = options.planning.rrt.rng_seed.wrapping_add(offset);
         options
     }
-
-    /// Declares startup-only ROS parameters, with the native library's defaults.
-    pub fn from_node(node: &rclrs::Node) -> Result<SearchParameters> {
-        let mut options = Self::default();
-        let mut parameters = SearchParameters {
-            options: options.clone(),
-            floats: vec![],
-            integers: vec![],
-            booleans: vec![],
-        };
-        macro_rules! float {
-            ($name:literal, $field:expr) => {
-                let parameter = node
-                    .declare_parameter::<f64>($name)
-                    .default(f64::from($field))
-                    .read_only()?;
-                $field = parameter.get() as _;
-                parameters.floats.push(parameter);
-            };
-        }
-        macro_rules! integer {
-            ($name:literal, $field:expr) => {
-                let parameter = node
-                    .declare_parameter::<i64>($name)
-                    .default(i64::try_from($field)?)
-                    .read_only()?;
-                $field = parameter.get().try_into().map_err(|_| {
-                    anyhow::anyhow!("{} is outside its nonnegative integer range", $name)
-                })?;
-                parameters.integers.push(parameter);
-            };
-        }
-        macro_rules! boolean {
-            ($name:literal, $field:expr) => {
-                let parameter = node
-                    .declare_parameter::<bool>($name)
-                    .default($field)
-                    .read_only()?;
-                $field = parameter.get();
-                parameters.booleans.push(parameter);
-            };
-        }
-        search_fields!(float, integer, boolean, options);
-        options.validate()?;
-        parameters.options = options;
-        Ok(parameters)
-    }
 }
 
 #[cfg(test)]
@@ -385,7 +276,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn planner_parameters_round_trip_and_updates_are_atomic() {
+    fn parameters_round_trip_and_an_update_that_does_not_parse_changes_nothing() {
         let settings = PlannerSettings {
             search: SearchOptions::default(),
             trajectory_dt: 0.01,
@@ -396,21 +287,16 @@ mod tests {
             original
         );
         for (key, value) in [
-            ("planning.collision.margin", "NaN"),
-            ("ik.seeds", "0"),
-            ("planning.history", "9"),
-            ("cartesian.step", "0.000001"),
-            ("trajectory_dt", "inf"),
+            ("ik.seeds", "-1"),
+            ("ik.seeds", "many"),
+            ("planning.shortcut.straighten", "1"),
             ("unknown", "1"),
-            ("default_planning_time", "inf"),
-            ("join.resolution", "-1"),
         ] {
             let update = BTreeMap::from([
                 ("solution_distance".into(), "0.2".into()),
                 (key.into(), value.into()),
             ]);
             assert!(settings.with_parameters(&update).is_err(), "{key}");
-            assert_eq!(settings.parameters(), original);
         }
         let changed = settings
             .with_parameters(&BTreeMap::from([
@@ -423,14 +309,36 @@ mod tests {
     }
 
     #[test]
-    fn retry_seeds_are_deterministic_without_mutating_settings() {
+    fn the_nodes_own_settings_are_checked() {
+        let settings = PlannerSettings {
+            search: SearchOptions::default(),
+            trajectory_dt: 0.02,
+        };
+        settings.check().unwrap();
+        for (key, value) in [
+            ("trajectory_dt", "inf"),
+            ("trajectory_dt", "0"),
+            ("solutions_per_pose", "0"),
+            ("solution_distance", "NaN"),
+            ("default_planning_time", "inf"),
+            ("default_planning_time", "0"),
+        ] {
+            let update = BTreeMap::from([(key.into(), value.into())]);
+            let changed = settings.with_parameters(&update).unwrap();
+            assert!(changed.check().is_err(), "{key}={value}");
+        }
+    }
+
+    #[test]
+    fn a_retry_changes_every_seed_and_the_first_attempt_none() {
         let options = SearchOptions::default();
-        assert_eq!(options.for_attempt(0).ik.rng_seed, options.ik.rng_seed);
-        assert_ne!(options.for_attempt(1).ik.rng_seed, options.ik.rng_seed);
-        assert_eq!(
-            options.for_attempt(2).planning.rrt.rng_seed,
-            options.for_attempt(2).planning.rrt.rng_seed
-        );
-        options.validate().unwrap();
+        let first = options.for_attempt(0);
+        assert_eq!(first.ik.rng_seed, options.ik.rng_seed);
+        assert_eq!(first.planning.rng_seed, options.planning.rng_seed);
+        assert_eq!(first.planning.rrt.rng_seed, options.planning.rrt.rng_seed);
+        let second = options.for_attempt(1);
+        assert_ne!(second.ik.rng_seed, options.ik.rng_seed);
+        assert_ne!(second.planning.rng_seed, options.planning.rng_seed);
+        assert_ne!(second.planning.rrt.rng_seed, options.planning.rrt.rng_seed);
     }
 }

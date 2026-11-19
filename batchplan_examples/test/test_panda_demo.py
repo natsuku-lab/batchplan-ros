@@ -47,6 +47,9 @@ def ros():
     node.create_subscription(JointState, "/joint_states", lambda m: joints.update(zip(m.name, m.position)), 10)
     planner = ActionClient(node, MoveGroup, "/batchplan_planner/move_group")
     assert planner.wait_for_server(timeout_sec=60.0), "the planner did not start"
+    # The arm's controller can come up after the planner, which waits for it only so long.
+    arm = ActionClient(node, FollowJointTrajectory, "/panda_arm_controller/follow_joint_trajectory")
+    assert arm.wait_for_server(timeout_sec=60.0), "the arm's controller did not start"
     # Discovery finishes after the server first shows up; a goal sent at once can lose its answer.
     deadline, settled = time.time() + 30, time.time() + 1.0
     while (len(joints) < 8 or time.time() < settled) and time.time() < deadline:

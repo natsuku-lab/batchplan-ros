@@ -43,18 +43,49 @@ fn share() -> PathBuf {
     PathBuf::from(prefix).join("share")
 }
 
-fn panda(srdf: &str) -> Planner {
-    let urdf =
-        std::fs::read_to_string(share().join("moveit_resources_panda_description/urdf/panda.urdf"))
-            .unwrap();
-    let cache_dir = Some(std::env::temp_dir().join("batchplan-ros-tests"));
-    let options = PlannerOptions {
-        package_dirs: vec![share()],
-        cache_dir,
-        ..Default::default()
-    };
-    Planner::try_new(&urdf, Some(srdf), &options).unwrap()
+fn panda_urdf() -> String {
+    std::fs::read_to_string(share().join("moveit_resources_panda_description/urdf/panda.urdf"))
+        .unwrap()
 }
+
+fn options() -> PlannerOptions {
+    PlannerOptions {
+        package_dirs: vec![share()],
+        cache_dir: Some(std::env::temp_dir().join("batchplan-ros-tests")),
+        ..Default::default()
+    }
+}
+
+fn panda(srdf: &str) -> Planner {
+    Planner::try_new(&panda_urdf(), Some(srdf), &options()).unwrap()
+}
+
+/// The wall of `obstacles_in_the_scene_are_avoided`: in front of the robot, between two reaches.
+const WALL: ([f64; 3], [f64; 3]) = ([0.55, 0.0, 0.3], [0.1, 0.3, 0.6]);
+
+/// The Panda in a workcell URDF: on a pedestal that reaches 2 cm into its base, beside the wall.
+/// The pedestal and the wall are fixed links outside `robot_link_roots`, so world obstacles.
+static CELL: LazyLock<Planner> = LazyLock::new(|| {
+    let ([x, y, z], [dx, dy, dz]) = WALL;
+    let fixtures = format!(
+        r#"<link name="cell"/>
+        <link name="pedestal"><collision><origin xyz="0 0 -0.08"/>
+          <geometry><box size="0.3 0.3 0.2"/></geometry></collision></link>
+        <link name="wall"><collision><geometry><box size="{dx} {dy} {dz}"/></geometry></collision></link>
+        <joint name="cell_pedestal" type="fixed"><parent link="cell"/><child link="pedestal"/></joint>
+        <joint name="pedestal_arm" type="fixed"><parent link="pedestal"/><child link="panda_link0"/></joint>
+        <joint name="cell_wall" type="fixed"><parent link="cell"/><child link="wall"/>
+          <origin xyz="{x} {y} {z}"/></joint>
+        </robot>"#
+    );
+    let urdf = panda_urdf().replace("</robot>", &fixtures);
+    let srdf = SRDF.replace(r#"child_link="panda_link0""#, r#"child_link="cell""#);
+    let options = PlannerOptions {
+        robot_link_roots: vec!["pedestal".into()],
+        ..options()
+    };
+    Planner::try_new(&urdf, Some(&srdf), &options).unwrap()
+});
 
 static PLANNER: LazyLock<Planner> = LazyLock::new(|| panda(SRDF));
 /// As MoveIt's Panda configuration has it: the root on a floating virtual joint from `world`.
@@ -526,16 +557,6 @@ fn closed_meshes_are_obstacles_and_open_ones_are_refused() {
         length(&with_mesh),
         length(&free)
     );
-
-    let mut crossed = mesh(triangles.clone());
-    crossed.meshes[0].vertices[7] = geometry::Point {
-        x: c[0],
-        y: c[1],
-        z: c[2] - 2.0 * h[2],
-    };
-    let invalid = blocked(vec![crossed]);
-    assert_eq!(invalid.error_code.val, Code::INVALID_OBJECT_NAME);
-    assert!(invalid.error_code.message.contains("self-intersections"));
 
     let open = blocked(vec![mesh(triangles[..10].to_vec())]);
     assert_eq!(
@@ -1765,14 +1786,7 @@ fn sequences_are_refused_as_pilz_refuses_them() {
 
 #[test]
 fn planner_settings_inherit_override_replace_and_reject_invalid_updates_atomically() {
-    use std::collections::BTreeMap;
     let planner = panda(SRDF);
-    let update = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    };
     let defaults = planner.planner_settings("panda_arm", "batchplan").unwrap();
     planner
         .set_planner_parameters("", "batchplan", &update(&[("trajectory_dt", "0.1")]), false)
@@ -1802,8 +1816,27 @@ fn planner_settings_inherit_override_replace_and_reject_invalid_updates_atomical
             .parameters(),
         overridden.parameters()
     );
+    // The node refuses its own settings, and batchplan each solver's options.
+    for (key, value) in [
+        ("trajectory_dt", "0"),
+        ("default_planning_time", "inf"),
+        ("ik.max_step", "NaN"),
+        ("planning.history", "9"),
+        ("planning.rrt.resolution", "0"),
+        ("planning.shortcut.min_change", "0"),
+        ("cartesian.step", "0.000001"),
+        ("join.resolution", "-1"),
+    ] {
+        let refused = planner.set_planner_parameters(
+            "panda_arm",
+            "batchplan",
+            &update(&[(key, value)]),
+            false,
+        );
+        assert!(refused.is_err(), "{key}={value} was accepted");
+    }
     planner
-        .set_planner_parameters("panda_arm", "batchplan", &BTreeMap::new(), true)
+        .set_planner_parameters("panda_arm", "batchplan", &update(&[]), true)
         .unwrap();
     assert_eq!(
         planner
@@ -1814,4 +1847,189 @@ fn planner_settings_inherit_override_replace_and_reject_invalid_updates_atomical
     );
     assert!(planner.planner_settings("missing", "batchplan").is_err());
     assert!(planner.planner_settings("panda_arm", "missing").is_err());
+}
+
+/// A workcell URDF's fixed links are obstacles to every request, with or without a scene, and
+/// the robot may rest on the one it is mounted on.
+#[test]
+fn a_workcells_fixed_links_are_obstacles_to_plans_ik_and_cartesian_paths() {
+    let (center, size) = WALL;
+    let start = [-1.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.785];
+    let goal = [1.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.785];
+    let meshes = MeshModel::try_new(CELL.robot()).unwrap();
+    let wall = World::new(vec![Obstacle::cuboid(
+        Vec3::from_array(center.map(|v| v as f32)),
+        Vec3::from_array(size.map(|v| 0.5 * v as f32)),
+    )]);
+    let clear = |q: &[f32]| {
+        meshes
+            .clearance(std::slice::from_ref(&wall), &[0], q)
+            .unwrap()[0]
+            .world
+    };
+
+    // A plan: around the wall, from a start whose base stands in the pedestal.
+    let asked = request("panda_arm", vec![joint_goal(&ARM, &goal)]);
+    let answer = CELL.plan(&asked, &scene(vec![]), Some(&current(&start)));
+    succeeded(&answer);
+    for k in 0..answer.trajectory.joint_trajectory.points.len() {
+        let q = waypoint(&answer, k, &full(&start));
+        assert!(clear(&q) > 0.0, "waypoint {k} touches the wall");
+    }
+    // The scene's objects add to the URDF's, and cannot take a link's name to replace it.
+    let renamed = scene(vec![cuboid("wall", "world", [0.0, 0.0, 2.0], [0.1; 3])]);
+    let refused = CELL.plan(&asked, &renamed, Some(&current(&start)));
+    assert_eq!(refused.error_code.val, Code::INVALID_OBJECT_NAME);
+
+    // IK: a pose that puts the hand in the wall has no solution, and has one without the wall.
+    let down = PLANNER.robot().ee_pose(&full(&READY), 0).rotation;
+    let inside = Pose::new(Vec3::new(0.55, 0.0, 0.35), down);
+    let mut ik = PositionIKRequest {
+        group_name: "panda_arm".into(),
+        ik_link_name: "panda_link8".into(),
+        ..Default::default()
+    };
+    ik.pose_stamped.header.frame_id = "world".into();
+    ik.pose_stamped.pose = pose_msg(inside);
+    let (_, without) = PLANNER.ik(&ik, Some(&current(&READY)));
+    assert_eq!(without.val, Code::SUCCESS, "{}", without.message);
+    let (_, with) = CELL.ik(&ik, Some(&current(&READY)));
+    assert_eq!(with.val, Code::NO_IK_SOLUTION, "{}", with.message);
+
+    // A Cartesian path: a straight line through the wall stops at it.
+    let from = PLANNER.robot().ee_pose(&full(&READY), 0);
+    let beyond = Pose::new(Vec3::new(0.7, 0.0, 0.35), from.rotation);
+    let mut line = GetCartesianPath_Request {
+        group_name: "panda_arm".into(),
+        link_name: "panda_link8".into(),
+        waypoints: vec![pose_msg(beyond)],
+        ..Default::default()
+    };
+    line.header.frame_id = "world".into();
+    let free = PLANNER.cartesian_path(&line, Some(&current(&READY)));
+    assert_eq!(free.fraction, 1.0, "{}", free.error_code.message);
+    let stopped = CELL.cartesian_path(&line, Some(&current(&READY)));
+    assert!(
+        stopped.fraction > 0.0 && stopped.fraction < 1.0,
+        "fraction {}: {}",
+        stopped.fraction,
+        stopped.error_code.message
+    );
+}
+
+fn update(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// A group's settings are what its plans, IK and Cartesian paths run with, and no other group's.
+#[test]
+fn a_groups_settings_change_its_requests_and_no_other_groups() {
+    let planner = panda(SRDF);
+    let spacing = |trajectory: &RobotTrajectory| {
+        let points = &trajectory.joint_trajectory.points;
+        seconds(&points[1].time_from_start) - seconds(&points[0].time_from_start)
+    };
+    let goal = [0.6, -0.4, 0.2, -2.0, 0.1, 1.8, 0.6];
+    let plan = |group: &str| {
+        // The group with the hand moves a finger too.
+        let (mut names, mut values) = (ARM.to_vec(), goal.to_vec());
+        if group == "panda_arm_hand" {
+            names.push("panda_finger_joint1");
+            values.push(0.02);
+        }
+        let asked = request(group, vec![joint_goal(&names, &values)]);
+        let answer = planner.plan(&asked, &scene(vec![]), Some(&current(&READY)));
+        succeeded(&answer);
+        spacing(&answer.trajectory)
+    };
+    let target = planner.robot().ee_pose(&full(&goal), 0);
+    let ik = |group: &str| {
+        let mut ik = PositionIKRequest {
+            group_name: group.into(),
+            ik_link_name: "panda_link8".into(),
+            ..Default::default()
+        };
+        ik.pose_stamped.header.frame_id = "world".into();
+        ik.pose_stamped.pose = pose_msg(target);
+        planner.ik(&ik, Some(&current(&READY))).1.val
+    };
+    let line = |group: &str| {
+        let mut asked = GetCartesianPath_Request {
+            group_name: group.into(),
+            link_name: "panda_link8".into(),
+            waypoints: vec![pose_msg(target)],
+            ..Default::default()
+        };
+        asked.header.frame_id = "world".into();
+        let answer = planner.cartesian_path(&asked, Some(&current(&READY)));
+        assert_eq!(answer.fraction, 1.0, "{}", answer.error_code.message);
+        spacing(&answer.solution)
+    };
+    assert!((plan("panda_arm") - 0.02).abs() < 1e-6);
+    assert_eq!(ik("panda_arm"), Code::SUCCESS);
+
+    // Waypoints five times as far apart, and an IK that cannot get anywhere.
+    let slow = update(&[
+        ("trajectory_dt", "0.1"),
+        ("ik.seeds", "1"),
+        ("ik.iterations", "1"),
+    ]);
+    planner
+        .set_planner_parameters("panda_arm", "batchplan", &slow, false)
+        .unwrap();
+    assert!((plan("panda_arm") - 0.1).abs() < 1e-6);
+    assert!((line("panda_arm") - 0.1).abs() < 1e-6);
+    assert_eq!(ik("panda_arm"), Code::NO_IK_SOLUTION);
+    assert!((plan("panda_arm_hand") - 0.02).abs() < 1e-6);
+    assert!((line("panda_arm_hand") - 0.02).abs() < 1e-6);
+    assert_eq!(ik("panda_arm_hand"), Code::SUCCESS);
+}
+
+/// Each planning attempt searches from seeds of its own: where one attempt's luck decides, more
+/// attempts succeed more often.
+#[test]
+fn planning_attempts_search_from_different_seeds() {
+    let planner = panda(SRDF);
+    // A wall too wide and tall for a straight line or its bends to pass.
+    let wall = scene(vec![cuboid(
+        "wall",
+        "world",
+        [0.55, 0.0, 0.6],
+        [0.1, 1.2, 1.2],
+    )]);
+    let start = [-1.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.785];
+    let goal = [1.0, 0.3, 0.0, -1.8, 0.0, 2.1, 0.785];
+    let solved = |attempts: i32| {
+        (0..24)
+            .filter(|seed| {
+                // A tree of eight short branches gets around the wall about half the time.
+                let unlucky = update(&[
+                    ("planning.rrt.max_iterations", "8"),
+                    ("planning.rrt.range", "0.3"),
+                    ("planning.rrt.rng_seed", &seed.to_string()),
+                ]);
+                planner
+                    .set_planner_parameters("panda_arm", "batchplan", &unlucky, true)
+                    .unwrap();
+                let asked = MotionPlanRequest {
+                    num_planning_attempts: attempts,
+                    ..request("panda_arm", vec![joint_goal(&ARM, &goal)])
+                };
+                let answer = planner.plan(&asked, &wall, Some(&current(&start)));
+                answer.error_code.val == Code::SUCCESS
+            })
+            .count()
+    };
+    let (once, often) = (solved(1), solved(8));
+    assert!(
+        (1..24).contains(&once),
+        "one attempt solved {once} of 24: its luck no longer decides, so retries show nothing"
+    );
+    assert!(
+        often > once,
+        "eight attempts solved {often} of 24, one attempt {once}"
+    );
 }

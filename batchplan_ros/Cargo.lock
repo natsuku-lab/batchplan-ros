@@ -276,10 +276,10 @@ name = "batchplan_ros"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-std",
  "batchplan",
  "futures",
  "mesh-loader",
- "parry3d-f64",
  "rclrs",
  "ros-env",
  "roxmltree 0.21.1",
@@ -1234,33 +1234,6 @@ dependencies = [
  "smallvec",
  "spade",
  "static_assertions",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "parry3d-f64"
-version = "0.31.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffb9e04261f1783d8f66f36767b2b73132a63c9b30b12a5ed47e1faa240f7591"
-dependencies = [
- "approx",
- "arrayvec",
- "bitflags",
- "downcast-rs",
- "either",
- "ena",
- "foldhash",
- "glamx",
- "hashbrown 0.17.1",
- "log",
- "num-derive",
- "num-traits",
- "ordered-float",
- "rstar",
- "simba",
- "slab",
- "smallvec",
- "spade",
  "thiserror 2.0.21",
 ]
 
@@ -2364,7 +2337,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "batchplan_ros"
-version = "0.1.0"
