@@ -6,10 +6,12 @@ use std::ops::Range;
 use anyhow::{Context, Result, ensure};
 use roxmltree::Document;
 
+/// A URDF divided between the robot and the world it is fixed in.
 pub(crate) struct Partition {
+    /// The URDF with collision geometry on the robot's links only.
     pub robot_urdf: String,
+    /// The robot's links; `None` when every link is.
     pub robot_links: Option<HashSet<String>>,
-    pub exemptions: Vec<(String, String)>,
 }
 
 impl Partition {
@@ -18,7 +20,6 @@ impl Partition {
             return Ok(Self {
                 robot_urdf: urdf.to_string(),
                 robot_links: None,
-                exemptions: vec![],
             });
         }
         let doc = Document::parse(urdf).context("partitioning the workcell URDF")?;
@@ -80,63 +81,17 @@ impl Partition {
                 "world link '{child}' has a non-fixed parent joint; select its parent subtree in robot_link_roots"
             );
         }
-        let mut remove_robot = vec![];
-        let mut geometry = HashSet::new();
-        for link in doc
+        let world_collisions = doc
             .root_element()
             .children()
             .filter(|n| n.has_tag_name("link"))
-        {
-            let name = link.attribute("name").context("link lacks name")?;
-            if !selected.contains(name) {
-                // BatchPlan falls back to visuals when a link has no collision elements.
-                remove_robot.extend(
-                    link.children()
-                        .filter(|n| n.has_tag_name("visual"))
-                        .map(|n| n.range()),
-                );
-            }
-            for collision in link.children().filter(|n| n.has_tag_name("collision")) {
-                geometry.insert(name);
-                if !selected.contains(name) {
-                    remove_robot.push(collision.range());
-                }
-            }
-        }
-        let mut components = HashMap::new();
-        for &link in &links {
-            let mut ancestor = link;
-            let mut seen = HashSet::new();
-            while let Some(&(parent, true)) = parents.get(ancestor) {
-                ensure!(seen.insert(ancestor), "URDF contains a fixed-joint cycle");
-                ancestor = parent;
-            }
-            components.insert(link, ancestor);
-        }
-        let mut exemptions = vec![];
-        for &robot in geometry.iter().filter(|l| selected.contains(*l)) {
-            for &world in geometry.iter().filter(|l| !selected.contains(*l)) {
-                if components[robot] == components[world] {
-                    exemptions.push((robot.to_string(), world.to_string()));
-                }
-            }
-            let mut ancestor = robot;
-            let mut seen = HashSet::new();
-            while let Some(&(parent, _)) = parents.get(ancestor) {
-                ensure!(seen.insert(ancestor), "URDF contains a joint cycle");
-                if geometry.contains(parent) {
-                    if !selected.contains(parent) {
-                        exemptions.push((robot.to_string(), parent.to_string()));
-                    }
-                    break;
-                }
-                ancestor = parent;
-            }
-        }
+            .filter(|n| !n.attribute("name").is_some_and(|l| selected.contains(l)))
+            .flat_map(|n| n.children().filter(|c| c.has_tag_name("collision")))
+            .map(|c| c.range())
+            .collect();
         Ok(Self {
-            robot_urdf: without(urdf, remove_robot),
+            robot_urdf: without(urdf, world_collisions),
             robot_links: Some(selected.into_iter().map(str::to_string).collect()),
-            exemptions,
         })
     }
 }
@@ -171,7 +126,7 @@ mod tests {
     </robot>"#;
 
     #[test]
-    fn selection_keeps_kinematics_and_removes_world_collision_and_visual_fallback() {
+    fn selection_keeps_kinematics_and_removes_world_collisions() {
         let partition = Partition::new(CELL, &["spacer".into()]).unwrap();
         assert_eq!(
             partition.robot_links.unwrap(),
@@ -189,17 +144,6 @@ mod tests {
                 .filter(|n| n.has_tag_name("collision"))
                 .count(),
             2
-        );
-        assert!(!doc.descendants().any(|n| n.has_tag_name("visual")));
-        assert!(
-            partition
-                .exemptions
-                .contains(&("arm".into(), "base".into()))
-        );
-        assert!(
-            !partition
-                .exemptions
-                .contains(&("arm".into(), "wall".into()))
         );
     }
 

@@ -63,17 +63,15 @@ fn panda(srdf: &str) -> Planner {
 /// The wall of `obstacles_in_the_scene_are_avoided`: in front of the robot, between two reaches.
 const WALL: ([f64; 3], [f64; 3]) = ([0.55, 0.0, 0.3], [0.1, 0.3, 0.6]);
 
-/// The Panda in a workcell URDF: on a pedestal that reaches 2 cm into its base, beside the wall.
-/// The pedestal and the wall are fixed links outside `robot_link_roots`, so world obstacles.
+/// The Panda in a workcell URDF, beside the wall. Its base link and the wall are fixed links
+/// outside `robot_link_roots`, so world obstacles: the base's mesh, which the first moving link
+/// rests on, and the wall's box.
 static CELL: LazyLock<Planner> = LazyLock::new(|| {
     let ([x, y, z], [dx, dy, dz]) = WALL;
     let fixtures = format!(
         r#"<link name="cell"/>
-        <link name="pedestal"><collision><origin xyz="0 0 -0.08"/>
-          <geometry><box size="0.3 0.3 0.2"/></geometry></collision></link>
         <link name="wall"><collision><geometry><box size="{dx} {dy} {dz}"/></geometry></collision></link>
-        <joint name="cell_pedestal" type="fixed"><parent link="cell"/><child link="pedestal"/></joint>
-        <joint name="pedestal_arm" type="fixed"><parent link="pedestal"/><child link="panda_link0"/></joint>
+        <joint name="cell_arm" type="fixed"><parent link="cell"/><child link="panda_link0"/></joint>
         <joint name="cell_wall" type="fixed"><parent link="cell"/><child link="wall"/>
           <origin xyz="{x} {y} {z}"/></joint>
         </robot>"#
@@ -81,7 +79,7 @@ static CELL: LazyLock<Planner> = LazyLock::new(|| {
     let urdf = panda_urdf().replace("</robot>", &fixtures);
     let srdf = SRDF.replace(r#"child_link="panda_link0""#, r#"child_link="cell""#);
     let options = PlannerOptions {
-        robot_link_roots: vec!["pedestal".into()],
+        robot_link_roots: vec!["panda_link0".into()],
         ..options()
     };
     Planner::try_new(&urdf, Some(&srdf), &options).unwrap()
@@ -1850,7 +1848,8 @@ fn planner_settings_inherit_override_replace_and_reject_invalid_updates_atomical
 }
 
 /// A workcell URDF's fixed links are obstacles to every request, with or without a scene, and
-/// the robot may rest on the one it is mounted on.
+/// the robot may rest on the one it is mounted on: the first moving link reaches 3 cm into the
+/// base's mesh, which would refuse every start, IK solution and Cartesian path.
 #[test]
 fn a_workcells_fixed_links_are_obstacles_to_plans_ik_and_cartesian_paths() {
     let (center, size) = WALL;
@@ -1868,7 +1867,7 @@ fn a_workcells_fixed_links_are_obstacles_to_plans_ik_and_cartesian_paths() {
             .world
     };
 
-    // A plan: around the wall, from a start whose base stands in the pedestal.
+    // A plan: around the wall, from a start that rests on the base.
     let asked = request("panda_arm", vec![joint_goal(&ARM, &goal)]);
     let answer = CELL.plan(&asked, &scene(vec![]), Some(&current(&start)));
     succeeded(&answer);
@@ -1895,6 +1894,9 @@ fn a_workcells_fixed_links_are_obstacles_to_plans_ik_and_cartesian_paths() {
     assert_eq!(without.val, Code::SUCCESS, "{}", without.message);
     let (_, with) = CELL.ik(&ik, Some(&current(&READY)));
     assert_eq!(with.val, Code::NO_IK_SOLUTION, "{}", with.message);
+    ik.pose_stamped.pose = pose_msg(Pose::new(Vec3::new(0.3, 0.3, 0.4), down));
+    let (_, clear) = CELL.ik(&ik, Some(&current(&READY)));
+    assert_eq!(clear.val, Code::SUCCESS, "{}", clear.message);
 
     // A Cartesian path: a straight line through the wall stops at it.
     let from = PLANNER.robot().ee_pose(&full(&READY), 0);
@@ -1915,6 +1917,25 @@ fn a_workcells_fixed_links_are_obstacles_to_plans_ik_and_cartesian_paths() {
         stopped.fraction,
         stopped.error_code.message
     );
+    line.waypoints = vec![pose_msg(Pose::new(Vec3::new(0.3, 0.3, 0.4), from.rotation))];
+    let beside = CELL.cartesian_path(&line, Some(&current(&READY)));
+    assert_eq!(beside.fraction, 1.0, "{}", beside.error_code.message);
+}
+
+/// Requests may name any planner, as MoveIt's and Pilz's clients do: all but `LIN` plan as
+/// `batchplan` does.
+#[test]
+fn any_planner_but_lin_plans_as_batchplan() {
+    for planner in ["PTP", "RRTConnectkConfigDefault"] {
+        let asked = MotionPlanRequest {
+            planner_id: planner.into(),
+            ..request(
+                "panda_arm",
+                vec![joint_goal(&ARM, &[0.6, -0.4, 0.2, -2.0, 0.1, 1.8, 0.6])],
+            )
+        };
+        succeeded(&plan(&asked, &scene(vec![]), &READY));
+    }
 }
 
 fn update(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {

@@ -18,10 +18,12 @@ use ros_env::shape_msgs::msg::{Mesh, SolidPrimitive};
 
 use crate::Refusal;
 
-/// Obstacles retained in one URDF link's local frame.
+/// A URDF link outside the robot: its obstacles in its own frame and, per obstacle, the robot's
+/// links that may touch it unless a request's allowed collision matrix says otherwise.
 pub(crate) struct WorldLink {
     pub name: String,
     pub obstacles: Vec<Obstacle>,
+    pub touching: Vec<Vec<String>>,
 }
 
 pub fn pose(p: &geometry::Pose) -> Pose {
@@ -198,11 +200,15 @@ pub fn world(
     grids: &Grids,
     robot: &Robot,
     links: &[WorldLink],
-    exemptions: &[(String, String)],
 ) -> Result<(World, Vec<String>), Refusal> {
     let mut obstacles = vec![];
     let mut ids = vec![];
     let mut objects = vec![];
+    // The links' obstacles come first, so `touching` is theirs by index.
+    let touching: Vec<&[String]> = links
+        .iter()
+        .flat_map(|l| l.touching.iter().map(Vec::as_slice))
+        .collect();
     for link in links {
         let base = frames.pose_of(&link.name)?;
         let first = obstacles.len();
@@ -234,7 +240,7 @@ pub fn world(
         objects.push((object.id.as_str(), first..obstacles.len()));
     }
     let world = World {
-        touch: touches(&scene.allowed_collision_matrix, &objects, robot, exemptions),
+        touch: touches(&scene.allowed_collision_matrix, &objects, robot, &touching),
         ..World::new(obstacles)
     };
     Ok((world, ids))
@@ -248,7 +254,7 @@ fn touches(
     acm: &AllowedCollisionMatrix,
     objects: &[(&str, Range<usize>)],
     robot: &Robot,
-    exemptions: &[(String, String)],
+    touching: &[&[String]],
 ) -> Vec<Touch> {
     let index = |names: &[String], name: &str| names.iter().position(|n| n == name);
     let entry = |a: &str, b: &str| {
@@ -263,16 +269,10 @@ fn touches(
         index(&acm.default_entry_names, name).and_then(|i| acm.default_entry_values.get(i).copied())
     };
     let allowed = |link: &str, object: &str| {
-        entry(link, object)
-            .or_else(|| match (default(link), default(object)) {
-                (Some(a), Some(b)) => Some(a && b),
-                (a, b) => a.or(b),
-            })
-            .unwrap_or_else(|| {
-                exemptions
-                    .iter()
-                    .any(|(a, b)| (a == link && b == object) || (b == link && a == object))
-            })
+        entry(link, object).or_else(|| match (default(link), default(object)) {
+            (Some(a), Some(b)) => Some(a && b),
+            (a, b) => a.or(b),
+        })
     };
     let links: Vec<&str> = robot
         .collision_model()
@@ -282,17 +282,16 @@ fn touches(
         .collect();
     let mut out = vec![];
     for (id, range) in objects {
-        let touching: Vec<&str> = links
-            .iter()
-            .copied()
-            .filter(|link| allowed(link, id))
-            .collect();
-        if !touching.is_empty() {
-            out.extend(
-                range
-                    .clone()
-                    .map(|o| Touch::new(o, touching.iter().copied())),
-            );
+        for obstacle in range.clone() {
+            // Where the matrix says nothing, a link may touch what it always touches.
+            let resting = touching.get(obstacle).copied().unwrap_or_default();
+            let may = |link: &&str| {
+                allowed(link, id).unwrap_or_else(|| resting.iter().any(|l| l == link))
+            };
+            let touching: Vec<&str> = links.iter().copied().filter(may).collect();
+            if !touching.is_empty() {
+                out.push(Touch::new(obstacle, touching));
+            }
         }
     }
     out

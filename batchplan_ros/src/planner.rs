@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use batchplan::{
     CollisionModel, CollisionWeights, Contact, Device, HandConstraint, HandSpeed, IkOptions,
-    IkProblem, JointLimits, JointTrajectory, MeshModel, PlanOptions, PlanProblem, PlanResult,
-    Robot, RobotOptions, SdfOptions, Sequence, SphereOptions, ToolPath, ToolPathOptions,
-    ToolPathStop, Trajectory, World, Worlds, solve_ik,
+    IkProblem, JointLimits, JointTrajectory, MeshModel, Obstacle, PlanOptions, PlanProblem,
+    PlanResult, Pose, Robot, RobotOptions, SdfOptions, Sequence, SphereOptions, ToolPath,
+    ToolPathOptions, ToolPathStop, Trajectory, World, Worlds, solve_ik,
 };
 use ros_env::moveit_msgs::msg::{
     AttachedCollisionObject, MotionPlanRequest, MotionSequenceRequest, MotionSequenceResponse,
@@ -165,7 +165,6 @@ pub struct Planner {
     configurations: RwLock<HashMap<(String, String), PlannerSettings>>,
     world_links: Vec<scene::WorldLink>,
     world_markers: Vec<ros_env::visualization_msgs::msg::Marker>,
-    world_exemptions: Vec<(String, String)>,
 }
 
 impl fmt::Debug for Planner {
@@ -185,7 +184,7 @@ impl Planner {
         let parsed = srdf.map(Srdf::parse).transpose()?.unwrap_or_default();
         let partition = workcell::Partition::new(urdf, &o.robot_link_roots)?;
         let robot_urdf = partition.robot_urdf.as_str();
-        let (world_links, world_markers) = world_geometry::world_model(
+        let (mut world_links, world_markers) = world_geometry::world_model(
             urdf,
             partition.robot_links.as_ref(),
             &o.package_dirs,
@@ -194,14 +193,6 @@ impl Planner {
                 ..Default::default()
             },
         )?;
-        let mut world_exemptions = partition.exemptions;
-        world_exemptions.extend(
-            parsed
-                .disabled_collisions()
-                .iter()
-                .filter(|(a, b)| world_links.iter().any(|l| l.name == *a || l.name == *b))
-                .cloned(),
-        );
         let hands = if o.ee_links.is_empty() {
             parsed.tips()
         } else {
@@ -254,10 +245,29 @@ impl Planner {
         };
         // batchplan checks obstacles when a world is uploaded: a workcell it refuses is refused
         // here, not at the first request.
-        let obstacles = world_links.iter().flat_map(|l| l.obstacles.iter().cloned());
+        let fixed = World::new(world_links.iter().flat_map(placed(&robot)).collect());
         device
-            .upload(&[World::new(obstacles.collect())])
+            .upload(std::slice::from_ref(&fixed))
             .context("the URDF's world geometry")?;
+        // A robot link may touch a world obstacle it rests on in every configuration, as the
+        // link above a base that is part of the world does, and one the SRDF pairs it with.
+        let mut touching = fixed.always_touching(&robot).into_iter().peekable();
+        let mut obstacle = 0;
+        for link in &mut world_links {
+            let paired = parsed.disabled_collisions().iter().filter_map(|(a, b)| {
+                (*a == link.name)
+                    .then_some(b)
+                    .or((*b == link.name).then_some(a))
+            });
+            let paired: Vec<&String> = paired.collect();
+            for links in &mut link.touching {
+                links.extend(paired.iter().map(|l| l.to_string()));
+                if let Some(touch) = touching.next_if(|t| t.obstacle == obstacle) {
+                    links.extend(touch.links);
+                }
+                obstacle += 1;
+            }
+        }
         let meshes = MeshModel::try_new(&robot)?;
         let root = tree
             .root()
@@ -281,7 +291,6 @@ impl Planner {
             configurations: RwLock::new(HashMap::new()),
             world_links,
             world_markers,
-            world_exemptions,
         };
         planner.accepts(&planner.defaults)?;
         Ok(planner)
@@ -319,13 +328,15 @@ impl Planner {
         self.device.name()
     }
 
-    /// Settings are copied before planning; edits cannot change an in-flight motion.
+    /// The settings of `group` for `planner` (`batchplan`, or `LIN`; an empty name is
+    /// `batchplan`): its own, else those set for every group, else the node's defaults. A request
+    /// plans with a copy, so an update cannot change a search under way.
     pub fn planner_settings(&self, group: &str, planner: &str) -> Result<PlannerSettings> {
         let planner = self.configuration_name(group, planner)?;
         let configs = self
             .configurations
             .read()
-            .map_err(|_| anyhow::anyhow!("planner configuration lock poisoned"))?;
+            .unwrap_or_else(|e| e.into_inner());
         Ok(configs
             .get(&(group.into(), planner.into()))
             .or_else(|| configs.get(&(String::new(), planner.into())))
@@ -334,7 +345,7 @@ impl Planner {
     }
 
     /// Applies a MoveIt configuration update whole, or not at all when the node or batchplan
-    /// refuses a value.
+    /// refuses a value. `replace` starts from the node's defaults, not the settings so far.
     pub fn set_planner_parameters(
         &self,
         group: &str,
@@ -343,22 +354,17 @@ impl Planner {
         replace: bool,
     ) -> Result<()> {
         let planner = self.configuration_name(group, planner)?;
-        let mut configs = self
-            .configurations
-            .write()
-            .map_err(|_| anyhow::anyhow!("planner configuration lock poisoned"))?;
-        let key = (group.into(), planner.into());
         let previous = if replace {
-            &self.defaults
+            self.defaults.clone()
         } else {
-            configs
-                .get(&key)
-                .or_else(|| configs.get(&(String::new(), planner.into())))
-                .unwrap_or(&self.defaults)
+            self.planner_settings(group, planner)?
         };
         let settings = previous.with_parameters(values)?;
         self.accepts(&settings)?;
-        configs.insert(key, settings);
+        self.configurations
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((group.into(), planner.into()), settings);
         Ok(())
     }
 
@@ -490,7 +496,13 @@ impl Planner {
         let settings = items
             .iter()
             .map(|(request, _)| {
-                self.planner_settings(&request.group_name, &request.planner_id)
+                // Any planner but LIN is batchplan's own, as other planners' names always were.
+                let planner = if request.planner_id == STRAIGHT {
+                    STRAIGHT
+                } else {
+                    "batchplan"
+                };
+                self.planner_settings(&request.group_name, planner)
                     .map_err(|e| invalid(e.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -516,14 +528,7 @@ impl Planner {
             .map_or((&self.robot, &self.device, &self.meshes), |h| {
                 (&h.0, &h.1, &h.2)
             });
-        let (world, ids) = scene::world(
-            scene,
-            &frames,
-            &self.grids,
-            robot,
-            &self.world_links,
-            &self.world_exemptions,
-        )?;
+        let (world, ids) = scene::world(scene, &frames, &self.grids, robot, &self.world_links)?;
         let worlds = device.upload(std::slice::from_ref(&world)).map_err(crash)?;
 
         let contacts = device.contacts(&worlds, &[0], &start, 0.0).map_err(crash)?;
@@ -1145,14 +1150,7 @@ impl Planner {
             hold: vec![],
             holding: None,
         };
-        let (world, _) = scene::world(
-            &scene,
-            &frames,
-            &self.grids,
-            robot,
-            &self.world_links,
-            &self.world_exemptions,
-        )?;
+        let (world, _) = scene::world(&scene, &frames, &self.grids, robot, &self.world_links)?;
         let worlds = device.upload(&[world]).map_err(crash)?;
         let result = batchplan::follow(device, &worlds, &[path], &options).map_err(crash)?;
         let speed = factor(request.max_velocity_scaling_factor)
@@ -1203,14 +1201,8 @@ impl Planner {
         let target = frames
             .pose_of(&request.pose_stamped.header.frame_id)?
             .mul_pose(scene::pose(&request.pose_stamped.pose));
-        let (world, _) = scene::world(
-            &scene,
-            &frames,
-            &self.grids,
-            &self.robot,
-            &self.world_links,
-            &self.world_exemptions,
-        )?;
+        let (world, _) =
+            scene::world(&scene, &frames, &self.grids, &self.robot, &self.world_links)?;
         let worlds = self.device.upload(&[world]).map_err(crash)?;
         let targets = (0..self.robot.hands())
             .map(|h| (h == hand).then_some(target))
@@ -1508,6 +1500,16 @@ fn code(val: i32, message: &str) -> MoveItErrorCodes {
         val,
         message: message.to_string(),
         source: "batchplan".to_string(),
+    }
+}
+
+/// A world link's obstacles in `robot`'s base frame, where the link is fixed.
+fn placed(robot: &Robot) -> impl Fn(&scene::WorldLink) -> Vec<Obstacle> + '_ {
+    let rest = vec![0.0; robot.dof()];
+    move |link| {
+        let base = robot.link_pose(&rest, &link.name).unwrap_or(Pose::IDENTITY);
+        let place = |o: &Obstacle| o.placed(base.mul_pose(o.pose()));
+        link.obstacles.iter().map(place).collect()
     }
 }
 

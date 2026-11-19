@@ -55,6 +55,7 @@ pub(crate) fn world_model(
         if !obstacles.is_empty() {
             links.push(WorldLink {
                 name: name.to_string(),
+                touching: vec![vec![]; obstacles.len()],
                 obstacles,
             });
         }

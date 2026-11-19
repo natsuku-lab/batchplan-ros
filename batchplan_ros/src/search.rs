@@ -1,8 +1,9 @@
 //! Search settings shared by motion planning, IK and Cartesian paths.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Result, ensure};
 use batchplan::{IkOptions, JoinOptions, PlanOptions, ToolPathOptions};
-use std::collections::BTreeMap;
 
 macro_rules! search_fields {
     ($float:ident, $integer:ident, $boolean:ident, $options:ident) => {

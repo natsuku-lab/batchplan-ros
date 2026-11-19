@@ -84,8 +84,8 @@ class Controller:
         generation = self.generation
         while not self.finish and generation == self.generation:
             if goal.is_cancel_requested:
-                goal.canceled()
                 self.events.append("cancelled")
+                goal.canceled()
                 return FollowJointTrajectory.Result()
             time.sleep(0.01)
         goal.succeed()

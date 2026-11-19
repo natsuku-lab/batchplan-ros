@@ -22,7 +22,7 @@ All links, joints and frames are kept. Only collision ownership changes:
 - **Robot links** are checked as fitted spheres, and each trajectory once more against their meshes.
 - **Other links** become world obstacles in their link's frame: boxes, spheres, cylinders, and `<capsule radius="..." length="..."/>`, where `length` is the distance between the caps' centers. A mesh becomes a distance grid, so it must be a closed surface.
 
-These obstacles are part of every request, alongside the request's planning scene, including IK and Cartesian-path requests that carry no scene. A scene object cannot take a world link's name. A robot link may touch the world link it is mounted on and any world link fixed to the same body; SRDF `disable_collisions` pairs that name a world link apply too, and a request's allowed collision matrix overrides both.
+These obstacles are part of every request, alongside the request's planning scene, including IK and Cartesian-path requests that carry no scene. A scene object cannot take a world link's name. A robot link may touch a world obstacle it touches in every configuration, as the first moving link rests on a base that is part of the world (batchplan finds these at startup by sampling); SRDF `disable_collisions` pairs that name a world link apply too, and a request's allowed collision matrix overrides both.
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -97,6 +97,6 @@ Cancelling `~/move_group` or `~/sequence_move_group`:
 - **While executing:** the node cancels the controller's goal, including one the controller has not yet accepted, and waits for the controller to report its end. The result is `PREEMPTED` once it has.
 - **A stop that cannot be confirmed** is `CONTROL_FAILED`, never `PREEMPTED`: the controller refused or did not answer the cancel, or did not report the goal's end in time.
 
-Without a cancel, a controller that does not appear, does not answer the goal request, or gives no result in time fails the goal with `CONTROL_FAILED`. The node then cancels the controller's goal, also when the controller accepts it only after the node has given up, and the message says whether the controller confirmed that it stopped.
+Without a cancel, a controller that does not appear, does not answer the goal request, or gives no result in time fails the goal with `CONTROL_FAILED`. The node then cancels the controller's goal, and the message says whether the controller confirmed that it stopped. A goal the controller accepts only after the node has given up is cancelled too, and the outcome goes to the node's log.
 
 Through MoveIt, a planning context cancels only its own request.
