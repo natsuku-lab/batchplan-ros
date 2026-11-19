@@ -10,8 +10,8 @@ use async_std::future::timeout;
 use futures::FutureExt;
 use futures::future::{Either, select};
 use rclrs::{
-    ActionClient, CancelResponseCode, GoalClient, GoalStatusCode, Node, RequestedGoalClient,
-    log_error, log_warn,
+    ActionClient, CancelResponseClient, CancelResponseCode, GoalClient, GoalStatusCode, Node,
+    RclrsError, RequestedGoalClient, ResultClient, log_error, log_warn,
 };
 use ros_env::control_msgs::action::{FollowJointTrajectory, FollowJointTrajectory_Goal};
 use ros_env::moveit_msgs::msg::RobotTrajectory;
@@ -84,18 +84,23 @@ pub async fn execute(
         Some(Ok(Some(accepted))) => accepted,
         Some(Ok(None)) => return Outcome::Failed("the controller rejected the trajectory".into()),
         Some(Err(_)) => {
-            stop_late(node, requested, waits);
-            return Outcome::Failed(unanswered());
+            let stopped = stop_unanswered(node, controller, requested, waits).await;
+            return Outcome::Failed(match stopped {
+                Ok(_) => format!(
+                    "{}; it had the goal all the same, and was stopped",
+                    unanswered()
+                ),
+                Err(_) => unanswered(),
+            });
         }
         // The request is out, so the controller may still accept it and move.
         None => {
             return Outcome::Cancelled(match timeout(waits.response, &mut requested).await {
-                Ok(Some(accepted)) => stop(&accepted, waits).await,
+                Ok(Some(accepted)) => stop_accepted(&accepted, waits).await,
                 Ok(None) => Ok("goal cancelled; the controller had rejected the trajectory"),
-                Err(_) => {
-                    stop_late(node, requested, waits);
-                    Err(unanswered())
-                }
+                Err(_) => stop_unanswered(node, controller, requested, waits)
+                    .await
+                    .map_err(|_| unanswered()),
             });
         }
     };
@@ -123,12 +128,12 @@ pub async fn execute(
                 waits.margin.as_secs_f64(),
                 duration.as_secs_f64()
             );
-            Outcome::Failed(match stop(&accepted, waits).await {
+            Outcome::Failed(match stop_accepted(&accepted, waits).await {
                 Ok(_) => format!("{quiet}; it was stopped"),
                 Err(e) => format!("{quiet}; cannot confirm that it stopped: {e}"),
             })
         }
-        None => Outcome::Cancelled(stop(&accepted, waits).await),
+        None => Outcome::Cancelled(stop_accepted(&accepted, waits).await),
     }
 }
 
@@ -144,13 +149,16 @@ async fn unless<T>(
     }
 }
 
-/// Cancels `goal` and waits for the controller to report its end: `Ok` only once it has.
+/// Cancels a goal and waits for the controller to report its end: `Ok` only once it has. `cancel`
+/// is the cancel request, sent; `result` asks for the goal's result once the controller has said
+/// that it is cancelling it.
 async fn stop(
-    goal: &GoalClient<FollowJointTrajectory>,
+    cancel: Result<CancelResponseClient<FollowJointTrajectory>, RclrsError>,
+    result: impl FnOnce() -> Result<ResultClient<FollowJointTrajectory>, RclrsError>,
     waits: Waits,
 ) -> Result<&'static str, String> {
     let response = waits.response.as_secs_f64();
-    let asked = goal.cancellation.try_cancel().map_err(|e| e.to_string())?;
+    let asked = cancel.map_err(|e| e.to_string())?;
     let answer = timeout(waits.response, asked).await.map_err(|_| {
         format!("the controller did not answer the cancel request within {response} s")
     })?;
@@ -163,11 +171,10 @@ async fn stop(
             answer.code
         ));
     }
-    let (status, result) = timeout(waits.response, goal.result.clone())
-        .await
-        .map_err(|_| {
-            format!("the controller did not report the cancelled goal's end within {response} s")
-        })?;
+    let result = result().map_err(|e| e.to_string())?;
+    let (status, result) = timeout(waits.response, result).await.map_err(|_| {
+        format!("the controller did not report the cancelled goal's end within {response} s")
+    })?;
     match status {
         GoalStatusCode::Cancelled => Ok("goal cancelled; the controller stopped"),
         GoalStatusCode::Succeeded if result.error_code == 0 => {
@@ -180,6 +187,33 @@ async fn stop(
     }
 }
 
+async fn stop_accepted(
+    goal: &GoalClient<FollowJointTrajectory>,
+    waits: Waits,
+) -> Result<&'static str, String> {
+    let result = || Ok(goal.result.clone());
+    stop(goal.cancellation.try_cancel(), result, waits).await
+}
+
+/// Stops a goal whose request got no answer in time. The controller may be running it all the
+/// same: the rclrs this builds with can drop an answer that arrives before it has noted the
+/// request (ros2-rust/ros2_rust#728). So the goal is cancelled by its id, and where the
+/// controller does not know it yet, its answer is still watched for.
+async fn stop_unanswered(
+    node: &Node,
+    controller: &ActionClient<FollowJointTrajectory>,
+    requested: RequestedGoalClient<FollowJointTrajectory>,
+    waits: Waits,
+) -> Result<&'static str, String> {
+    let id = *requested.goal_id();
+    let result = || controller.try_receive_result(id);
+    let stopped = stop(controller.try_cancel_goal(id), result, waits).await;
+    if stopped.is_err() {
+        stop_late(node, requested, waits);
+    }
+    stopped
+}
+
 /// Stops a goal whose request got no answer in time, if the controller accepts it after all. The
 /// watch is a task on the executor: a controller that never answers costs its memory, no thread.
 fn stop_late(node: &Node, requested: RequestedGoalClient<FollowJointTrajectory>, waits: Waits) {
@@ -188,7 +222,7 @@ fn stop_late(node: &Node, requested: RequestedGoalClient<FollowJointTrajectory>,
         let Some(accepted) = requested.await else {
             return;
         };
-        match stop(&accepted, waits).await {
+        match stop_accepted(&accepted, waits).await {
             Ok(_) => log_warn!(
                 logger.logger(),
                 "the controller accepted a trajectory late; it was stopped"

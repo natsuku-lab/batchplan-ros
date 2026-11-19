@@ -61,12 +61,21 @@ def ros():
 
 
 def run(ros, goal, client=None):
+    """The goal's result. An answer can get lost on the way: the planner's to this client, and the
+    controller's to the planner, whose rclrs can drop one that arrives before it has noted the
+    request (ros2-rust/ros2_rust#728). The planner then says so, and the goal is sent once more."""
     node, planner, _ = ros
-    sent = (client or planner).send_goal_async(goal)
-    rclpy.spin_until_future_complete(node, sent, timeout_sec=30)
-    result = sent.result().get_result_async()
-    rclpy.spin_until_future_complete(node, result, timeout_sec=60)
-    return result.result().result
+    for last in (False, True):
+        sent = (client or planner).send_goal_async(goal)
+        rclpy.spin_until_future_complete(node, sent, timeout_sec=30)
+        if sent.result() is None and not last:
+            continue
+        result = sent.result().get_result_async()
+        rclpy.spin_until_future_complete(node, result, timeout_sec=60)
+        answer = result.result().result
+        code = getattr(answer, "response", answer).error_code
+        if "did not answer the goal request" not in code.message or last:
+            return answer
 
 
 def settle(ros):

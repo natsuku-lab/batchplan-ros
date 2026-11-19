@@ -63,9 +63,13 @@ def ros():
 
 
 def run(ros, client, goal):
+    """The goal's result. A goal whose answer got lost on the way is sent once more."""
     node = ros[0]
     sent = client.send_goal_async(goal)
     rclpy.spin_until_future_complete(node, sent, timeout_sec=30)
+    if sent.result() is None:
+        sent = client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(node, sent, timeout_sec=30)
     result = sent.result().get_result_async()
     rclpy.spin_until_future_complete(node, result, timeout_sec=120)
     return result.result().result
