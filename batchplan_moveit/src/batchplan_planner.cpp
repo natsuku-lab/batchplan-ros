@@ -336,33 +336,40 @@ public:
     if (defaults_.empty())
       load(std::chrono::seconds(5));
     auto held = config_settings_;
-    for (const auto& [name, asked] : configurations)
+    // The groups' own first: MoveIt hands them over as they were, and one for every group, applied
+    // after them, is not undone by them.
+    for (const bool every_group : { false, true })
     {
-      const auto bracket = name.find('[');
-      const bool every_group = bracket == std::string::npos;
-      const auto planner = every_group ? name : name.substr(bracket + 1, name.size() - bracket - 2);
-      for (const auto& group : every_group ? groups_ : std::vector<std::string>{ name.substr(0, bracket) })
+      for (const auto& [name, asked] : configurations)
       {
-        auto& settings = held[group + "[" + planner + "]"];
-        // A group's configuration is whole, over the defaults; one for every group adds to each.
-        auto wanted = every_group && !settings.config.empty() ? settings.config : defaults_;
-        for (const auto& [key, value] : asked.config)
-          wanted[key] = value;
-        if (wanted == settings.config)
+        const auto bracket = name.find('[');
+        if ((bracket == std::string::npos) != every_group)
           continue;
-        const auto stored = client_->set(group, planner, wanted, Clock::now() + std::chrono::seconds(5));
-        if (!stored)
+        const auto planner = every_group ? name : name.substr(bracket + 1, name.size() - bracket - 2);
+        for (const auto& group : every_group ? groups_ : std::vector<std::string>{ name.substr(0, bracket) })
         {
-          RCLCPP_ERROR(logger_, "batchplan_planner did not take the settings of '%s' for '%s'", planner.c_str(),
-                       group.c_str());
-          continue;
+          auto& settings = held[group + "[" + planner + "]"];
+          // A group's configuration is whole, over the defaults; one for every group adds to each.
+          auto wanted = every_group && !settings.config.empty() ? settings.config : defaults_;
+          for (const auto& [key, value] : asked.config)
+            wanted[key] = value;
+          if (wanted == settings.config)
+            continue;
+          const auto stored = client_->set(group, planner, wanted, Clock::now() + std::chrono::seconds(5));
+          if (!stored)
+          {
+            RCLCPP_ERROR(logger_, "batchplan_planner did not take the settings of '%s' for '%s'", planner.c_str(),
+                         group.c_str());
+            continue;
+          }
+          if (*stored == settings.config)
+            RCLCPP_WARN(logger_,
+                        "batchplan_planner kept the settings of '%s' for '%s'; its log names a value it refused",
+                        planner.c_str(), group.c_str());
+          settings.name = group + "[" + planner + "]";
+          settings.group = group;
+          settings.config = *stored;
         }
-        if (*stored == settings.config)
-          RCLCPP_WARN(logger_, "batchplan_planner kept the settings of '%s' for '%s'; its log names a value it refused",
-                      planner.c_str(), group.c_str());
-        settings.name = group + "[" + planner + "]";
-        settings.group = group;
-        settings.config = *stored;
       }
     }
     planning_interface::PlannerManager::setPlannerConfigurations(held);
