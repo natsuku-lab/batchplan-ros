@@ -86,11 +86,8 @@ pub async fn execute(
         Some(Err(_)) => {
             let stopped = stop_unanswered(node, controller, requested, waits).await;
             return Outcome::Failed(match stopped {
-                Ok(_) => format!(
-                    "{}; it had the goal all the same, and was stopped",
-                    unanswered()
-                ),
-                Err(_) => unanswered(),
+                Ok(how) => format!("{}; it had the goal all the same ({how})", unanswered()),
+                Err(e) => format!("{}; cannot confirm that it stopped: {e}", unanswered()),
             });
         }
         // The request is out, so the controller may still accept it and move.
@@ -100,7 +97,7 @@ pub async fn execute(
                 Ok(None) => Ok("goal cancelled; the controller had rejected the trajectory"),
                 Err(_) => stop_unanswered(node, controller, requested, waits)
                     .await
-                    .map_err(|_| unanswered()),
+                    .map_err(|e| format!("{}; {e}", unanswered())),
             });
         }
     };

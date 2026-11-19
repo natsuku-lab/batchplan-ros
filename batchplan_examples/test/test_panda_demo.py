@@ -68,7 +68,8 @@ def run(ros, goal, client=None):
     for last in (False, True):
         sent = (client or planner).send_goal_async(goal)
         rclpy.spin_until_future_complete(node, sent, timeout_sec=30)
-        if sent.result() is None and not last:
+        if sent.result() is None:
+            assert not last, "the goal request got no answer, twice"
             continue
         result = sent.result().get_result_async()
         rclpy.spin_until_future_complete(node, result, timeout_sec=60)
